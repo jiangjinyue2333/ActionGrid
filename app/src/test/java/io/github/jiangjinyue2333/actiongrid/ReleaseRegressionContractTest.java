@@ -125,14 +125,15 @@ public final class ReleaseRegressionContractTest {
     }
 
     @Test
-    public void moduleUsesOnlyLauncherScopeAndRemovesStaleSystemScope() throws IOException {
+    public void moduleScopesOnlySupportedAppsAndRemovesStaleSystemScope() throws IOException {
         Path local = Path.of("src", "main", "resources", "META-INF", "xposed", "scope.list");
         Path scopePath = Files.exists(local) ? local : Path.of("app").resolve(local);
         String scope = Files.readString(scopePath);
         String activity = source("io/github/jiangjinyue2333/actiongrid/MainActivity.java");
 
-        assertTrue(scope.strip().equals("com.miui.home"));
-        assertFalse(scope.contains("android"));
+        assertTrue(scope.lines().anyMatch(line -> line.strip().equals("com.miui.home")));
+        assertTrue(scope.lines().anyMatch(line -> line.strip().equals("com.android.contacts")));
+        assertFalse(scope.lines().anyMatch(line -> line.strip().equals("android")));
         assertTrue(activity.contains("isHyperOs4Home"));
         assertTrue(activity.contains("removeScope(List.of(\"android\"))"));
         assertFalse(activity.contains("grantSystemScope"));

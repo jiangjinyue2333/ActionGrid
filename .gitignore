@@ -23,3 +23,6 @@ androguard.db
 *.png
 *.so
 /系统桌面/
+
+# 反编译产物（微信 8.0.77 smali，1.5G，不进仓库）
+wx-apk/

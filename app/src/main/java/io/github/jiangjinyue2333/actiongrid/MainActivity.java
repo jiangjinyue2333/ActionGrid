@@ -58,6 +58,7 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
     private Button restartHome;
     private Button checkUpdates;
     private Switch loggingSwitch;
+    private Switch pageOrderSwitch;
     private final ExecutorService backgroundExecutor = Executors.newSingleThreadExecutor();
     private final BroadcastReceiver updateReceiver = new BroadcastReceiver() {
         @Override
@@ -126,6 +127,9 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
     public void onServiceChanged(XposedService value) {
         service = value;
         runOnUiThread(this::refreshStatus);
+        if (value != null) {
+            PageOrderSettings.pushToModule(value, this);
+        }
     }
 
     private void bindViews() {
@@ -141,9 +145,11 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
         restartHome = findViewById(R.id.restart_home);
         checkUpdates = findViewById(R.id.check_updates);
         loggingSwitch = findViewById(R.id.logging_switch);
+        pageOrderSwitch = findViewById(R.id.page_order_switch);
         ((TextView) findViewById(R.id.version_text)).setText(
                 getString(R.string.version_format, BuildConfig.VERSION_NAME));
         loggingSwitch.setChecked(LogStore.isEnabled(this));
+        pageOrderSwitch.setChecked(PageOrderSettings.isReversed(this));
     }
 
     private void configureActions() {
@@ -157,6 +163,15 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
             LogStore.setEnabled(this, enabled);
             aboutStatus.setText(enabled ? "已开始记录新日志" : "日志记录已关闭，旧日志已清除");
             findViewById(R.id.send_logs).setEnabled(enabled && LogStore.hasLogs(this));
+        });
+        pageOrderSwitch.setOnCheckedChangeListener((button, reversed) -> {
+            PageOrderSettings.setReversed(this, reversed);
+            if (!PageOrderSettings.pushToModule(service, this)) {
+                statusMessage.setText(R.string.page_order_sync_failed);
+                return;
+            }
+            statusMessage.setText(reversed
+                    ? R.string.page_order_enabled : R.string.page_order_disabled);
         });
         findViewById(R.id.send_logs).setOnClickListener(view -> shareLogs());
         checkUpdates.setOnClickListener(view -> checkUpdates(true));

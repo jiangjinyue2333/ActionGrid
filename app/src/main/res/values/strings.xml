@@ -25,6 +25,11 @@
     <string name="restart_home_module_not_current">小米桌面尚未加载当前模块；首次升级请在 LSP 中强制停止小米桌面一次</string>
     <string name="restart_home_unavailable">未找到可启动的小米桌面</string>
     <string name="open_about">关于与诊断</string>
+    <string name="page_order_reversed">页码指示器倒序翻页</string>
+    <string name="page_order_summary">焦点在页码指示器上时，单指上下滑本可翻页；开启后上下滑方向对调，关闭时保持系统默认方向。</string>
+    <string name="page_order_enabled">页码指示器已改为倒序翻页</string>
+    <string name="page_order_disabled">页码指示器翻页方向已恢复默认</string>
+    <string name="page_order_sync_failed">设置已保存，但同步到模块失败；请重启小米桌面后再试一次。</string>
     <string name="back_to_status">返回运行状态</string>
     <string name="source_repository">GitHub 源码仓库</string>
     <string name="source_repository_unavailable">无法打开 GitHub 源码仓库</string>
