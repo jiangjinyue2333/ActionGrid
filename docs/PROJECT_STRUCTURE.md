@@ -51,6 +51,7 @@ ActionGrid/
 - 0.4.9 使用已有原生 ContentResolver 将 7748/8565 桌面日志异步传入 `DiagnosticsProvider`。`native_diagnostics.h` 限制队列和批次，`LogStore` 校验开关 session 与写入确认，`RotatingLog` 保存四份轮换文件并生成独立分享快照；没有在桌面进程创建 Java VM。见 `docs/RELEASE_0.4.9.md`。
 - 0.4.10 在原生移动前注册节点观察，刷新后先通知读屏再等待查询，并复查最终数据库位置；诊断日志区分保存、刷新改位及节点匹配失败。见 `docs/RELEASE_0.4.10.md`。
 - 0.4.11 恢复页码指示器默认描述，仅替换自动翻页公告为当前页项目数；修正事件窗口与字符串 ABI，使原生旧公告能被正确去重。桌面文件夹按自身类型解析并保留托起时的 favorite ID，成功反馈使用系统桌面的托起、放置原文。见 `docs/RELEASE_0.4.11.md`。
+- 0.4.13 在桌面节点重建或快照解析短暂失败时继续复用托起阶段确认的 favorite 位置；原生 workspace host 更换窗口/节点后仍重写页码项目数播报。见 `docs/RELEASE_0.4.13.md`。
 - `zip_directory.h` 为 APK 中直接加载的 Rust 库定位 ZIP 尾记录，检查截断和注释长度，避免兼容性探测读取末尾以外的内存；同一 native 回归包含空 ZIP、注释与缺失尾记录。
 - `scripts/verify-launcher-contract.py` 从指定桌面 ELF 的真实跳转表验证 FRB 操作号、刷新入口及 `Vec<ItemInfo>` 解码调用链，证据见 `docs/LAUNCHER_7748_ABI.md`；不用于运行时猜测新接口。
 - 应用最低支持 Android 14，目标版本为 Android 17。

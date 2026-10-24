@@ -25,6 +25,7 @@ void prepareGrid() {
     g_virtual_focused_id.store(-1);
     g_sources.clear();
     g_source_placements.clear();
+    g_app_targets.clear();
     g_snapshot = {};
     g_model_move_running.store(false);
     g_sqlite_open_v2 = nullptr;
@@ -122,7 +123,9 @@ struct AccessibilityCapture {
         g_last_provider.store(nullptr);
         g_announced_page = -1;
         g_launcher_window_focused.store(-1);
+        g_workspace_host_id.store(-1);
         g_workspace_window_id.store(-1);
+        g_page_source_keys.clear();
         g_consume_back_up.store(false);
     }
     ~AccessibilityCapture() {
@@ -414,6 +417,68 @@ void pageSpeechHandlesWorkspaceAnnouncementSources() {
     putString(event, kEventTextOffset, "已打开文件夹");
     require(!rewritePageScrollEvent(event.data(), suppressed) && !suppressed,
             "unrelated native speech was suppressed");
+}
+
+void pageSpeechSurvivesNativeWorkspaceSourceRebuild() {
+    AccessibilityCapture capture;
+    g_snapshot.ready = true;
+    g_snapshot.pageCounts = {{2, 11}, {3, 17}};
+    g_page_state_known.store(true);
+    g_total_pages.store(8);
+    g_visible_screen.store(0);
+    g_workspace_host_id.store(7);
+    g_workspace_window_id.store(8);
+    g_launcher_window_focused.store(1);
+
+    TestNode event{};
+    putField(event, kEventTypeOffset, kTypeViewScrolled);
+    putField(event, kEventSourceOffset, (uint64_t{30} << 32U) | 7U);
+    putField(event, kEventWindowOffset, int32_t{8});
+    putField(event, kEventItemCountOffset, int32_t{8});
+    putField(event, kEventFromIndexOffset, int32_t{1});
+    putField(event, kEventToIndexOffset, int32_t{1});
+    bool suppressed = false;
+    require(rewritePageScrollEvent(event.data(), suppressed) && suppressed
+                    && events.size() == 1 && events.back().text == u"第 2 页共 11 项",
+            "the first native page event was not rewritten");
+
+    // The native suite rebuilds the workspace provider and changes both the
+    // source node and window.  The host identity remains the same.
+    putField(event, kEventSourceOffset, (uint64_t{31} << 32U) | 7U);
+    putField(event, kEventWindowOffset, int32_t{9});
+    putField(event, kEventFromIndexOffset, int32_t{2});
+    putField(event, kEventToIndexOffset, int32_t{2});
+    require(rewritePageScrollEvent(event.data(), suppressed) && suppressed
+                    && events.size() == 2 && events.back().text == u"第 3 页共 17 项"
+                    && g_workspace_window_id.load() == 9,
+            "a rebuilt native workspace source fell back to the launcher's page speech");
+}
+
+void moveUsesCachedFavoriteWhenSnapshotResolutionFails() {
+    prepareGrid();
+    g_visible_screen.store(3);
+    g_lifted_screen.store(3);
+    g_sources = {{71, 20, 7, 8, {200, 100, 300, 200},
+            "com.miui.home:id/folder", "旅行交通"}};
+    g_source_placements.clear();
+    AppTarget cached;
+    cached.spoken = "旅行交通";
+    cached.favorite = 101;
+    cached.placement = {101, kDesktopContainer, 4, 2, 3, 1, 1, 2};
+    g_app_targets[71] = cached;
+    g_snapshot.ready = false;
+    g_slots = {{{100, 0, 200, 100}, 0, 1}};
+
+    std::vector<FavoritePlacement> sources;
+    std::vector<FavoritePlacement> expected;
+    WireWriter wire;
+    std::string failureReason;
+    require(buildModelMove(nullptr, kVirtualNodeBase + 1, 0,
+                    sources, expected, wire, failureReason),
+            "a cached folder favorite was discarded when the snapshot resolver was unavailable");
+    require(sources.size() == 1 && sources.front().id == 101
+                    && expected.size() == 1 && expected.front().screen == 4,
+            "cached folder favorite did not preserve its stable database identity");
 }
 
 void pendingPlacementRequiresTheDestinationPage() {
@@ -1309,6 +1374,8 @@ int main() {
         {"page speech failure preserves native fallback", pageSpeechFailurePreservesNativeFallback},
         {"page indicator keeps its default description", pageNodeKeepsDefaultDescriptionAndTotalPages},
         {"page speech accepts actual workspace node sources", pageSpeechHandlesWorkspaceAnnouncementSources},
+        {"page speech survives native workspace source rebuild", pageSpeechSurvivesNativeWorkspaceSourceRebuild},
+        {"move reuses cached favorite after source resolution failure", moveUsesCachedFavoriteWhenSnapshotResolutionFails},
         {"move visibility requires the destination page", pendingPlacementRequiresTheDestinationPage},
         {"move refresh notifies reader before waiting for its nodes", placementRefreshNotifiesReaderBeforeVisibilityWait},
         {"move rechecks persisted coordinates after reload", placementRechecksDatabaseAfterReload},

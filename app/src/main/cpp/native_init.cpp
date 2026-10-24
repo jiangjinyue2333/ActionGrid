@@ -264,6 +264,11 @@ DropFn g_event_drop = nullptr;
 std::atomic<void *> g_event_controller{nullptr};
 std::mutex g_event_mutex;
 std::unordered_set<uint64_t> g_page_source_keys;
+// The native accessibility provider can recreate the workspace node and
+// assign it a new window/node pair while a page transition is in flight.  The
+// low 32 bits of an accessibility source identify the provider host and stay
+// stable across that rebuild, so retain it separately from exact source keys.
+std::atomic<int32_t> g_workspace_host_id{-1};
 std::atomic<int32_t> g_workspace_window_id{-1};
 std::atomic<int32_t> g_host_view_id{0};
 std::atomic<int32_t> g_window_id{-1};
@@ -1977,6 +1982,67 @@ bool resolveAppTarget(int32_t nodeId, const std::string &spoken, AppTarget &out,
     return true;
 }
 
+bool cachedPlacementForNode(int32_t nodeId, const std::string &spoken,
+        int32_t itemType, FavoritePlacement &out) {
+    std::lock_guard lock(g_app_mutex);
+    auto found = g_app_targets.find(nodeId);
+    if (found == g_app_targets.end() || found->second.spoken != spoken) return false;
+    const FavoritePlacement &placement = found->second.placement;
+    if (placement.id < 0 || placement.itemType != itemType
+            || !workspaceContainer(placement.container)) return false;
+    out = placement;
+    return true;
+}
+
+// Resolve the placement directly from the snapshot when the normal target
+// resolver is temporarily unable to produce an AppTarget.  Folders have no
+// component intent, so their favorite row is the only identity we need.  A
+// unique same-page exact label is safe to use; ambiguous rows still fail
+// closed rather than moving the wrong folder.
+bool snapshotPlacementForLabel(const std::string &spoken, int32_t screenHint,
+        int32_t itemType, FavoritePlacement &out) {
+    if (spoken.empty()) return false;
+    LauncherSnapshot snapshot;
+    {
+        std::lock_guard lock(g_snapshot_mutex);
+        if (!g_snapshot.ready) return false;
+        snapshot = g_snapshot;
+    }
+    std::vector<const SnapshotFavorite *> matches;
+    std::vector<const SnapshotFavorite *> preferred;
+    for (const SnapshotFavorite &favorite : snapshot.favorites) {
+        if (favorite.placement.itemType != itemType
+                || !workspaceContainer(favorite.placement.container)) continue;
+        const bool exact = spoken == favorite.title || spoken == favorite.label;
+        if (!exact && !labelMatches(spoken, favorite.title)
+                && !labelMatches(spoken, favorite.label)) continue;
+        matches.push_back(&favorite);
+        if (screenHint > 0 && favorite.placement.screen == screenHint) {
+            preferred.push_back(&favorite);
+        }
+    }
+    const auto &candidates = preferred.empty() ? matches : preferred;
+    if (candidates.size() != 1) return false;
+    out = candidates.front()->placement;
+    return out.id >= 0;
+}
+
+bool resolveSourcePlacement(int32_t nodeId, const std::string &spoken,
+        int32_t screenHint, int32_t itemType, FavoritePlacement &out) {
+    AppTarget target;
+    if (resolveAppTarget(nodeId, spoken, target, screenHint, itemType)
+            && target.placement.id >= 0
+            && workspaceContainer(target.placement.container)) {
+        out = target.placement;
+        return true;
+    }
+    // targetForNode() may have resolved this node before the launcher started
+    // rebuilding its snapshot.  Keep that favorite identity for the lift
+    // session instead of asking the new node ID to resolve again at drop time.
+    if (cachedPlacementForNode(nodeId, spoken, itemType, out)) return true;
+    return snapshotPlacementForLabel(spoken, screenHint, itemType, out);
+}
+
 LauncherAbiProfile launcherAbiProfileForBuildId(const char *buildId) {
     if (buildId == nullptr) return LauncherAbiProfile::kUnknown;
     if (std::strcmp(buildId, kExpectedPreviousLauncherDartBuildId) == 0) {
@@ -2780,6 +2846,8 @@ void rememberPageSource(void *node) {
     if (resource != "com.miui.home:id/workspace"
             && resource != "com.miui.home:id/screen_content") return;
     uint64_t source = static_cast<uint64_t>(nodeField<int64_t>(node, 0x338));
+    g_workspace_host_id.store(static_cast<int32_t>(static_cast<uint32_t>(source)),
+            std::memory_order_release);
     g_workspace_window_id.store(nodeField<int32_t>(node, 0x418),
             std::memory_order_release);
     std::lock_guard lock(g_event_mutex);
@@ -3199,7 +3267,15 @@ bool rewritePageScrollEvent(void *event, bool &suppressOriginal) {
     uint64_t source = nodeField<uint64_t>(event, kEventSourceOffset);
     const int32_t window = nodeField<int32_t>(event, kEventWindowOffset);
     const int32_t workspaceWindow = g_workspace_window_id.load(std::memory_order_acquire);
-    if (workspaceWindow >= 0 && window != workspaceWindow) return false;
+    const int32_t workspaceHost = g_workspace_host_id.load(std::memory_order_acquire);
+    const int32_t sourceHost = static_cast<int32_t>(static_cast<uint32_t>(source));
+    // The launcher may rebuild the workspace provider during a swipe.  A new
+    // window/node pair is still a workspace event when its provider host is
+    // the one observed from the workspace node.  Keep the synthetic Flutter
+    // source on the stricter window check because it has no stable host.
+    const bool sameWorkspaceHost = source != kFlutterPageAnnouncementSource
+            && workspaceHost >= 0 && sourceHost == workspaceHost;
+    if (workspaceWindow >= 0 && window != workspaceWindow && !sameWorkspaceHost) return false;
     if (type == kTypeAnnouncement) {
         int32_t page = 0;
         std::string originalText = eventString(event, kEventTextOffset);
@@ -3210,6 +3286,12 @@ bool rewritePageScrollEvent(void *event, bool &suppressOriginal) {
             }
             if (workspaceWindow == -1) {
                 g_workspace_window_id.store(window, std::memory_order_release);
+            }
+            if (sameWorkspaceHost && window != workspaceWindow) {
+                g_workspace_window_id.store(window, std::memory_order_release);
+            }
+            if (workspaceHost < 0 && source != kFlutterPageAnnouncementSource) {
+                g_workspace_host_id.store(sourceHost, std::memory_order_release);
             }
             const bool lifted = g_lifted.load(std::memory_order_acquire);
             g_visible_screen.store(page - 1, std::memory_order_release);
@@ -3227,13 +3309,16 @@ bool rewritePageScrollEvent(void *event, bool &suppressOriginal) {
         std::lock_guard lock(g_event_mutex);
         sourceMatched = g_page_source_keys.find(source) != g_page_source_keys.end();
     }
-    if (!sourceMatched && (workspaceWindow < 0
+    if (!sourceMatched && !sameWorkspaceHost && (workspaceWindow < 0
             || window != workspaceWindow
             || !g_page_state_known.load(std::memory_order_acquire))) {
         return false;
     }
-    if (workspaceWindow == -1) {
+    if (workspaceWindow == -1 || (sameWorkspaceHost && window != workspaceWindow)) {
         g_workspace_window_id.store(window, std::memory_order_release);
+    }
+    if (workspaceHost < 0 && source != kFlutterPageAnnouncementSource) {
+        g_workspace_host_id.store(sourceHost, std::memory_order_release);
     }
     if (type != kTypeViewScrolled || itemCount <= 0
             || fromIndex < 0 || fromIndex >= itemCount || toIndex < fromIndex) {
@@ -4006,6 +4091,7 @@ AppTarget targetForNode(int32_t nodeId, void *node) {
     if (node == nullptr) return target;
     std::string label = nodeString(node, 0x138);
     const int32_t screenHint = g_visible_screen.load(std::memory_order_acquire) + 1;
+    const int32_t itemType = nodeString(node, 0x1b8) == "com.miui.home:id/folder" ? 2 : 0;
     uint64_t generation = 0;
     {
         std::lock_guard lock(g_snapshot_mutex);
@@ -4016,13 +4102,14 @@ AppTarget targetForNode(int32_t nodeId, void *node) {
         auto found = g_app_targets.find(nodeId);
         if (found != g_app_targets.end() && found->second.spoken == label
                 && found->second.snapshotGeneration == generation
+                && found->second.placement.itemType == itemType
                 && (screenHint < 1 || found->second.placement.screen == screenHint)) {
             target = found->second;
             if (!target.shortcutsLoaded) queueShortcutLoad(nodeId, target);
             return target;
         }
     }
-    if (!resolveAppTarget(nodeId, label, target, screenHint)) return target;
+    if (!resolveAppTarget(nodeId, label, target, screenHint, itemType)) return target;
     {
         std::lock_guard lock(g_app_mutex);
         g_app_targets[nodeId] = target;
@@ -4147,6 +4234,7 @@ void clearWorkspacePageContext() {
         std::lock_guard lock(g_event_mutex);
         g_page_source_keys.clear();
     }
+    g_workspace_host_id.store(-1, std::memory_order_release);
     g_workspace_window_id.store(-1, std::memory_order_release);
     g_visible_screen.store(0, std::memory_order_release);
     g_total_pages.store(0, std::memory_order_release);
@@ -4811,13 +4899,14 @@ bool buildModelMove(void *provider, int32_t nodeId, int32_t actionId,
     }
     if (sources.empty()) {
         for (const auto &node : selected) {
-            AppTarget target;
             const int32_t liftedScreen = g_lifted_screen.load(std::memory_order_acquire);
             const int32_t screenHint = liftedScreen >= 0 ? liftedScreen + 1 : -1;
-            if (!resolveAppTarget(node.id, node.label, target, screenHint,
-                        node.resource == "com.miui.home:id/folder" ? 2 : 0)
-                    || target.placement.id < 0
-                    || !workspaceContainer(target.placement.container)) {
+            FavoritePlacement placement;
+            if (!resolveSourcePlacement(node.id, node.label, screenHint,
+                        node.resource == "com.miui.home:id/folder" ? 2 : 0,
+                        placement)
+                    || placement.id < 0
+                    || !workspaceContainer(placement.container)) {
                 LauncherSnapshot snapshot;
                 {
                     std::lock_guard lock(g_snapshot_mutex);
@@ -4831,7 +4920,7 @@ bool buildModelMove(void *provider, int32_t nodeId, int32_t actionId,
                         static_cast<unsigned long long>(snapshot.generation));
                 return false;
             }
-            sources.push_back(target.placement);
+            sources.push_back(placement);
         }
     }
 
@@ -5363,9 +5452,12 @@ bool performActionImpl(void *provider, int32_t nodeId, int32_t actionId, void *a
                 [nodeId](const auto &node) { return node.id == nodeId && node.icon(); });
         if (source != nodes.end()) {
             AppTarget placement;
-            if (resolveAppTarget(nodeId, source->label, placement,
+            FavoritePlacement sourcePlacement;
+            if (resolveSourcePlacement(nodeId, source->label,
                     g_visible_screen.load() + 1,
-                    source->resource == "com.miui.home:id/folder" ? 2 : 0)) {
+                    source->resource == "com.miui.home:id/folder" ? 2 : 0,
+                    sourcePlacement)) {
+                placement.placement = sourcePlacement;
                 if (!workspaceContainer(placement.placement.container)) {
                     sendAnnouncement(nodeId, "暂不支持移动文件夹内项目");
                     return false;
@@ -5437,19 +5529,20 @@ bool performActionImpl(void *provider, int32_t nodeId, int32_t actionId, void *a
         sourcePlacements.reserve(sourceNodes.size());
         bool sourcePlacementsReady = !sourceNodes.empty();
         for (const auto &sourceNode : sourceNodes) {
-            AppTarget target;
-            if (!resolveAppTarget(sourceNode.id, sourceNode.label, target,
+            FavoritePlacement placement;
+            if (!resolveSourcePlacement(sourceNode.id, sourceNode.label,
                         g_visible_screen.load() + 1,
-                        sourceNode.resource == "com.miui.home:id/folder" ? 2 : 0)
-                    || target.placement.id < 0
-                    || !workspaceContainer(target.placement.container)) {
+                        sourceNode.resource == "com.miui.home:id/folder" ? 2 : 0,
+                        placement)
+                    || placement.id < 0
+                    || !workspaceContainer(placement.container)) {
                 sourcePlacementsReady = false;
                 nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
                         "HyperOS4 lift source placement cache deferred node=%d label=%s count=%zu",
                         sourceNode.id, sourceNode.label.c_str(), sourceNodes.size());
                 break;
             }
-            sourcePlacements.push_back(target.placement);
+            sourcePlacements.push_back(placement);
         }
         if (sourcePlacementsReady) {
             std::lock_guard lock(g_session_mutex);
