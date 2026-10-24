@@ -10,15 +10,24 @@ import org.junit.Test;
 
 public final class HyperOs4CompatibilityTest {
     @Test
-    public void exactRustLauncherIsSelectedAutomatically() {
+    public void nativeRoutingDoesNotRejectCompatibleLauncherUpdatesByVersion() {
+        assertTrue(HyperOs4Compatibility.supports(37, 801027748L, false));
+        assertTrue(HyperOs4Compatibility.supports(37, 801028566L, false));
+        assertTrue(HyperOs4Compatibility.supports(38, 901000001L, false));
+        assertFalse(HyperOs4Compatibility.supports(37, 801027748L, true));
+        assertFalse(HyperOs4Compatibility.supports(36, 801027748L, false));
+    }
+
+    @Test
+    public void rustLauncherBackendIsSelectedAutomatically() {
         assertTrue(HyperOs4Compatibility.supports(37, 801028565L, false));
         assertTrue(HyperOs4Compatibility.supports(37, 801027722L, false));
         assertTrue(HyperOs4Compatibility.supports(37, 801027653L, false));
         assertTrue(HyperOs4Compatibility.isNativeCandidate(37, 801028566L, false));
         assertFalse(HyperOs4Compatibility.isNativeCandidate(37, 801028566L, true));
-        assertFalse(HyperOs4Compatibility.supports(37, 801025436L, false));
+        assertTrue(HyperOs4Compatibility.supports(37, 801025436L, false));
         assertFalse(HyperOs4Compatibility.supports(37, 801025436L, true));
-        assertFalse(HyperOs4Compatibility.supports(37, 801025437L, false));
+        assertTrue(HyperOs4Compatibility.supports(37, 801025437L, false));
         assertFalse(HyperOs4Compatibility.supports(36, 801025436L, false));
     }
 

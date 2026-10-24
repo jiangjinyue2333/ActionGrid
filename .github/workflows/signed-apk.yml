@@ -45,6 +45,12 @@ jobs:
       - name: Test, lint and unsigned build
         run: ./gradlew.bat test lint assembleRelease
 
+      - name: Verify APK installation ABI
+        run: ./scripts/test-apk-abi.ps1 -ApkPath app/build/outputs/apk/release/app-release-unsigned.apk
+
+      - name: Verify native capability policy
+        run: ./scripts/test-native-policy.ps1
+
       - name: Upload unsigned APK
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -102,11 +108,21 @@ jobs:
           ACTIONGRID_RELEASE_KEY_PASSWORD: ${{ secrets.ACTIONGRID_RELEASE_KEY_PASSWORD }}
         run: ./scripts/build-release.ps1 -ReleaseTag $env:GITHUB_REF_NAME
 
+      - name: Generate GitHub update manifest
+        run: |
+          $apk = Get-ChildItem -LiteralPath artifacts -Filter 'ActionGrid-*.apk' -File | Select-Object -First 1
+          if ($null -eq $apk) {
+            throw '找不到已验证的发布 APK'
+          }
+          ./scripts/create-update-manifest.ps1 -ApkPath $apk.FullName -ReleaseTag $env:GITHUB_REF_NAME -OutputPath artifacts/latest.json
+
       - name: Upload verified APK
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ActionGrid-signed-${{ github.run_number }}
-          path: artifacts/ActionGrid-*.apk
+          path: |
+            artifacts/ActionGrid-*.apk
+            artifacts/latest.json
           if-no-files-found: error
           retention-days: 14
 
@@ -115,10 +131,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $apk = Get-ChildItem -LiteralPath artifacts -Filter 'ActionGrid-*.apk' -File | Select-Object -First 1
+          $manifest = Get-Item -LiteralPath artifacts/latest.json
           if ($null -eq $apk) {
             throw '找不到已验证的发布 APK'
           }
-          gh release create $env:GITHUB_REF_NAME $apk.FullName --title "ActionGrid $env:GITHUB_REF_NAME" --generate-notes
+          if ($null -eq $manifest) {
+            throw '找不到 GitHub 更新清单'
+          }
+          gh release create $env:GITHUB_REF_NAME $apk.FullName $manifest.FullName --title "ActionGrid $env:GITHUB_REF_NAME" --generate-notes
 
       - name: Remove temporary signing key
         if: always()

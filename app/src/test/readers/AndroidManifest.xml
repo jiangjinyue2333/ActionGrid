@@ -1,0 +1,11 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="io.github.jiangjinyue2333.actiongrid.readerfixture">
+    <uses-sdk android:minSdkVersion="28" android:targetSdkVersion="28" />
+    <application android:label="ActionGrid 读屏验证" android:theme="@android:style/Theme.Material.Light.NoActionBar" android:extractNativeLibs="true" android:debuggable="true">
+        <activity android:name=".ReaderFixtureActivity" android:exported="true" android:launchMode="singleTop">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

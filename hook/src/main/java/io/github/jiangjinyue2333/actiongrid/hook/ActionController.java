@@ -168,7 +168,7 @@ final class ActionController {
                 .findFirst()
                 .orElse(null);
         if (current == null || occupantId(current) != occupantId(requested)) {
-            announce(requested.host(), "当前桌面状态已变化，请重新托起");
+            announce(requested.host(), "目标位置已变化，请重新选择位置");
             return true;
         }
         if (current.occupiedView() != null) {
@@ -342,9 +342,10 @@ final class ActionController {
             }
             session = candidate;
             placementInProgress = false;
+            // Match System Home's announce_for_drag and drag_multiple_item_name.
             announce(host, candidate.multiSelect()
-                    ? "已托起 " + candidate.sourceRefs().size() + " 个图标"
-                    : "已托起 " + MiuiHomeBridge.label(host));
+                    ? "已拖起" + candidate.sourceRefs().size() + "个图标"
+                    : "已拖起");
             DiagnosticsClient.record(host.getContext(), candidate.multiSelect()
                     ? "已建立多选托起会话" : "已建立单项托起会话");
             notifyWindowChanged(host);

@@ -94,6 +94,11 @@ public final class ActionGridModule extends XposedModule {
                                 + (installed ? "installed" : "unavailable"));
                 return;
             }
+            if (PageOrderProtocol.supports(version, hasCode)) {
+                boolean pageOrder = PageOrderHook.install(this);
+                log(pageOrder ? Log.INFO : Log.WARN, TAG,
+                        "HyperOS 3 page order hooks " + (pageOrder ? "installed" : "unavailable"));
+            }
             CompatibilityReport report = CapabilityProbe.probe(param.getClassLoader());
             log(Log.INFO, TAG, "Probe " + report.summary());
             if (!report.availableCapabilities().contains(Capability.ICON_BINDING)) {
@@ -152,6 +157,16 @@ public final class ActionGridModule extends XposedModule {
                 } catch (RuntimeException exception) {
                     logHookFailure("action", exception);
                 }
+                Object result = chain.proceed();
+                if ((int) chain.getArg(0) == android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK
+                        && result instanceof Boolean handled && handled
+                        && bridge.isSupportedIcon(view)) {
+                    // Use the platform event path so TalkBack supplies its normal
+                    // click feedback.  No module-owned sound is played here.
+                    view.sendAccessibilityEvent(
+                            android.view.accessibility.AccessibilityEvent.TYPE_VIEW_CLICKED);
+                }
+                return result;
             }
             return chain.proceed();
         });
@@ -172,23 +187,32 @@ public final class ActionGridModule extends XposedModule {
 
         Set<Method> hoverMethods = new HashSet<>();
         for (Class<?> hostClass : bridge.placementHostClasses()) {
-            hoverMethods.add(hostClass.getMethod("dispatchHoverEvent", MotionEvent.class));
+            Method hover = HookMethodLookup.find(hostClass, "dispatchHoverEvent", MotionEvent.class);
+            if (hover != null) {
+                hoverMethods.add(hover);
+            } else {
+                log(Log.WARN, TAG, "Optional hover hook unavailable: " + hostClass.getName());
+            }
         }
         for (Method hoverMethod : hoverMethods) {
-            hook(hoverMethod).setId("actiongrid.legacy.hover."
-                    + hoverMethod.getDeclaringClass().getName()).intercept(chain -> {
-                if (chain.getThisObject() instanceof View view) {
-                    try {
-                        if (controller.dispatchHoverEvent(
-                                view, (MotionEvent) chain.getArg(0))) {
-                            return true;
+            try {
+                hook(hoverMethod).setId("actiongrid.legacy.hover."
+                        + hoverMethod.getDeclaringClass().getName()).intercept(chain -> {
+                    if (chain.getThisObject() instanceof View view && bridge.isPlacementHost(view)) {
+                        try {
+                            if (controller.dispatchHoverEvent(
+                                    view, (MotionEvent) chain.getArg(0))) {
+                                return true;
+                            }
+                        } catch (RuntimeException exception) {
+                            logHookFailure("hover", exception);
                         }
-                    } catch (RuntimeException exception) {
-                        logHookFailure("hover", exception);
                     }
-                }
-                return chain.proceed();
-            });
+                    return chain.proceed();
+                });
+            } catch (RuntimeException | LinkageError exception) {
+                logHookFailure("hover-install", exception);
+            }
         }
     }
 
@@ -219,7 +243,7 @@ public final class ActionGridModule extends XposedModule {
         }
     }
 
-    private synchronized void logHookFailure(String stage, RuntimeException exception) {
+    private synchronized void logHookFailure(String stage, Throwable exception) {
         String key = stage + ':' + exception.getClass().getName();
         if (loggedFailures.add(key)) {
             log(Log.WARN, TAG, stage + " failed: " + exception.getClass().getSimpleName());

@@ -246,11 +246,13 @@ public final class ReleaseRegressionContractTest {
         assertTrue(desktop.contains("VirtualGridLayout.cells(columns, rows)"));
         assertTrue(desktop.contains("desktopGeometry("));
         assertTrue(desktop.contains("occupiedView == null ? null : label(occupiedView)"));
+        assertTrue(desktop.contains("occupied == null || column >= occupied.length"));
         assertFalse(desktop.contains("if (occupied[column][row] != null)"));
         assertTrue(hotseat.contains("hotseatMaxCount.invoke(null)"));
         assertTrue(hotseat.contains("items.size()"));
         assertFalse(hotseat.contains("items.isEmpty()"));
         assertTrue(availability.contains("target.cellX() == items.size()"));
+        assertTrue(source.contains("目标位置已变化，请重新选择位置"));
     }
 
     @Test
@@ -325,6 +327,9 @@ public final class ReleaseRegressionContractTest {
         assertTrue(workspace.contains("resolver.query(FAVORITES_URI"));
         assertTrue(workspace.contains("if (loaded == null)"));
         assertTrue(workspace.contains("return null;"));
+        assertTrue(workspace.contains("WORKSPACE_RESOURCE_ID"));
+        assertTrue(workspace.contains("icons.size() == 1"));
+        assertTrue(workspace.contains("sourceItemId"));
         assertTrue(adapter.contains("dynamicActions(target.item().id())"));
         assertTrue(adapter.contains("dynamicActions(node.item().id())"));
         assertFalse(adapter.contains("dynamicActions(target.nodeId())"));

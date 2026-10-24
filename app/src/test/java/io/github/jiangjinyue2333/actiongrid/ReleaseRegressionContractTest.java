@@ -61,6 +61,24 @@ public final class ReleaseRegressionContractTest {
     }
 
     @Test
+    public void updateSourceSelectionUsesGithubAndRetainsGitcode() throws IOException {
+        String activity = source("io/github/jiangjinyue2333/actiongrid/MainActivity.java");
+        String client = source("io/github/jiangjinyue2333/actiongrid/update/UpdateClient.java");
+        String layout = Files.readString(projectPath("app/src/main/res/layout/activity_main.xml"));
+        String workflow = Files.readString(projectPath(".github/workflows/signed-apk.yml"));
+
+        assertTrue(activity.contains("showUpdateSourceDialog"));
+        assertTrue(activity.contains("refreshUpdateSourceSummary"));
+        assertTrue(activity.contains("UpdateClient.fetch(source)"));
+        assertTrue(client.contains("UpdateSource.GITHUB"));
+        assertTrue(client.contains("source.acceptsApkUrl"));
+        assertTrue(layout.contains("@+id/update_source_summary"));
+        assertTrue(layout.contains("@+id/select_update_source"));
+        assertTrue(workflow.contains("create-update-manifest.ps1"));
+        assertTrue(workflow.contains("artifacts/latest.json"));
+    }
+
+    @Test
     public void diagnosticFileOpenUsesPlatformUriGrantEnforcement() throws IOException {
         String provider = source(
                 "io/github/jiangjinyue2333/actiongrid/diagnostics/DiagnosticsProvider.java");
@@ -161,7 +179,7 @@ public final class ReleaseRegressionContractTest {
                 "private String hyperOs4ActionStatus");
 
         assertFalse(process.contains("return \"未运行\""));
-        assertTrue(process.contains("return \"无法确认\""));
+        assertTrue(process.contains("系统限制，暂时无法确认（不代表桌面未运行）"));
     }
 
     @Test
@@ -302,8 +320,8 @@ public final class ReleaseRegressionContractTest {
         Path local = Path.of("src", "main", "cpp", "native_init.cpp");
         Path path = Files.exists(local) ? local : Path.of("app").resolve(local);
         String nativeSource = Files.readString(path);
-        String touch = between(nativeSource, "void updateTouchExplorationTarget(",
-                "bool onLauncherMotionV2(");
+        String touch = between(nativeSource, "bool updateTouchExplorationTarget(",
+                "void onLauncherMotion(");
 
         assertTrue(touch.contains("kActionHoverMove"));
         assertTrue(touch.contains("g_virtual_hovered_id.exchange"));
@@ -313,7 +331,7 @@ public final class ReleaseRegressionContractTest {
         assertTrue(nativeSource.contains("g_event_push_text(event"));
         assertTrue(nativeSource.contains("virtualNodeDescription(nodeId)"));
         assertTrue(touch.contains("sendEvent(target, 32768)"));
-        assertTrue(touch.contains("sendEvent(previous, 65536)"));
+        assertTrue(touch.contains("sendEvent(focused, 65536)"));
     }
 
     @Test
@@ -321,11 +339,11 @@ public final class ReleaseRegressionContractTest {
         Path local = Path.of("src", "main", "cpp", "native_init.cpp");
         Path path = Files.exists(local) ? local : Path.of("app").resolve(local);
         String nativeSource = Files.readString(path);
-        String pager = between(nativeSource, "bool predictPageSwipe(",
-                "void handleRecentSwipeMotion(");
+        String pager = between(nativeSource, "bool rewritePageScrollEvent(",
+                "void onSendEvent(void *controller, void *event) {");
 
         assertFalse(pager.contains("g_lifted.load(std::memory_order_acquire)\n            ||"));
-        assertTrue(pager.contains("refreshLiftSessionForPage(g_last_provider.load"));
+        assertTrue(pager.contains("scheduleLiftSessionRefresh(lifted)"));
         assertTrue(nativeSource.contains("suppressOriginal = true;"));
         assertTrue(nativeSource.contains("return true;"));
     }
@@ -338,9 +356,9 @@ public final class ReleaseRegressionContractTest {
         String nodeHook = between(nativeSource, "NodeResult onCreateNode(void *provider, int32_t nodeId) {",
                 "void injectDirectAction");
 
-        assertTrue(nodeHook.contains("predictedPage <= 0"));
-        assertTrue(nodeHook.contains("&& rememberVisibleScreen(pageDescription);"));
-        assertFalse(nodeHook.contains("(!lifted || predictedPage) && rememberVisibleScreen"));
+        assertTrue(nodeHook.contains("const bool pageChanged = rememberVisibleScreen(pageDescription);"));
+        assertTrue(nodeHook.contains("announceConfirmedPage"));
+        assertFalse(nodeHook.contains("pageSignalAccepted"));
     }
 
     @Test
@@ -409,21 +427,19 @@ public final class ReleaseRegressionContractTest {
         String nodeHook = between(nativeSource,
                 "NodeResult onCreateNode(void *provider, int32_t nodeId) {",
                 "void injectDirectAction");
-        assertFalse(nodeHook.contains("setNodeString(g_node_set_content_description"));
+        assertFalse(nodeHook.contains("g_sqlite_open_v2"));
     }
 
     @Test
-    public void nativePredictedPageAnnouncementStillRebuildsLiftSession() throws IOException {
+    public void nativeConfirmedPageAnnouncementStillRebuildsLiftSession() throws IOException {
         Path local = Path.of("src", "main", "cpp", "native_init.cpp");
         Path path = Files.exists(local) ? local : Path.of("app").resolve(local);
         String nativeSource = Files.readString(path);
         String paging = between(nativeSource, "bool rewritePageScrollEvent(",
                 "void onSendEvent(void *controller, void *event) {");
-        String predicted = between(paging, "const bool predictedPage = g_predicted_page.exchange",
-                "int32_t count = 0;");
-
-        assertTrue(predicted.contains("suppressOriginal = true;"));
-        assertFalse(predicted.contains("return true;"));
+        assertTrue(paging.contains("announceConfirmedPage(page"));
+        assertTrue(paging.contains("suppressOriginal = true;"));
+        assertFalse(nativeSource.contains("predictPageSwipe"));
         assertTrue(paging.contains("scheduleLiftSessionRefresh(lifted)"));
     }
 
@@ -434,7 +450,7 @@ public final class ReleaseRegressionContractTest {
         String nativeSource = Files.readString(path);
 
         assertTrue(nativeSource.contains("kVirtualNodeCount = 64"));
-        assertTrue(nativeSource.contains("放置到第"));
+        assertTrue(nativeSource.contains("移至第 "));
         assertTrue(nativeSource.contains("findDropParentNode"));
         assertTrue(nativeSource.contains("nodeId == g_drop_parent_node_id"));
         assertTrue(nativeSource.contains("kAccessibilityFocusAction"));
@@ -460,10 +476,12 @@ public final class ReleaseRegressionContractTest {
         assertTrue(iconActions.contains(
                 "injectDirectAction(node, kCancelAction, kCancelLabel);"));
         assertFalse(iconActions.contains("if (lifted && liftedSource)"));
-        assertTrue(cancel.contains("if (!g_lifted.load"));
-        assertTrue(cancel.contains("clearLiftSession();"));
-        assertTrue(cancel.contains("sendAnnouncement(nodeId, \"已取消托起\")"));
-        assertTrue(cancel.contains("sendEvent(parent >= 0 ? parent : nodeId, 2048)"));
+        assertTrue(cancel.contains("return cancelLiftSession(provider, nodeId);"));
+        String sharedCancel = between(nativeSource, "bool cancelLiftSession(", "bool placementsMatch(");
+        assertTrue(sharedCancel.contains("g_lifted.exchange(false"));
+        assertTrue(sharedCancel.contains("clearLiftSession();"));
+        assertTrue(sharedCancel.contains("\"已取消托起\""));
+        assertTrue(sharedCancel.contains("sendEvent(parent, kTypeWindowContentChanged)"));
     }
 
     @Test
@@ -473,13 +491,17 @@ public final class ReleaseRegressionContractTest {
         Path path = Files.exists(local) ? local : Path.of("app").resolve(local);
         String nativeSource = Files.readString(path);
         String placement = between(nativeSource, "bool performNativePlacement(",
-                "bool onPerformAction(");
-        String action = between(nativeSource, "bool onPerformAction(", "void *findLoadedHandle");
+                "bool performActionImpl(");
+        String action = between(nativeSource, "bool performActionImpl(", "void *findLoadedHandle");
 
         assertTrue(placement.contains("AccessibilityEventSource eventSource"));
         assertTrue(placement.contains("captureDropParentEventSource(nodeId)"));
         assertTrue(placement.contains("invokeWorkspaceReload()"));
         assertTrue(placement.contains("sendEvent(eventSource, kTypeWindowContentChanged)"));
+        assertTrue(placement.contains("beginPendingPlacement"));
+        assertTrue(placement.contains("waitForPendingPlacementVisibility"));
+        assertFalse(placement.contains("waitForVisiblePlacements(provider"));
+        assertFalse(placement.contains("eventSource, provider"));
         assertTrue(placement.indexOf("requestSnapshotRefresh(true)")
                 < placement.indexOf("invokeWorkspaceReload()"));
         assertTrue(placement.indexOf("invokeWorkspaceReload()")
@@ -488,6 +510,7 @@ public final class ReleaseRegressionContractTest {
                 < placement.indexOf("sendEvent(eventSource, kTypeWindowContentChanged)"));
         assertFalse(placement.contains("sendEvent(nodeId, 2048)"));
         assertFalse(action.contains("if (handled) sendEvent(nodeId, 2048)"));
+        assertFalse(action.contains("正在打开 "));
     }
 
     @Test
@@ -521,9 +544,9 @@ public final class ReleaseRegressionContractTest {
         String iconActions = between(nativeSource, "void injectIconActions(void *node) {",
                 "void injectRecentActions(void *node) {");
         String placement = between(nativeSource, "bool performNativePlacement(",
-                "bool onPerformAction(");
+                "bool performActionImpl(");
 
-        assertTrue(nativeSource.contains("struct ElfFingerprint"));
+        assertTrue(nativeSource.contains("#include \"native_abi_profiles.h\""));
         assertTrue(nativeSource.contains("readModuleFingerprint"));
         assertTrue(nativeSource.contains("CAP_MOVE_PROFILE"));
         assertTrue(nativeSource.contains("fingerprintMatches"));
@@ -589,6 +612,22 @@ public final class ReleaseRegressionContractTest {
         Path local = Path.of("src", "main", "java").resolve(relative);
         Path path = Files.exists(local) ? local : Path.of("app").resolve(local);
         return Files.readString(path);
+    }
+
+    private static Path projectPath(String relative) {
+        Path direct = Path.of(relative);
+        if (Files.exists(direct)) {
+            return direct;
+        }
+        Path appRelative = Path.of("app").resolve(relative);
+        if (Files.exists(appRelative)) {
+            return appRelative;
+        }
+        Path parentRelative = Path.of("..").resolve(relative);
+        if (Files.exists(parentRelative)) {
+            return parentRelative;
+        }
+        throw new IllegalStateException("Missing project file: " + relative);
     }
 
     private static String manifest() throws IOException {

@@ -89,6 +89,8 @@ final class HyperOs4NodeAdapter {
 
     private volatile Object lastController;
     private volatile View rootView;
+    private volatile int lastDecoratedNodeCount;
+    private volatile int lastDecoratedWindowCount;
     private HyperOs4Workspace workspace;
     private HyperOs4GestureDispatcher gestures;
     private Session session;
@@ -287,7 +289,22 @@ final class HyperOs4NodeAdapter {
         int action = (int) chain.getArg(1);
         int virtualId = HyperOs4VirtualNodes.virtualDescendantId(nodeId);
         boolean synthetic = HyperOs4VirtualNodes.contains(virtualId);
-        if (applicationActionsOnly && (synthetic || !isApplicationAction(action))) {
+        if (applicationActionsOnly && (isCustomAction(action)
+                || (synthetic && action == AccessibilityNodeInfo.ACTION_CLICK))) {
+            recordDiagnostic("原生动作 action=0x" + Integer.toHexString(action)
+                    + " node=" + nodeId
+                    + " synthetic=" + synthetic
+                    + " nodes=" + lastDecoratedNodeCount
+                    + " windows=" + lastDecoratedWindowCount);
+        }
+        if (applicationActionsOnly && (synthetic
+                || (!isApplicationAction(action) && action != ActionIds.EDIT_FOLDER))) {
+            return chain.proceed();
+        }
+        if (applicationActionsOnly && action == ActionIds.EDIT_FOLDER) {
+            // Native Flutter nodes perform this action through the Rust
+            // provider; the Java adapter only supplies the fallback action
+            // label and folder role.
             return chain.proceed();
         }
         if (!synthetic && !isCustomAction(action)) {
@@ -334,6 +351,8 @@ final class HyperOs4NodeAdapter {
                 byWindow.computeIfAbsent(node.getWindowId(), ignored -> new ArrayList<>()).add(node);
             }
         }
+        lastDecoratedNodeCount = nodes.size();
+        lastDecoratedWindowCount = byWindow.size();
         for (Map.Entry<Integer, List<AccessibilityNodeInfo>> window : byWindow.entrySet()) {
             decorateWindow(controller, window.getKey(), window.getValue(), nodes,
                     appendVirtualNodes);
@@ -360,6 +379,13 @@ final class HyperOs4NodeAdapter {
 
         Map<Integer, HyperOs4Workspace.DropTarget> targets = new LinkedHashMap<>();
         Map<View, List<HyperOs4Workspace.DropTarget>> byHost = new IdentityHashMap<>();
+        Map<AccessibilityNodeInfo, int[]> cellOrder = new IdentityHashMap<>();
+        for (Map.Entry<AccessibilityNodeInfo, HyperOs4Workspace.ResolvedNode> entry
+                : resolved.entrySet()) {
+            StableItemRef item = entry.getValue().item();
+            cellOrder.put(entry.getKey(), new int[]{item.cellY(), item.cellX()});
+        }
+        List<AccessibilityNodeInfo> virtualNodes = new ArrayList<>();
         hoverTargets.clear();
         if (active != null && !placementInProgress && workspace.virtualIdsAvailable()) {
             for (HyperOs4Workspace.DropTarget target
@@ -377,6 +403,8 @@ final class HyperOs4NodeAdapter {
                         AccessibilityNodeInfo virtual = createVirtualNode(host, target);
                         if (virtual != null) {
                             output.add(virtual);
+                            virtualNodes.add(virtual);
+                            cellOrder.put(virtual, new int[]{target.cellY(), target.cellX()});
                         }
                     }
                 }
@@ -391,6 +419,46 @@ final class HyperOs4NodeAdapter {
             hoverTargets.put(entry.getKey(), List.copyOf(entry.getValue()));
             ensureHoverHook(entry.getKey());
         }
+        if (appendVirtualNodes && !virtualNodes.isEmpty()) {
+            reorderWindowNodes(output, windowNodes, virtualNodes, cellOrder);
+        }
+    }
+
+    private static void reorderWindowNodes(
+            List<AccessibilityNodeInfo> output,
+            List<AccessibilityNodeInfo> windowNodes,
+            List<AccessibilityNodeInfo> virtualNodes,
+            Map<AccessibilityNodeInfo, int[]> cellOrder
+    ) {
+        List<AccessibilityNodeInfo> members = new ArrayList<>();
+        for (AccessibilityNodeInfo node : windowNodes) {
+            if (cellOrder.containsKey(node)) {
+                members.add(node);
+            }
+        }
+        members.addAll(virtualNodes);
+        List<AccessibilityNodeInfo> ordered = new ArrayList<>(members);
+        ordered.sort((left, right) -> {
+            int[] a = cellOrder.get(left);
+            int[] b = cellOrder.get(right);
+            int byRow = Integer.compare(a[0], b[0]);
+            return byRow != 0 ? byRow : Integer.compare(a[1], b[1]);
+        });
+        Set<AccessibilityNodeInfo> memberSet = Collections.newSetFromMap(
+                new IdentityHashMap<>());
+        memberSet.addAll(members);
+        int insertion = -1;
+        for (int index = 0; index < output.size(); index++) {
+            if (memberSet.contains(output.get(index))) {
+                insertion = index;
+                break;
+            }
+        }
+        if (insertion < 0) {
+            return;
+        }
+        output.removeIf(memberSet::contains);
+        output.addAll(Math.min(insertion, output.size()), ordered);
     }
 
     private void addNodeActions(
@@ -398,7 +466,13 @@ final class HyperOs4NodeAdapter {
             HyperOs4Workspace.ResolvedNode target,
             Session active
     ) throws Throwable {
+        if (target.item().isSupportedFolder()) {
+            mutate(node, () -> node.setClassName(View.class.getName()));
+        }
         List<ActionSpec> actions = new ArrayList<>();
+        if (!placementInProgress && active == null && target.item().isSupportedFolder()) {
+            actions.add(new ActionSpec(ActionIds.EDIT_FOLDER, "编辑"));
+        }
         if (!applicationActionsOnly) {
             if (!placementInProgress && active == null && target.item().isSupportedLiftSource()) {
                 actions.add(new ActionSpec(ActionIds.LIFT, "托起"));
@@ -459,11 +533,23 @@ final class HyperOs4NodeAdapter {
     }
 
     private boolean handleNodeAction(Object controller, long nodeId, int action) {
-        if (applicationActionsOnly && !isApplicationAction(action)) {
+        if (applicationActionsOnly && action != ActionIds.EDIT_FOLDER
+                && !isApplicationAction(action)) {
             return false;
         }
         HyperOs4Workspace.ResolvedNode node = workspace == null
                 ? null : workspace.resolve(nodeId);
+        if (action == ActionIds.EDIT_FOLDER && node != null
+                && node.item().isSupportedFolder()) {
+            try {
+                View folder = hostFor(controller, nodeId);
+                return folder != null && folder.performAccessibilityAction(
+                        AccessibilityNodeInfo.ACTION_LONG_CLICK, null);
+            } catch (ReflectiveOperationException | RuntimeException exception) {
+                logFailure("folder-edit", exception);
+                return false;
+            }
+        }
         if (node != null && activeSession(-1) == null) {
             AppTarget appTarget = appTarget(node.favorite());
             if (appTarget != null && action == ActionIds.APP_INFO) {
@@ -492,7 +578,7 @@ final class HyperOs4NodeAdapter {
                 session = new Session(node, screen,
                         SystemClock.elapsedRealtime() + SESSION_MILLIS);
             }
-            announce("已托起 " + node.label());
+            announce("已拖起");
             sendNodeEvent(controller, node.nodeId(), AccessibilityEvent.TYPE_VIEW_CLICKED, null);
             notifyContentChanged();
             return true;
@@ -1173,6 +1259,16 @@ final class HyperOs4NodeAdapter {
         if (loggedFailures.add(key)) {
             module.log(Log.WARN, TAG, stage + " failed: "
                     + cause.getClass().getSimpleName());
+            recordDiagnostic("桌面动作异常 stage=" + stage + " type="
+                    + cause.getClass().getSimpleName());
+        }
+    }
+
+    private void recordDiagnostic(String message) {
+        View root = rootView;
+        if (root != null && message != null && !message.isEmpty()) {
+            Context context = root.getContext();
+            main.post(() -> DiagnosticsClient.record(context, message));
         }
     }
 

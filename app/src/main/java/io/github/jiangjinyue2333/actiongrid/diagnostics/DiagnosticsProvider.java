@@ -17,8 +17,12 @@ public final class DiagnosticsProvider extends ContentProvider {
     public static final String AUTHORITY = "io.github.jiangjinyue2333.actiongrid.diagnostics";
     public static final Uri LOG_URI = Uri.parse("content://" + AUTHORITY + "/" + LogStore.FILE_NAME);
     public static final String METHOD_APPEND = "append";
+    public static final String METHOD_STATE = "state";
+    public static final String METHOD_APPEND_NATIVE = "append_native";
     public static final String EXTRA_SOURCE = "source";
     public static final String EXTRA_MESSAGE = "message";
+    public static final String EXTRA_SESSION = "session";
+    public static final String EXTRA_ACK = "ack";
 
     private static final String TARGET_PACKAGE = "com.miui.home";
 
@@ -31,6 +35,21 @@ public final class DiagnosticsProvider extends ContentProvider {
     public Bundle call(String method, String arg, Bundle extras) {
         if (!isTrustedCaller()) {
             throw new SecurityException("Untrusted diagnostics caller");
+        }
+        if (METHOD_STATE.equals(method)) {
+            Bundle result = new Bundle();
+            result.putLong(EXTRA_SESSION, LogStore.nativeState(requireContext(),
+                    Binder.getCallingUid() != requireContext().getApplicationInfo().uid));
+            return result;
+        }
+        if (METHOD_APPEND_NATIVE.equals(method)) {
+            LogStore.NativeAppendResult written = LogStore.appendNative(requireContext(),
+                    extras == null ? 0 : extras.getLong(EXTRA_SESSION, 0),
+                    extras == null ? null : extras.getString(EXTRA_MESSAGE));
+            Bundle result = new Bundle();
+            result.putLong(EXTRA_SESSION, written.session);
+            result.putLong(EXTRA_ACK, written.acknowledgement);
+            return result;
         }
         if (METHOD_APPEND.equals(method) && extras != null) {
             LogStore.append(requireContext(), extras.getString(EXTRA_SOURCE, "hook"),
@@ -45,11 +64,7 @@ public final class DiagnosticsProvider extends ContentProvider {
         if (!"r".equals(mode) || !LOG_URI.equals(uri)) {
             throw new FileNotFoundException("Unsupported diagnostics path");
         }
-        File file = LogStore.file(requireContext());
-        if (!file.isFile()) {
-            throw new FileNotFoundException("No diagnostics file");
-        }
-        return ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY);
+        return LogStore.openExport(requireContext());
     }
 
     private boolean isTrustedCaller() {
@@ -57,7 +72,15 @@ public final class DiagnosticsProvider extends ContentProvider {
         if (uid == requireContext().getApplicationInfo().uid) {
             return true;
         }
-        return TARGET_PACKAGE.equals(getCallingPackage());
+        String[] packages = requireContext().getPackageManager().getPackagesForUid(uid);
+        if (packages != null) {
+            for (String packageName : packages) {
+                if (TARGET_PACKAGE.equals(packageName)) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     @Override

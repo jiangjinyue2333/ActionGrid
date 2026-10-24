@@ -40,7 +40,18 @@ Require-Text 'hook/src/main/java/io/github/jiangjinyue2333/actiongrid/hook/Hyper
 Require-Text 'hook/src/main/java/io/github/jiangjinyue2333/actiongrid/hook/HyperOs4Compatibility.java' '801027722' '必须保留 7722 native profile'
 Require-Text 'hook/src/main/java/io/github/jiangjinyue2333/actiongrid/hook/HyperOs4Compatibility.java' '801027653' '必须保留 7653 native profile'
 Require-Text 'app/src/main/cpp/native_init.cpp' 'actiongrid_native_capabilities' 'Rust 原生后端必须提供能力状态'
-Require-Text 'app/src/main/cpp/native_init.cpp' 'kExpectedPrivateBuildId' 'Rust 原生后端必须校验 Build ID'
+Require-Text 'app/src/main/cpp/native_init.cpp' 'knownSystemAbi' '基础动作必须独立验证完整系统 ABI'
+Require-Text 'app/src/main/cpp/native_abi_profiles.h' 'kLegacy7748' '必须包含核对过的 7748 Rust profile'
+Require-Text 'app/src/main/cpp/native_init.cpp' 'batchMoveOperation' '批量事务必须使用所选 profile 的操作号'
+Require-Text 'app/src/main/cpp/native_init.cpp' 'workspaceContainer' '原生桌面事务必须检查文件夹边界'
+Require-Text 'app/src/main/cpp/zip_directory.h' 'offset \+ 22 \+ commentSize == size' 'APK 尾记录必须完整且不能越界'
+Require-Text 'hook/src/main/java/io/github/jiangjinyue2333/actiongrid/hook/FolderDragTransfer.java' 'removeItemsFromSourceWhenMultiDrag' '文件夹拖出必须复用原生源项清理'
+Require-Text 'hook/src/main/java/io/github/jiangjinyue2333/actiongrid/hook/ActionGridModule.java' 'PageOrderProtocol.supports' '页码倒序必须通过共用的 7.x 范围检查'
+Require-Text 'scripts/test-native-policy.ps1' 'native_abi_profiles_test.cpp' '原生能力边界必须有可编译回归'
+Require-Text 'scripts/verify-launcher-contract.py' 'opcode_target' 'FRB 契约必须核对真实二进制操作目标'
+Require-Text 'docs/PROJECT_STRUCTURE.md' 'native_abi_profiles.h' '结构文档必须记录原生 ABI 模块'
+Require-Text 'docs/PROJECT_STRUCTURE.md' 'FolderDragTransfer' '结构文档必须记录文件夹事务模块'
+Require-Text 'docs/PROJECT_STRUCTURE.md' 'PageOrderProtocol' '结构文档必须记录页码倒序边界'
 Require-Text 'app/src/main/cpp/native_init.cpp' 'frb_pde_ffi_dispatcher_primary' '澎湃 4 必须使用内部 FRB 放置入口'
 Require-Text 'app/src/main/cpp/native_init.cpp' 'kExpectedCurrentLauncherDartBuildId' 'native 必须识别 8565 Build ID'
 Require-Text 'app/src/main/cpp/native_init.cpp' 'kExpectedPreviousLauncherDartBuildId' 'native 必须识别 7653 Build ID'
@@ -77,10 +88,15 @@ Require-Text 'app/src/main/AndroidManifest.xml' 'android:permission="android\.pe
 Require-Text 'app/src/main/java/io/github/jiangjinyue2333/actiongrid/WeChatShortcutActivity.java' 'getLaunchedFromPackage' '卸载入口必须校验调用方包名'
 Require-Text 'app/src/main/java/io/github/jiangjinyue2333/actiongrid/WeChatShortcutActivity.java' 'getPackagesForUid' '卸载入口必须校验调用方 UID'
 Require-Text 'scripts/build-release.ps1' 'aapt dump badging' '发布脚本必须读取 APK 实际版本'
+Require-Text 'scripts/create-update-manifest.ps1' 'releases/download' 'GitHub 发布必须生成可下载更新清单'
 Require-Text 'scripts/verify-release.ps1' 'expectedCertificateSha256' '发布验证必须固定证书连续性'
 Require-Text 'scripts/verify-release.ps1' 'ExpectedTag' '发布验证必须核对 tag 版本'
+Require-Text 'scripts/verify-release.ps1' 'verify-apk-abi.ps1' '正式包必须检查合并 manifest 与 ELF 安装 ABI'
+Require-Text '.github/workflows/signed-apk.yml' 'run: ./scripts/test-apk-abi.ps1' '普通构建必须验证安装 ABI 和错误样例'
+Require-Text 'docs/INSTALLATION_ABI.md' 'multiArch' '安装 ABI 约束必须记录在专项文档'
 Require-Text '.github/workflows/signed-apk.yml' 'refs/tags/v' '正式签名必须限制在 v<version> tag'
 Require-Text '.github/workflows/signed-apk.yml' 'run: ./scripts/build-release.ps1' '云端构建必须复用正式发布脚本'
+Require-Text '.github/workflows/signed-apk.yml' 'create-update-manifest.ps1' 'GitHub Release 必须上传更新清单'
 Require-Text '.github/workflows/signed-apk.yml' 'if: always\(\)' '签名密钥清理必须始终执行'
 Require-Text 'docs/PROJECT_STRUCTURE.md' 'signed-apk.yml' '项目结构文档必须说明云端签名入口'
 Require-Text 'docs/PROJECT_STRUCTURE.md' '正式版本以' '项目结构文档必须使用通用版本说明'
@@ -118,6 +134,14 @@ if ($hyperAdapter -match 'com\.android\.server|onSystemServerStarting') {
 $hookBuild = Get-Content -Raw -LiteralPath (Join-Path $root 'hook/build.gradle.kts')
 if ($hookBuild -match 'project\(":app"\)') {
     throw '结构验证失败：hook 不得依赖 app'
+}
+
+[xml] $appManifest = Get-Content -Raw -LiteralPath (Join-Path $root 'app/src/main/AndroidManifest.xml')
+foreach ($attribute in @('multiArch', 'use32bitAbi')) {
+    $value = $appManifest.manifest.application.GetAttribute($attribute, 'http://schemas.android.com/apk/res/android')
+    if ($value -and $value -ne 'false') {
+        throw "结构验证失败：arm64 单 ABI 包不得启用 android:$attribute"
+    }
 }
 
 $bridge = Get-Content -Raw -LiteralPath (Join-Path $root 'hook/src/main/java/io/github/jiangjinyue2333/actiongrid/hook/MiuiHomeBridge.java')

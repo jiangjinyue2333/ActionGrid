@@ -74,6 +74,8 @@ if ($badging -notmatch 'compileSdkVersion[^0-9]*37') {
     throw 'APK compile SDK 不是 37'
 }
 
+& (Join-Path $PSScriptRoot 'verify-apk-abi.ps1') -ApkPath $apk
+
 & $apksigner verify --verbose $apk | Out-Null
 if ($LASTEXITCODE -ne 0) {
     throw 'APK 签名验证失败'
@@ -119,17 +121,6 @@ try {
             throw "APK 中 $($pair.Key) 内容不正确"
         }
     }
-
-    if ($null -eq $archive.GetEntry('lib/arm64-v8a/libactiongrid_native.so')) {
-        throw 'APK 缺少 arm64-v8a native 库'
-    }
-    $unexpectedNative = @($archive.Entries | Where-Object {
-        $_.FullName -match '^lib/[^/]+/libactiongrid_native\.so$' -and
-        $_.FullName -ne 'lib/arm64-v8a/libactiongrid_native.so'
-    })
-    if ($unexpectedNative.Count -gt 0) {
-        throw "APK 包含未预期的 native ABI：$($unexpectedNative.FullName -join ', ')"
-    }
 } finally {
     $archive.Dispose()
 }
@@ -146,5 +137,5 @@ if ($defined -match '(?m)^C\s+.*(?:de\.robv\.android\.xposed|io\.github\.libxpos
 }
 
 $hash = (Get-FileHash -LiteralPath $apk -Algorithm SHA256).Hash.ToLowerInvariant()
-Write-Output "发布 APK 验证通过：versionName=$versionName、versionCode=$versionCode、Android 14–17、Modern API 102、三套 HyperOS 4 native profile、静态作用域、DEX 入口与签名均正确。"
+Write-Output "发布 APK 验证通过：versionName=$versionName、versionCode=$versionCode、Android 14–17、Modern API 102、arm64 原生库、静态作用域、DEX 入口与签名均正确。"
 Write-Output "SHA-256: $hash"

@@ -271,11 +271,12 @@ $systemProfile = switch ($systemFingerprintKey) {
 if ($publicFingerprint -ne 'e3cc5ece19a86f1968095ade224bb05b') {
     throw "公开 Rust 库 ELF 指纹不匹配：$publicFingerprint (Build ID=$publicId)"
 }
-$launcherFingerprintKey = "$dartFingerprint|$launcherFingerprint"
+$launcherFingerprintKey = $launcherFingerprint
 $launcherProfile = switch ($launcherFingerprintKey) {
-    '5e31a8f53bfa5c9566ff90acbeddc872|0676d70c1d6227d6e899ab4db826315e' { 'legacy7653' }
-    'efa1be7bb9c193dd727e1f5340ea701e|6aafec65d595b957d78ecbfd33f5b7af' { 'legacy7722' }
-    'd8c9d91e0825e4ad33c1b7c515f4d2fa|d43e8de27a633a7e770a572f4b6ddfc6' { 'current8565' }
+    '0676d70c1d6227d6e899ab4db826315e' { 'legacy7653' }
+    '6aafec65d595b957d78ecbfd33f5b7af' { 'legacy7722' }
+    '6018f13c7a9d6274d0b4054c1d248904' { 'legacy7748' }
+    'd43e8de27a633a7e770a572f4b6ddfc6' { 'current8565' }
     default { throw "桌面 ELF 指纹未验证：$launcherFingerprintKey (Build ID=$dartId)" }
 }
 if (($systemProfile -eq 'current8565') -ne ($launcherProfile -eq 'current8565')) {
@@ -306,6 +307,7 @@ function Verify-WorkspaceReloadPrologue([string] $path, [string] $tool, [UInt64]
 $workspaceReloadOffset = switch ($launcherProfile) {
     'legacy7653' { [UInt64] 0x7a1660 }
     'legacy7722' { [UInt64] 0x7a2008 }
+    'legacy7748' { [UInt64] 0x7a35a4 }
     'current8565' { [UInt64] 0x7aa050 }
     default { throw "没有 workspace reload profile：$launcherProfile" }
 }
@@ -326,6 +328,7 @@ foreach ($symbol in @(
     'AccessibilityNodeInfo_add_action',
     'AccessibilityNodeInfo_drop',
     'AccessibilityNodeInfo_set_content_description',
+    'AccessibilityNodeInfo_set_traversal_after',
     'AccessibilityNodeInfo_set_text',
     'AccessibilityNodeInfo_set_selected',
     'AccessibilityNodeInfo_set_checked',
@@ -358,7 +361,8 @@ foreach ($symbol in @(
     Require-Symbol $launcherSymbols $symbol
 }
 
-$nativeSource = Get-Content -Raw -LiteralPath (Join-Path $root 'app/src/main/cpp/native_init.cpp')
+$nativeSource = (Get-Content -Raw -LiteralPath (Join-Path $root 'app/src/main/cpp/native_init.cpp')) +
+    (Get-Content -Raw -LiteralPath (Join-Path $root 'app/src/main/cpp/native_abi_profiles.h'))
 foreach ($buildId in @(
     '401af21eddb88554a568b61ef29fc138',
     'e05f4ad255225718a2f86dfcc636b871',
@@ -383,10 +387,8 @@ foreach ($fingerprint in @(
     '06ad928995604d98', 'e150a44005597071',
     '0447f0269df2c72f', '98e52e43a1f1887a',
     'e3cc5ece19a86f19', '68095ade224bb05b',
-    '5e31a8f53bfa5c95', '66ff90acbeddc872',
-    'efa1be7bb9c193dd', '27e1f5340ea701e',
-    'd8c9d91e0825e4ad', '33c1b7c515f4d2fa',
     '0676d70c1d6227d6', 'e899ab4db826315e',
+    '6018f13c7a9d6274', 'd0b4054c1d248904',
     '6aafec65d595b957', 'd78ecbfd33f5b7af',
     'd43e8de27a633a7e', '770a572f4b6ddfc6'
 )) {
@@ -403,7 +405,7 @@ foreach ($op in @(
         throw "缺少 HyperOS4 FRB 内部模型操作：$op"
     }
 }
-foreach ($offset in @('0x7a1660', '0x7a2008', '0x7aa050')) {
+foreach ($offset in @('0x7a1660', '0x7a2008', '0x7a35a4', '0x7aa050')) {
     if ($nativeSource -notmatch [regex]::Escape($offset)) {
         throw "native_init.cpp 缺少 workspace reload profile 偏移：$offset"
     }

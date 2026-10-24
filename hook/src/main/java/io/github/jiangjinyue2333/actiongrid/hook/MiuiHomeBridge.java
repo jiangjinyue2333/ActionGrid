@@ -494,7 +494,7 @@ final class MiuiHomeBridge {
             int rows = verticalCellCountField.getInt(host);
             View[][] occupied = (View[][]) occupiedCellsField.get(host);
             long screenId = ((Number) cellLayoutGetScreenId.invoke(host)).longValue();
-            if (columns <= 0 || rows <= 0 || occupied == null
+            if (columns <= 0 || rows <= 0
                     || host.getWidth() <= 0 || host.getHeight() <= 0) {
                 return List.of();
             }
@@ -502,7 +502,9 @@ final class MiuiHomeBridge {
             for (VirtualGridLayout.Cell cell : VirtualGridLayout.cells(columns, rows)) {
                 int column = cell.column();
                 int row = cell.row();
-                View occupiedView = occupied[column][row];
+                View occupiedView = occupied == null || column >= occupied.length
+                        || occupied[column] == null || row >= occupied[column].length
+                        ? null : occupied[column][row];
                 VirtualGridLayout.Geometry geometry = desktopGeometry(
                         host, column, row, columns, rows);
                 String emptyDescription;
@@ -629,7 +631,7 @@ final class MiuiHomeBridge {
                 session.sourceRefs().stream().allMatch(StableItemRef::isSupportedShortcut),
                 targetRef, targetKind(target))
                 .contains(action)) {
-            callback.onComplete(false, "当前桌面状态已变化，请重新托起");
+            callback.onComplete(false, "目标位置已变化，请重新选择位置");
             return;
         }
         Object launcherObject = findLauncher(target);
@@ -656,7 +658,7 @@ final class MiuiHomeBridge {
         View anchor = session.anchor();
         View host = target.host();
         if (anchor == null || !sessionStillValid(session) || !positionStillAvailable(target)) {
-            callback.onComplete(false, "当前桌面状态已变化，请重新托起");
+            callback.onComplete(false, "目标位置已变化，请重新选择位置");
             return;
         }
         Object launcherObject = findLauncher(host);
@@ -815,6 +817,16 @@ final class MiuiHomeBridge {
             PlacementCallback callback) {
         try {
             StableItemRef source = describe(anchor);
+            if (source == null || !session.sourceIds().contains(source.id())
+                    || !session.sourceItems().contains(anchor.getTag())) {
+                failPlacement(launcher, callback);
+                return;
+            }
+            FolderDragTransfer folderTransfer = family == BridgeFamily.MODERN_7X
+                    && source.container() > 0 && source.container() != targetContainer
+                    && session.sourceItems().size() == 1
+                    ? FolderDragTransfer.prepare(launcher, anchor.getTag(), source.container())
+                    : null;
             boolean sourceCanChangePage = source != null
                     && source.container() == StableItemRef.CONTAINER_DESKTOP
                     && (targetContainer == StableItemRef.CONTAINER_DESKTOP
@@ -847,6 +859,16 @@ final class MiuiHomeBridge {
                         dispatch(launcher, downTime, downTime,
                                 MotionEvent.ACTION_DOWN, sourcePoint);
                         launcherLongClick.invoke(launcher, anchor);
+                    }
+                    if (folderTransfer != null) {
+                        NativeDrag folderDrag = currentNativeDrag(
+                                launcher, downTime, sourcePoint, true);
+                        try {
+                            folderTransfer.onDragStarted(folderDrag.dragObject());
+                        } catch (ReflectiveOperationException | RuntimeException exception) {
+                            cancelSyntheticTouch(launcher, folderDrag);
+                            throw exception;
+                        }
                     }
                     boolean showTarget = workspace != null
                             && targetContainer == StableItemRef.CONTAINER_DESKTOP
@@ -956,10 +978,16 @@ final class MiuiHomeBridge {
                     return false;
                 }
                 View[][] occupied = (View[][]) occupiedCellsField.get(target.host());
-                return occupied != null
-                        && target.cellX() >= 0 && target.cellX() < occupied.length
-                        && target.cellY() >= 0 && target.cellY() < occupied[target.cellX()].length
-                        && occupied[target.cellX()][target.cellY()] == null;
+                if (occupied == null) {
+                    return true;
+                }
+                if (target.cellX() < 0 || target.cellX() >= occupied.length
+                        || occupied[target.cellX()] == null
+                        || target.cellY() < 0
+                        || target.cellY() >= occupied[target.cellX()].length) {
+                    return false;
+                }
+                return occupied[target.cellX()][target.cellY()] == null;
             }
             if (target.container() == StableItemRef.CONTAINER_HOTSEAT) {
                 if (hotseatMaxCount == null) {

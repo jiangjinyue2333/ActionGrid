@@ -11,8 +11,15 @@ android {
         applicationId = "io.github.jiangjinyue2333.actiongrid"
         minSdk = 34
         targetSdk = 37
-        versionCode = 16
-        versionName = "0.4"
+        versionCode = 28
+        versionName = "0.4.12"
+        testInstrumentationRunner = "io.github.jiangjinyue2333.actiongrid.diagnostics.DiagnosticsInstrumentation"
+
+        externalNativeBuild {
+            ndkBuild {
+                arguments += "ACTIONGRID_VERSION=$versionName"
+            }
+        }
 
         ndk {
             abiFilters += "arm64-v8a"

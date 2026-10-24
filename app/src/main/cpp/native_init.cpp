@@ -1,3 +1,7 @@
+#include "native_abi_profiles.h"
+#include "zip_directory.h"
+#include "native_diagnostics.h"
+
 #include <android/log.h>
 #include <jni.h>
 #include <dlfcn.h>
@@ -24,10 +28,56 @@
 #include <chrono>
 #include <limits>
 #include <cstdio>
+#include <cstdarg>
 #include <cmath>
 #include <time.h>
 
 namespace {
+
+using namespace actiongrid::abi;
+
+#ifndef ACTIONGRID_VERSION
+#define ACTIONGRID_VERSION "development"
+#endif
+
+actiongrid::diagnostics::Buffer g_diagnostics;
+std::atomic<bool> g_diagnostics_started{false};
+std::atomic<bool> g_diagnostics_apis_ready{false};
+std::atomic<int> g_diagnostics_node_budget{0};
+std::mutex g_diagnostics_wake_mutex;
+std::condition_variable g_diagnostics_wake_cv;
+bool g_diagnostics_wake = false;
+void ensureDiagnosticsWorker();
+void logDiagnosticsSnapshot(const char *reason);
+
+void nativeLog(int priority, const char *tag, const char *format, ...) {
+    va_list arguments;
+    va_start(arguments, format);
+    va_list copy;
+    va_copy(copy, arguments);
+    __android_log_vprint(priority, tag, format, arguments);
+    va_end(arguments);
+    const int64_t session = g_diagnostics.session();
+    if (session != 0) {
+        char message[2048];
+        vsnprintf(message, sizeof(message), format, copy);
+        timespec now{};
+        clock_gettime(CLOCK_REALTIME, &now);
+        char prefix[96];
+        snprintf(prefix, sizeof(prefix), "time=%lld.%03ld pid=%d level=%d ",
+                static_cast<long long>(now.tv_sec), now.tv_nsec / 1000000L, getpid(), priority);
+        g_diagnostics.append(std::string(prefix) + message, session);
+    }
+    va_end(copy);
+}
+
+void wakeDiagnosticsWorker() {
+    {
+        std::lock_guard lock(g_diagnostics_wake_mutex);
+        g_diagnostics_wake = true;
+    }
+    g_diagnostics_wake_cv.notify_one();
+}
 
 using HookFunType = int (*)(void *function, void *replace, void **backup);
 using UnhookFunType = int (*)(void *function);
@@ -58,6 +108,7 @@ constexpr uint32_t CAP_SCENE_ACTIVITY = 1U << 13;
 constexpr uint32_t CAP_MOVE_PROFILE = 1U << 14;
 
 constexpr int32_t kTypeViewScrolled = 4096;
+constexpr int32_t kTypeViewClicked = 1;
 constexpr int32_t kTypeAnnouncement = 16384;
 constexpr int32_t kTypeWindowContentChanged = 2048;
 constexpr int32_t kSqliteRow = 100;
@@ -65,7 +116,7 @@ constexpr int32_t kSqliteDone = 101;
 
 // HyperOS 4 public ABI build e2ba6d4: verified against libhyper_os_aidl.
 constexpr size_t kEventSourceOffset = 0x88;
-constexpr size_t kEventWindowOffset = 0x90;
+constexpr size_t kEventWindowOffset = 0xc4;
 constexpr size_t kEventTextOffset = 0x38;
 constexpr size_t kEventItemCountOffset = 0x98;
 constexpr size_t kEventFromIndexOffset = 0x9c;
@@ -77,52 +128,6 @@ constexpr uint32_t kFrbUpdateItemDatabaseBatch = 854U;
 constexpr uint32_t kFrbStartLoad = 851U;
 // HyperOS 4.01.02.8565 primary dispatcher: single ItemInfo move operation.
 constexpr uint32_t kFrbMoveItemInDatabase = 833U;
-
-enum class LauncherAbiProfile : uint8_t {
-    kUnknown,
-    kLegacy7653,
-    kLegacy7722,
-    kCurrent8565,
-};
-
-struct ElfFingerprint {
-    uint64_t first = 0;
-    uint64_t second = 0;
-    bool valid = false;
-};
-
-struct KnownFingerprint {
-    uint64_t first;
-    uint64_t second;
-};
-
-// Filled from the checked-in ELF samples by scripts/verify-native-abi.ps1.
-// PT_NOTE/.comment bytes are excluded, so a Build ID-only rebuild keeps the
-// same structural fingerprint.
-constexpr KnownFingerprint kSystemPrivateFingerprint{
-        0x5b7a19c56d7704c7ULL, 0xf5c729612d74d0deULL};
-constexpr KnownFingerprint kLegacyAidlFingerprint{
-        0xd884584d8d3d6fb8ULL, 0xcd7b61ccbcf2dab1ULL};
-constexpr KnownFingerprint kCurrentAidlFingerprint{
-        0xdaf46dda4c2b40d4ULL, 0xceb378cc00132dc9ULL};
-constexpr KnownFingerprint kLegacyUiFingerprint{
-        0x06ad928995604d98ULL, 0xe150a44005597071ULL};
-constexpr KnownFingerprint kCurrentUiFingerprint{
-        0x0447f0269df2c72fULL, 0x98e52e43a1f1887aULL};
-constexpr KnownFingerprint kPublicFingerprint{
-        0xe3cc5ece19a86f19ULL, 0x68095ade224bb05bULL};
-constexpr KnownFingerprint kLegacy7653DartFingerprint{
-        0x5e31a8f53bfa5c95ULL, 0x66ff90acbeddc872ULL};
-constexpr KnownFingerprint kLegacy7722DartFingerprint{
-        0xefa1be7bb9c193ddULL, 0x27e1f5340ea701eULL};
-constexpr KnownFingerprint kCurrent8565DartFingerprint{
-        0xd8c9d91e0825e4adULL, 0x33c1b7c515f4d2faULL};
-constexpr KnownFingerprint kLegacy7653LauncherFingerprint{
-        0x0676d70c1d6227d6ULL, 0xe899ab4db826315eULL};
-constexpr KnownFingerprint kLegacy7722LauncherFingerprint{
-        0x6aafec65d595b957ULL, 0xd78ecbfd33f5b7afULL};
-constexpr KnownFingerprint kCurrent8565LauncherFingerprint{
-        0xd43e8de27a633a7eULL, 0x770a572f4b6ddfc6ULL};
 
 constexpr char kExpectedLegacyPrivateBuildId[] =
         "401af21eddb88554a568b61ef29fc138";
@@ -153,7 +158,7 @@ constexpr char kExpectedPreviousLauncherDartBuildId[] =
 constexpr char kExpectedCurrentLauncherDartBuildId[] =
         "4f1bdaeda5978273de7d3ebca639ae02";
 // maybe_trigger_workspace_reload() is an internal, zero-argument entry point.
-// Keep every offset behind its paired libapp Build ID and verify its prologue
+// Keep every offset behind its libapp_launcher fingerprint and verify its prologue
 // before calling it.
 constexpr uint32_t kWorkspaceReloadPrologue[] = {
         0xd10343ffU, 0xa90b7bfdU, 0xa90c4ff4U, 0x9102c3fdU};
@@ -173,6 +178,7 @@ constexpr char kSendEventSymbol[] =
 std::atomic<uint32_t> g_capabilities{0};
 std::atomic<LauncherAbiProfile> g_launcher_profile{LauncherAbiProfile::kUnknown};
 std::atomic<bool> g_launcher_fingerprint_ready{false};
+std::atomic<bool> g_launcher_system_compatible{false};
 std::atomic<bool> g_current_frb_move_profile{false};
 std::atomic<uint32_t> g_node_action_calls{0};
 std::atomic<uint32_t> g_custom_action_calls{0};
@@ -220,6 +226,8 @@ using NodeSetBoolFn = void (*)(void *, bool);
 using NodeSetBoundsFn = void (*)(void *, uint64_t, uint64_t);
 using NodeAddChildFn = void (*)(void *, int32_t, int32_t);
 using NodeSetSourceFn = void (*)(void *, int32_t, int32_t, int32_t);
+using NodeSetParentFn = void (*)(void *, int32_t, int32_t);
+using NodeSetTraversalFn = void (*)(void *, int32_t, int32_t);
 NodeNewFn g_node_new = nullptr;
 NodeSetStringFn g_node_set_content_description = nullptr;
 NodeSetStringFn g_node_set_class_name = nullptr;
@@ -233,7 +241,9 @@ NodeSetBoundsFn g_node_set_bounds = nullptr;
 NodeSetBoundsFn g_node_set_parent_bounds = nullptr;
 NodeAddChildFn g_node_add_child = nullptr;
 NodeSetSourceFn g_node_set_source = nullptr;
-NodeSetSourceFn g_node_set_parent = nullptr;
+NodeSetParentFn g_node_set_parent = nullptr;
+NodeSetTraversalFn g_node_set_traversal_after = nullptr;
+NodeSetTraversalFn g_node_set_traversal_before = nullptr;
 NodeSetBoolFn g_node_set_important = nullptr;
 NodeSetBoolFn g_node_set_accessibility_focused = nullptr;
 using EventNewFn = void *(*)(int32_t);
@@ -262,12 +272,33 @@ std::atomic<bool> g_find_focus_hook_attempted{false};
 using MotionNewFn = void *(*)(int64_t, int64_t, int32_t, float, float, int32_t);
 MotionNewFn g_motion_new = nullptr;
 using MotionActionFn = int32_t (*)(void *);
+using MotionSetActionFn = void (*)(void *, int32_t);
+using MotionCloneFn = void *(*)(void *);
 using MotionFloatFn = float (*)(void *, int32_t);
 MotionActionFn g_motion_action_masked = nullptr;
+MotionSetActionFn g_motion_set_action = nullptr;
+MotionCloneFn g_motion_clone = nullptr;
+DropFn g_motion_drop = nullptr;
 MotionFloatFn g_motion_raw_x = nullptr;
 MotionFloatFn g_motion_raw_y = nullptr;
-using LauncherMotionV2Fn = bool (*)(void *, void *, void *);
-LauncherMotionV2Fn g_original_launcher_motion_v2 = nullptr;
+using LauncherMotionFn = void (*)(void *, void *);
+LauncherMotionFn g_original_launcher_motion = nullptr;
+using LauncherFocusFn = void (*)(void *, bool);
+using LauncherKeyFn = bool (*)(void *, void *);
+using LauncherBackFn = void (*)(void *);
+LauncherFocusFn g_original_launcher_focus = nullptr;
+LauncherKeyFn g_original_launcher_key = nullptr;
+LauncherBackFn g_original_launcher_back = nullptr;
+MotionActionFn g_key_code = nullptr;
+MotionActionFn g_key_action = nullptr;
+std::atomic<bool> g_launcher_lifecycle_hook_attempted{false};
+std::atomic<int32_t> g_launcher_window_focused{-1};
+std::atomic<bool> g_consume_back_up{false};
+std::atomic<int32_t> g_resume_scans{0};
+std::atomic<bool> g_focus_callback_active{false};
+std::atomic<bool> g_focus_callback_node_observed{false};
+std::atomic<bool> g_home_announcement_pending{false};
+std::atomic<uint64_t> g_focus_generation{0};
 std::atomic<bool> g_launcher_motion_hook_attempted{false};
 using InputEventFn = void *(*)(void *);
 InputEventFn g_input_event = nullptr;
@@ -275,17 +306,17 @@ DropFn g_input_drop = nullptr;
 using InjectInputFn = uint64_t (*)(void *, int32_t, int32_t);
 InjectInputFn g_inject_input = nullptr;
 std::atomic<bool> g_model_move_running{false};
-std::atomic<int32_t> g_grid_columns{4};
-std::atomic<int32_t> g_grid_rows{7};
+using LauncherCellCountFn = int32_t (*)();
+LauncherCellCountFn g_cell_count_x = nullptr;
+LauncherCellCountFn g_cell_count_y = nullptr;
+std::atomic<int32_t> g_grid_columns{0};
+std::atomic<int32_t> g_grid_rows{0};
 std::atomic<int32_t> g_visible_screen{0};
 std::atomic<int32_t> g_total_pages{0};
 std::atomic<bool> g_page_state_known{false};
-std::atomic<int32_t> g_predicted_page{-1};
-std::mutex g_page_swipe_mutex;
-bool g_page_swipe_tracking = false;
-bool g_page_swipe_announced = false;
-float g_page_swipe_start_x = 0.0f;
-float g_page_swipe_start_y = 0.0f;
+std::mutex g_page_announcement_mutex;
+int32_t g_announced_page = -1;
+std::unordered_map<int32_t, int32_t> g_page_item_counts;
 std::atomic<int32_t> g_lifted_screen{-1};
 std::atomic<int32_t> g_drop_parent_node_id{-1};
 std::atomic<int32_t> g_drop_parent_host_id{0};
@@ -328,6 +359,7 @@ constexpr int32_t kMoveAfterAction = 0x6A000004;
 constexpr int32_t kCreateFolderAction = 0x6A000005;
 constexpr int32_t kAppInfoAction = 0x6A000006;
 constexpr int32_t kUninstallAction = 0x6A000007;
+constexpr int32_t kEditFolderAction = 0x6A000009;
 constexpr int32_t kRecentAppFlowAction = 0x6A000300;
 constexpr int32_t kRecentLockAction = 0x6A000301;
 constexpr int32_t kRecentSplitAction = 0x6A000302;
@@ -349,6 +381,7 @@ constexpr char16_t kMultiLiftLabel[] = u"托起已选中的应用";
 constexpr char16_t kCancelLabel[] = u"取消托起";
 constexpr char16_t kAppInfoLabel[] = u"应用信息";
 constexpr char16_t kUninstallLabel[] = u"卸载";
+constexpr char16_t kEditFolderLabel[] = u"编辑";
 constexpr char16_t kRecentAppFlowLabel[] = u"应用流转";
 constexpr char16_t kRecentLockLabel[] = u"锁定任务";
 constexpr char16_t kRecentUnlockLabel[] = u"解除锁定";
@@ -387,6 +420,7 @@ struct ObservedNode {
 };
 
 bool nodeBounds(void *provider, int32_t nodeId, Bounds &bounds, std::string *label);
+bool isIconNode(void *node);
 void readTree(void *provider, int32_t id, std::vector<ObservedNode> &nodes, int depth = 0);
 std::mutex g_session_mutex;
 ObservedNode g_source{};
@@ -398,6 +432,53 @@ struct Slot {
     int32_t column;
 };
 std::vector<Slot> g_slots;
+std::vector<Slot> g_grid_cells;
+int32_t g_grid_screen = -1; // Protected by g_session_mutex.
+std::string g_diagnostics_last_grid; // Same session lock as rebuildSlots().
+int64_t g_diagnostics_grid_session = 0;
+
+int32_t virtualIdForSlot(const Slot &slot) {
+    return kVirtualNodeBase + slot.row * g_grid_columns.load() + slot.column;
+}
+
+int32_t slotIndexForVirtualIdLocked(int32_t nodeId) {
+    for (size_t index = 0; index < g_slots.size(); ++index) {
+        if (virtualIdForSlot(g_slots[index]) == nodeId) return static_cast<int32_t>(index);
+    }
+    return -1;
+}
+
+bool hotseatNodeLocked(const ObservedNode &node) {
+    int32_t parent = node.parent;
+    for (int depth = 0; parent >= 0 && depth < 20; ++depth) {
+        auto found = std::find_if(g_workspace.begin(), g_workspace.end(), [&](const auto &item) {
+            return item.id == parent && item.host == node.host;
+        });
+        if (found == g_workspace.end()) break;
+        if (found->resource == "com.miui.home:id/hotseat") return true;
+        if (found->parent == parent) break;
+        parent = found->parent;
+    }
+    for (const auto &item : g_workspace) {
+        if (item.resource == "com.miui.home:id/hotseat"
+                && node.bounds.centerX() >= item.bounds.left && node.bounds.centerX() < item.bounds.right
+                && node.bounds.centerY() >= item.bounds.top && node.bounds.centerY() < item.bounds.bottom) return true;
+    }
+    return false;
+}
+
+bool descendsFromLocked(const ObservedNode &item, int32_t ancestor) {
+    int32_t parent = item.parent;
+    for (int depth = 0; parent >= 0 && depth < 20; ++depth) {
+        if (parent == ancestor) return true;
+        auto found = std::find_if(g_workspace.begin(), g_workspace.end(), [&](const auto &node) {
+            return node.id == parent && node.host == item.host;
+        });
+        if (found == g_workspace.end() || found->parent == parent) break;
+        parent = found->parent;
+    }
+    return false;
+}
 
 struct DynamicShortcut {
     std::string label;
@@ -415,6 +496,25 @@ struct FavoritePlacement {
     int32_t spanY = 1;
     int32_t itemType = 0;
 };
+
+std::vector<FavoritePlacement> g_source_placements;
+
+struct PendingPlacement {
+    FavoritePlacement item;
+    std::string label;
+    Bounds bounds;
+    bool visible = false;
+    size_t observations = 0;
+    size_t labelHits = 0;
+    ObservedNode lastLabelNode{};
+    int32_t lastLabelPage = -1;
+};
+
+std::mutex g_placement_mutex;
+std::condition_variable g_placement_cv;
+std::vector<PendingPlacement> g_pending_placements;
+int g_pending_observation_budget = 0;
+
 struct AppTarget {
     std::string package;
     std::string activity;
@@ -544,6 +644,12 @@ using RustDropValueFn = void (*)(void *);
 using RuntimeIncStrongFn = void (*)(void *);
 using RuntimeGetContextFn = void *(*)(void *);
 using ContentResolverNewFn = void *(*)(void *);
+using ContentResolverDeleteFn = void (*)(void *);
+using ContentResolverCallFn = RustResult48 (*)(void *, const char *, size_t,
+        const char *, size_t, const RustOptionStringView *, void *);
+struct RustOptionI64 { uint8_t tag; uint8_t padding[7]; int64_t value; };
+using BundleGetI64Fn = RustOptionI64 (*)(void *, const char *, size_t);
+using BundleInsertI64Fn = void (*)(void *, const RustRString *, int64_t);
 using Sqlite3 = struct sqlite3;
 using Sqlite3Stmt = struct sqlite3_stmt;
 using SqliteOpenV2Fn = int (*)(const char *, Sqlite3 **, int, const char *);
@@ -609,6 +715,10 @@ RuntimeIncStrongFn g_runtime_inc_strong = nullptr;
 RuntimeGetContextFn g_runtime_get_context = nullptr;
 ContentResolverNewFn g_content_resolver_new = nullptr;
 ContentResolverNewFn g_original_content_resolver_new = nullptr;
+ContentResolverDeleteFn g_content_resolver_delete = nullptr;
+ContentResolverCallFn g_content_resolver_call = nullptr;
+BundleGetI64Fn g_bundle_get_i64 = nullptr;
+BundleInsertI64Fn g_bundle_insert_i64 = nullptr;
 std::atomic<void *> g_runtime_shared_address{nullptr};
 std::atomic<bool> g_db_probe_logged{false};
 std::atomic<bool> g_shortcut_error_logged{false};
@@ -727,6 +837,9 @@ LauncherWorkspaceReloadFn resolveWorkspaceReloadForProfile(
         case LauncherAbiProfile::kLegacy7722:
             offset = 0x7a2008;
             break;
+        case LauncherAbiProfile::kLegacy7748:
+            offset = 0x7a35a4;
+            break;
         case LauncherAbiProfile::kCurrent8565:
             offset = 0x7aa050;
             break;
@@ -740,12 +853,12 @@ LauncherWorkspaceReloadFn resolveWorkspaceReloadForProfile(
     if (base == nullptr) return nullptr;
     void *target = reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(base) + offset);
     if (!workspaceReloadPrologueMatches(target)) {
-        __android_log_print(ANDROID_LOG_WARN, "ActionGridNative",
+        nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
                 "Launcher workspace reload prologue mismatch build=%s offset=0x%zx",
                 buildId, static_cast<size_t>(offset));
         return nullptr;
     }
-    __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+    nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
             "Launcher workspace reload symbol installed target=%p build=%s",
             target, buildId);
     return reinterpret_cast<LauncherWorkspaceReloadFn>(target);
@@ -753,13 +866,37 @@ LauncherWorkspaceReloadFn resolveWorkspaceReloadForProfile(
 
 void invokeWorkspaceReload() {
     if (g_trigger_workspace_reload == nullptr) {
-        __android_log_print(ANDROID_LOG_WARN, "ActionGridNative",
+        nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
                 "Launcher workspace reload unavailable");
         return;
     }
     g_trigger_workspace_reload();
-    __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+    nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
             "HyperOS4 workspace reload requested");
+}
+
+void resolveGridCounts(LauncherAbiProfile profile) {
+    g_cell_count_x = nullptr;
+    g_cell_count_y = nullptr;
+    if (!g_launcher_fingerprint_ready.load(std::memory_order_acquire)) return;
+    uintptr_t offsetX = 0;
+    uintptr_t offsetY = 0;
+    if (profile == LauncherAbiProfile::kCurrent8565) {
+        offsetX = 0x6c9588;
+        offsetY = 0x6c9634;
+    } else if (profile == LauncherAbiProfile::kLegacy7748) {
+        offsetX = 0x6c5a74;
+        offsetY = 0x6c5b20;
+    } else {
+        return;
+    }
+    auto *base = static_cast<uint8_t *>(launcherLibraryBase());
+    if (base == nullptr) return;
+    constexpr uint32_t prologue[] = {0xd10083ffU, 0xa9017bfdU, 0x910043fdU};
+    if (std::memcmp(base + offsetX, prologue, sizeof(prologue)) != 0
+            || std::memcmp(base + offsetY, prologue, sizeof(prologue)) != 0) return;
+    g_cell_count_x = reinterpret_cast<LauncherCellCountFn>(base + offsetX);
+    g_cell_count_y = reinterpret_cast<LauncherCellCountFn>(base + offsetY);
 }
 
 bool readBuildId(const char *moduleName, char *output, size_t outputSize) {
@@ -996,11 +1133,7 @@ bool readZipStoredEntry(const char *zipPath, const char *entryName,
         std::fclose(file);
         return false;
     }
-    size_t eocd = tail.size();
-    while (eocd >= 22U) {
-        --eocd;
-        if (zipU32(tail.data() + eocd) == 0x06054b50U) break;
-    }
+    const size_t eocd = actiongrid::zip::endRecordOffset(tail.data(), tail.size());
     if (eocd == tail.size()) {
         std::fclose(file);
         return false;
@@ -1113,10 +1246,6 @@ bool readModuleFingerprint(const char *moduleName, ElfFingerprint &output) {
     return search.found;
 }
 
-bool fingerprintMatches(const ElfFingerprint &actual, KnownFingerprint expected) {
-    return actual.valid && actual.first == expected.first && actual.second == expected.second;
-}
-
 void resolvePrivate(const char *name, void *handle);
 void onAddAction(void *node, void *action);
 void injectIconActions(void *node);
@@ -1138,6 +1267,8 @@ AccessibilityEventSource captureDropParentEventSource(int32_t fallbackNodeId);
 bool sendAnnouncement(int32_t nodeId, const std::string &text);
 bool sendAnnouncementWithSource(int32_t host, int32_t window, int32_t virtualId,
         const std::string &text);
+bool announceReliably(int32_t host, int32_t window, int32_t virtualId,
+        const std::string &text);
 void queueSurfaceAnnouncement(const std::string &text);
 void flushSurfaceAnnouncements();
 bool isRecentTaskLabel(const std::string &label);
@@ -1145,8 +1276,8 @@ std::string recentCardName(const std::string &label);
 void observeSurfaceNode(void *provider, int32_t nodeId, void *node);
 void observeSurfaceSample(void *provider, SurfaceState observed,
         const std::vector<ObservedNode> &nodes);
+void observeSurfaceTree(void *provider, const std::vector<ObservedNode> &nodes);
 void refreshLiftSessionForPage(void *provider);
-void handlePageSwipeMotion(int32_t action, float x, float y);
 void handleRecentSwipeMotion(int32_t action, float x, float y);
 
 
@@ -1162,6 +1293,97 @@ bool labelMatches(const std::string &spoken, const std::string &title) {
     if (spoken.size() <= title.size() || spoken.compare(0, title.size(), title) != 0) return false;
     unsigned char next = static_cast<unsigned char>(spoken[title.size()]);
     return next <= 0x20 || next == ',' || next == 0xe3 || next == 0xef;
+}
+
+bool parsePageIndicator(const std::string &description, int32_t &page, int32_t *totalPages);
+
+void observePendingPlacement(const ObservedNode &node, int32_t page = -1) {
+    if (!node.icon()) return;
+    std::lock_guard lock(g_placement_mutex);
+    if (g_pending_placements.empty()) return;
+    if (page < 0) page = g_visible_screen.load(std::memory_order_acquire) + 1;
+    bool changed = false;
+    for (auto &pending : g_pending_placements) {
+        ++pending.observations;
+        const bool labelOk = labelMatches(node.label, pending.label);
+        const bool pageOk = page == pending.item.screen;
+        const bool boundsOk = pending.bounds.width() > 0 && pending.bounds.height() > 0
+                && node.bounds.centerX() >= pending.bounds.left
+                && node.bounds.centerX() < pending.bounds.right
+                && node.bounds.centerY() >= pending.bounds.top
+                && node.bounds.centerY() < pending.bounds.bottom;
+        if (labelOk) {
+            ++pending.labelHits;
+            pending.lastLabelNode = node;
+            pending.lastLabelPage = page;
+        }
+        if (!pending.visible && (labelOk || boundsOk)
+                && g_pending_observation_budget > 0 && g_diagnostics.session() != 0) {
+            --g_pending_observation_budget;
+            nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
+                    "move candidate id=%lld node=%d label=%s page=%d bounds=%d,%d,%d,%d label_ok=%d page_ok=%d bounds_ok=%d",
+                    static_cast<long long>(pending.item.id), node.id, node.label.c_str(), page,
+                    node.bounds.left, node.bounds.top, node.bounds.right, node.bounds.bottom,
+                    labelOk ? 1 : 0, pageOk ? 1 : 0, boundsOk ? 1 : 0);
+        }
+        if (pending.visible || !labelOk || !pageOk || !boundsOk) continue;
+        pending.visible = true;
+        changed = true;
+    }
+    if (changed && std::all_of(g_pending_placements.begin(), g_pending_placements.end(),
+            [](const auto &pending) { return pending.visible; })) {
+        g_placement_cv.notify_all();
+    }
+}
+
+void observePendingPlacements(const std::vector<ObservedNode> &nodes) {
+    int32_t page = -1;
+    for (const auto &node : nodes) {
+        if (parsePageIndicator(node.label, page, nullptr)) break;
+    }
+    for (const auto &node : nodes) observePendingPlacement(node, page);
+}
+
+void beginPendingPlacement(const std::vector<PendingPlacement> &expected) {
+    std::lock_guard lock(g_placement_mutex);
+    g_pending_placements = expected;
+    g_pending_observation_budget = 12;
+    if (g_diagnostics.session() == 0) return;
+    for (const auto &target : expected) {
+        nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
+                "move visibility target id=%lld label=%s page=%d cell=%d,%d bounds=%d,%d,%d,%d",
+                static_cast<long long>(target.item.id), target.label.c_str(), target.item.screen,
+                target.item.cellX, target.item.cellY,
+                target.bounds.left, target.bounds.top, target.bounds.right, target.bounds.bottom);
+    }
+}
+
+bool waitForPendingPlacementVisibility() {
+    std::unique_lock lock(g_placement_mutex);
+    const bool visible = g_placement_cv.wait_for(lock, std::chrono::milliseconds(4'500), [] {
+        return g_pending_placements.empty() || std::all_of(
+                g_pending_placements.begin(), g_pending_placements.end(),
+                [](const auto &pending) { return pending.visible; });
+    });
+    return visible && !g_pending_placements.empty()
+            && std::all_of(g_pending_placements.begin(), g_pending_placements.end(),
+                    [](const auto &pending) { return pending.visible; });
+}
+
+void endPendingPlacement() {
+    std::lock_guard lock(g_placement_mutex);
+    if (g_diagnostics.session() != 0) {
+        for (const auto &pending : g_pending_placements) {
+            const auto &last = pending.lastLabelNode;
+            nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
+                    "move visibility result id=%lld visible=%d observations=%zu label_hits=%zu last_node=%d last_page=%d last_bounds=%d,%d,%d,%d",
+                    static_cast<long long>(pending.item.id), pending.visible ? 1 : 0,
+                    pending.observations, pending.labelHits, last.id, pending.lastLabelPage,
+                    last.bounds.left, last.bounds.top, last.bounds.right, last.bounds.bottom);
+        }
+    }
+    g_pending_placements.clear();
+    g_placement_cv.notify_all();
 }
 
 std::u16string utf16FromUtf8(const std::string &value) {
@@ -1203,10 +1425,173 @@ void dropRustVec(RustVec &value) {
     }
 }
 
+struct DiagnosticsReply {
+    bool valid = false;
+    int64_t session = 0;
+    int64_t ack = 0;
+    int32_t error = 0;
+};
+
+// Immutable ABI function snapshot: the loader can continue resolving other APIs
+// while the worker communicates with the provider on its own thread.
+struct DiagnosticsTransport {
+    void *runtime;
+    ContentResolverNewFn create;
+    ContentResolverDeleteFn destroy;
+    ContentResolverCallFn call;
+    BundleDefaultFn bundleNew;
+    BundleDropFn bundleDrop;
+    BundleGetI64Fn getI64;
+    BundleInsertI64Fn putI64;
+    BundleInsertStringFn putString;
+    RStringFromUtf16Fn stringNew;
+
+    DiagnosticsReply decode(RustResult48 &result) const {
+        DiagnosticsReply reply;
+        void *bundle = nullptr;
+        if ((result.data[0] & 1U) == 0) {
+            if ((result.data[8] & 1U) == 0) bundle = nodeField<void *>(result.data, 16);
+        } else if (nodeField<void *>(result.data, 16) != nullptr) {
+            reply.error = nodeField<int32_t>(result.data, 8);
+            RustVec message = nodeField<RustVec>(result.data, 16);
+            dropRustVec(message);
+        } else {
+            // Verified alternate Option<Bundle> arm in both 7748 and 8565.
+            if ((result.data[24] & 1U) == 0) bundle = nodeField<void *>(result.data, 32);
+        }
+        if (bundle != nullptr) {
+            const RustOptionI64 session = getI64(bundle, "session", 7);
+            const RustOptionI64 ack = getI64(bundle, "ack", 3);
+            reply.valid = (session.tag & 1U) == 0 && session.value >= 0;
+            if (reply.valid) reply.session = session.value;
+            if ((ack.tag & 1U) == 0) reply.ack = ack.value;
+            bundleDrop(bundle);
+        }
+        return reply;
+    }
+
+    DiagnosticsReply request(const actiongrid::diagnostics::Buffer::Batch *batch = nullptr) const {
+        void *resolver = create(runtime);
+        if (resolver == nullptr) return {};
+        void *extras = nullptr;
+        if (batch != nullptr) {
+            extras = bundleNew();
+            if (extras == nullptr) {
+                destroy(resolver);
+                return {};
+            }
+            RustRString sessionKey = stringNew(reinterpret_cast<const uint16_t *>(u"session"), 7);
+            putI64(extras, &sessionKey, batch->session);
+            RustRString messageKey = stringNew(reinterpret_cast<const uint16_t *>(u"message"), 7);
+            const std::u16string text = utf16FromUtf8(batch->text);
+            RustOptionString message{0, {}, stringNew(
+                    reinterpret_cast<const uint16_t *>(text.data()), text.size())};
+            // Both insert methods consume their strings. The call only borrows extras.
+            putString(extras, &messageKey, &message);
+        }
+        constexpr char authority[] = "io.github.jiangjinyue2333.actiongrid.diagnostics";
+        const char *method = batch == nullptr ? "state" : "append_native";
+        RustOptionStringView argument{1, {}, nullptr, 0};
+        RustResult48 result = call(resolver, authority, sizeof(authority) - 1,
+                method, strlen(method), &argument, extras);
+        if (extras != nullptr) bundleDrop(extras);
+        destroy(resolver);
+        return decode(result);
+    }
+};
+
+DiagnosticsReply sendDiagnosticsBatch(const DiagnosticsTransport &transport,
+        const actiongrid::diagnostics::Buffer::Batch &batch) {
+    const DiagnosticsReply reply = transport.request(&batch);
+    if (reply.valid) {
+        g_diagnostics.setSession(reply.session);
+        if (reply.session == batch.session && reply.ack == batch.session) {
+            g_diagnostics.acknowledge(batch);
+        }
+    }
+    return reply;
+}
+
+void diagnosticsWorker(DiagnosticsTransport transport) {
+    uint32_t failures = 0;
+    int32_t lastError = 0;
+    int64_t describedSession = 0;
+    auto lastSnapshot = std::chrono::steady_clock::now();
+    for (;;) {
+        int delayMs = 30000;
+        const DiagnosticsReply state = transport.request();
+        if (state.valid) {
+            g_diagnostics.setSession(state.session);
+            const bool changed = describedSession != state.session;
+            if (state.session != 0) {
+                const auto now = std::chrono::steady_clock::now();
+                if (changed || failures != 0 || now - lastSnapshot >= std::chrono::seconds(30)) {
+                    logDiagnosticsSnapshot(changed ? "logging enabled" : failures ? "reconnected" : "heartbeat");
+                    if (failures != 0) nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
+                            "diagnostics recovered failed_calls=%u last_error=%d", failures, lastError);
+                    lastSnapshot = now;
+                    describedSession = state.session;
+                }
+                const auto batch = g_diagnostics.batch();
+                if (!batch.text.empty()) {
+                    const DiagnosticsReply written = sendDiagnosticsBatch(transport, batch);
+                    if (written.valid) {
+                        if (written.session == batch.session && written.ack == batch.session) {
+                            failures = 0;
+                        } else if (written.session == batch.session) {
+                            ++failures; // Provider reachable, but storage did not accept the batch.
+                        } else {
+                            failures = 0;
+                        }
+                    } else {
+                        ++failures;
+                        lastError = written.error;
+                    }
+                } else {
+                    failures = 0;
+                }
+                delayMs = g_diagnostics.batch().text.empty() ? 2000 : 500;
+            } else {
+                failures = 0;
+                describedSession = 0;
+            }
+        } else {
+            ++failures;
+            lastError = state.error;
+        }
+        if (failures != 0) delayMs = failures < 3 ? 5000 : 30000;
+        std::unique_lock lock(g_diagnostics_wake_mutex);
+        // Focus changes can shorten idle/backoff waits, never cause a tight Binder loop.
+        g_diagnostics_wake_cv.wait_until(lock, std::chrono::steady_clock::now()
+                + std::chrono::milliseconds(500), [] { return false; });
+        g_diagnostics_wake_cv.wait_for(lock, std::chrono::milliseconds(delayMs - 500), [] {
+            return g_diagnostics_wake;
+        });
+        g_diagnostics_wake = false;
+    }
+}
+
+void ensureDiagnosticsWorker() {
+    if (!g_diagnostics_apis_ready.load(std::memory_order_acquire)
+            || !g_launcher_fingerprint_ready.load(std::memory_order_acquire)
+            || !g_launcher_system_compatible.load(std::memory_order_acquire)) return;
+    const auto profile = g_launcher_profile.load();
+    if (profile != LauncherAbiProfile::kLegacy7748 && profile != LauncherAbiProfile::kCurrent8565) return;
+    void *runtime = g_runtime_shared_address.load(std::memory_order_acquire);
+    if (runtime == nullptr || g_original_content_resolver_new == nullptr
+            || g_content_resolver_delete == nullptr || g_content_resolver_call == nullptr
+            || g_bundle_default == nullptr || g_bundle_drop == nullptr || g_bundle_get_i64 == nullptr
+            || g_bundle_insert_i64 == nullptr || g_bundle_insert_string == nullptr
+            || g_rstring_from_utf16 == nullptr || g_diagnostics_started.exchange(true)) return;
+    std::thread(diagnosticsWorker, DiagnosticsTransport{runtime, g_original_content_resolver_new,
+            g_content_resolver_delete, g_content_resolver_call, g_bundle_default, g_bundle_drop,
+            g_bundle_get_i64, g_bundle_insert_i64, g_bundle_insert_string, g_rstring_from_utf16}).detach();
+}
+
 bool rustResultOk(RustResult48 &result, const char *operation) {
     if ((result.data[0] & 1U) == 0) return true;
     RustVec message = nodeField<RustVec>(result.data, 16);
-    if (!g_shortcut_error_logged.exchange(true)) __android_log_print(ANDROID_LOG_WARN,
+    if (!g_shortcut_error_logged.exchange(true)) nativeLog(ANDROID_LOG_WARN,
             "ActionGridNative", "%s failed code=%d", operation,
             nodeField<int32_t>(result.data, 8));
     dropRustVec(message);
@@ -1223,7 +1608,7 @@ RustResult48 onSceneStartActivity(void *scene, void *intent, uint64_t requestCod
         void *previous = g_scene_instance.exchange(scene, std::memory_order_acq_rel);
         g_capabilities.fetch_or(CAP_SCENE_ACTIVITY, std::memory_order_release);
         if (previous != scene) {
-            __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+            nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                     "Scene instance captured=%p", scene);
         }
     }
@@ -1253,10 +1638,11 @@ void *onContentResolverNew(void *runtimeShared) {
             if (retainedRuntime != nullptr) {
                 g_runtime_inc_strong(retainedRuntime);
                 g_runtime_shared_address.store(&retainedRuntime, std::memory_order_release);
-                __android_log_print(ANDROID_LOG_INFO, "ActionGridNative", "Native Runtime captured");
+                nativeLog(ANDROID_LOG_INFO, "ActionGridNative", "Native Runtime captured");
             }
         });
     }
+    ensureDiagnosticsWorker();
     return g_original_content_resolver_new(runtimeShared);
 }
 
@@ -1327,11 +1713,11 @@ bool readableAddress(const void *address, size_t length) {
 }
 
 std::string eventString(const void *event, size_t offset) {
-    uint64_t length = nodeField<uint64_t>(event, offset);
+    uint64_t capacity = nodeField<uint64_t>(event, offset);
     uint64_t pointer = nodeField<uint64_t>(event, offset + 8U)
             & 0x00ffffffffffffffULL;
-    uint64_t capacity = nodeField<uint64_t>(event, offset + 16U);
-    if (length == 0 || length > 128 || capacity < length
+    uint64_t length = nodeField<uint64_t>(event, offset + 16U);
+    if ((capacity >> 63U) != 0 || length == 0 || length > 128 || capacity < length
             || !readableAddress(reinterpret_cast<const void *>(pointer), length)) return {};
     std::string value(length, '\0');
     std::memcpy(value.data(), reinterpret_cast<const void *>(pointer), length);
@@ -1395,6 +1781,7 @@ bool loadLauncherSnapshot() {
     uint64_t generation = 0;
     size_t favoriteCount = 0;
     size_t pageCount = 0;
+    std::unordered_map<int32_t, int32_t> pageCounts;
     {
         std::lock_guard lock(g_snapshot_mutex);
         loaded.generation = g_snapshot.generation + 1;
@@ -1403,8 +1790,16 @@ bool loadLauncherSnapshot() {
         generation = g_snapshot.generation;
         favoriteCount = g_snapshot.favorites.size();
         pageCount = g_snapshot.pageCounts.size();
+        pageCounts = g_snapshot.pageCounts;
     }
-    __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+    {
+        // Keep the last successful counts available while the next SQLite
+        // refresh is in flight.  Accessibility events arrive before the
+        // worker can publish a new snapshot during a page transition.
+        std::lock_guard lock(g_page_announcement_mutex);
+        g_page_item_counts = std::move(pageCounts);
+    }
+    nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
             "launcher snapshot ready generation=%llu favorites=%zu pages=%zu",
             static_cast<unsigned long long>(generation), favoriteCount, pageCount);
     return true;
@@ -1467,7 +1862,15 @@ bool desktopItemCountForPage(int32_t page, int32_t &count) {
     {
         std::lock_guard lock(g_snapshot_mutex);
         auto found = g_snapshot.pageCounts.find(page);
-        if (g_snapshot.ready && found != g_snapshot.pageCounts.end()) {
+        if (g_snapshot.ready) {
+            count = found == g_snapshot.pageCounts.end() ? 0 : found->second;
+            return true;
+        }
+    }
+    if (g_page_state_known.load(std::memory_order_acquire)) {
+        std::lock_guard lock(g_page_announcement_mutex);
+        auto found = g_page_item_counts.find(page);
+        if (found != g_page_item_counts.end()) {
             count = found->second;
             return true;
         }
@@ -1500,7 +1903,7 @@ bool sameApp(const AppTarget &a, const AppTarget &b) {
 }
 
 bool resolveAppTarget(int32_t nodeId, const std::string &spoken, AppTarget &out,
-        int32_t screenHint = -1) {
+        int32_t screenHint = -1, int32_t itemType = 0) {
     if (spoken.empty()) return false;
     LauncherSnapshot snapshot;
     {
@@ -1517,10 +1920,12 @@ bool resolveAppTarget(int32_t nodeId, const std::string &spoken, AppTarget &out,
     bool preferredResolved = false;
     bool fallbackResolved = false;
     bool ambiguous = false;
+    size_t matches = 0, preferredMatches = 0;
     for (const SnapshotFavorite &favorite : snapshot.favorites) {
-        if (favorite.placement.itemType != 0) continue;
+        if (favorite.placement.itemType != itemType) continue;
         if (!labelMatches(spoken, favorite.title)
                 && !labelMatches(spoken, favorite.label)) continue;
+        ++matches;
         AppTarget candidate;
         // Placement only needs the favorite row. Some launcher rows (notably
         // unread-badged apps) omit a parseable component intent.
@@ -1534,6 +1939,7 @@ bool resolveAppTarget(int32_t nodeId, const std::string &spoken, AppTarget &out,
         if (candidate.placement.screen == screenHint) {
             preferred = candidate;
             preferredResolved = true;
+            ++preferredMatches;
         }
         if (!fallbackResolved
                 || candidate.placement.screen > fallback.placement.screen) {
@@ -1547,6 +1953,8 @@ bool resolveAppTarget(int32_t nodeId, const std::string &spoken, AppTarget &out,
         }
         match = std::move(candidate);
     }
+    // Folders have no app component; never guess between same-name favorites.
+    if (itemType == 2 && (preferredResolved ? preferredMatches : matches) != 1) return false;
     if (preferredResolved) {
         match = std::move(preferred);
         ambiguous = false;
@@ -1583,36 +1991,15 @@ LauncherAbiProfile launcherAbiProfileForBuildId(const char *buildId) {
     return LauncherAbiProfile::kUnknown;
 }
 
-LauncherAbiProfile launcherAbiProfileForFingerprint(
-        const ElfFingerprint &dart, const ElfFingerprint &launcher) {
-    if (fingerprintMatches(dart, kLegacy7653DartFingerprint)
-            && fingerprintMatches(launcher, kLegacy7653LauncherFingerprint)) {
-        return LauncherAbiProfile::kLegacy7653;
-    }
-    if (fingerprintMatches(dart, kLegacy7722DartFingerprint)
-            && fingerprintMatches(launcher, kLegacy7722LauncherFingerprint)) {
-        return LauncherAbiProfile::kLegacy7722;
-    }
-    if (fingerprintMatches(dart, kCurrent8565DartFingerprint)
-            && fingerprintMatches(launcher, kCurrent8565LauncherFingerprint)) {
-        return LauncherAbiProfile::kCurrent8565;
-    }
-    return LauncherAbiProfile::kUnknown;
-}
-
 const char *launcherAbiProfileName(LauncherAbiProfile profile) {
     switch (profile) {
         case LauncherAbiProfile::kLegacy7653: return "8.01.02.7653";
         case LauncherAbiProfile::kLegacy7722: return "8.01.02.7722";
+        case LauncherAbiProfile::kLegacy7748: return "8.01.02.7748";
         case LauncherAbiProfile::kCurrent8565: return "8.01.02.8565";
         case LauncherAbiProfile::kUnknown: return "unknown";
     }
     return "unknown";
-}
-
-bool isLegacyLauncherProfile(LauncherAbiProfile profile) {
-    return profile == LauncherAbiProfile::kLegacy7653
-            || profile == LauncherAbiProfile::kLegacy7722;
 }
 
 bool matchesLauncherDartBuildId(const char *buildId) {
@@ -1623,7 +2010,9 @@ bool matchesLauncherDartBuildId(const char *buildId) {
 bool matchesLauncherMotionBuildId(const char *buildId) {
     // Motion/freeform offsets were only verified for the two legacy profiles.
     (void) buildId;
-    return isLegacyLauncherProfile(g_launcher_profile.load(std::memory_order_acquire));
+    const auto profile = g_launcher_profile.load(std::memory_order_acquire);
+    return profile == LauncherAbiProfile::kLegacy7653
+            || profile == LauncherAbiProfile::kLegacy7722;
 }
 
 bool matchesFrbModelBuildId(const char *buildId) {
@@ -1641,16 +2030,14 @@ LauncherAbiProfile refreshLauncherAbiProfile(char *buildId, size_t buildIdSize) 
         }
         return cached;
     }
-    LauncherAbiProfile profile = LauncherAbiProfile::kUnknown;
-    if (buildId != nullptr && buildIdSize > 0
-            && readBuildId("libapp.so", buildId, buildIdSize)) {
-        ElfFingerprint dartFingerprint{};
-        ElfFingerprint launcherFingerprint{};
-        if (readModuleFingerprint("libapp.so", dartFingerprint)
-                && readModuleFingerprint("libapp_launcher.so", launcherFingerprint)) {
-            profile = launcherAbiProfileForFingerprint(dartFingerprint, launcherFingerprint);
-        }
+    if (buildId != nullptr && buildIdSize > 0) {
+        readBuildId("libapp.so", buildId, buildIdSize);
     }
+    ElfFingerprint launcherFingerprint{};
+    const LauncherAbiProfile profile = readModuleFingerprint(
+            "libapp_launcher.so", launcherFingerprint)
+            ? launcherAbiProfileForFingerprint(launcherFingerprint)
+            : LauncherAbiProfile::kUnknown;
     g_launcher_profile.store(profile, std::memory_order_release);
     g_launcher_fingerprint_ready.store(profile != LauncherAbiProfile::kUnknown,
             std::memory_order_release);
@@ -1662,7 +2049,7 @@ LauncherAbiProfile refreshLauncherAbiProfile(char *buildId, size_t buildIdSize) 
     if (profile != LauncherAbiProfile::kUnknown && g_frb_dispatcher != nullptr) {
         g_capabilities.fetch_or(CAP_FRB_MODEL, std::memory_order_release);
     }
-    __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+    nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
             "Launcher ABI profile=%s build=%s fingerprint=%d frb_model=%d",
             launcherAbiProfileName(profile), buildId == nullptr ? "" : buildId,
             profile != LauncherAbiProfile::kUnknown ? 1 : 0,
@@ -1678,22 +2065,14 @@ bool profileMatchesSystemAbi(LauncherAbiProfile profile,
     (void) privateId;
     (void) aidlId;
     (void) uiId;
-    if (!fingerprintMatches(privateFingerprint, kSystemPrivateFingerprint)) return false;
-    if (profile == LauncherAbiProfile::kCurrent8565) {
-        return fingerprintMatches(aidlFingerprint, kCurrentAidlFingerprint)
-                && fingerprintMatches(uiFingerprint, kCurrentUiFingerprint);
-    }
-    if (isLegacyLauncherProfile(profile)) {
-        return fingerprintMatches(aidlFingerprint, kLegacyAidlFingerprint)
-                && fingerprintMatches(uiFingerprint, kLegacyUiFingerprint);
-    }
-    return false;
+    return launcherMatchesSystemAbi(profile, privateFingerprint, aidlFingerprint, uiFingerprint);
 }
 
 bool moveActionsReady() {
     constexpr uint32_t kRequired = CAP_MOVE_PROFILE | CAP_PRIVATE_BUILD_MATCH
             | CAP_PRIVATE_SYMBOLS;
-    return (g_capabilities.load(std::memory_order_acquire) & kRequired) == kRequired;
+    return g_launcher_system_compatible.load(std::memory_order_acquire)
+            && (g_capabilities.load(std::memory_order_acquire) & kRequired) == kRequired;
 }
 
 bool uninstallLaunchReady() {
@@ -1880,7 +2259,7 @@ void appendSparseItemInfo(WireWriter &wire, const FavoritePlacement &source,
     wire.none();                         // additional position
     wire.none();                         // additional position
     wire.none();                         // title
-    wire.none();                         // package
+    wire.none();                         // label
     // The generated decoder has 35 fields; keep the sparse tail exact.
     wire.none();                         // field 16
     wire.none();                         // field 17
@@ -1919,24 +2298,71 @@ void clearLiftSession() {
     g_drop_parent_window_id.store(-1, std::memory_order_release);
     std::lock_guard lock(g_session_mutex);
     g_sources.clear();
+    g_source_placements.clear();
     g_workspace.clear();
     g_slots.clear();
+    g_grid_cells.clear();
+    g_grid_screen = -1;
 }
 
-bool placementsMatch(const std::vector<FavoritePlacement> &expected) {
+bool cancelLiftSession(void *provider, int32_t nodeId) {
+    if (!g_lifted.exchange(false, std::memory_order_acq_rel)) return false;
+    const auto parent = captureDropParentEventSource(nodeId);
+    int32_t restoreId = -1;
+    {
+        std::lock_guard lock(g_session_mutex);
+        for (const auto &node : g_workspace) {
+            if (node.icon() && (restoreId < 0 || node.id == g_source.id)) restoreId = node.id;
+        }
+    }
+    clearLiftSession();
+    sendEvent(parent, kTypeWindowContentChanged);
+    if (restoreId >= 0 && provider != nullptr && g_original_perform_action != nullptr) {
+        uintptr_t arguments[2]{};
+        g_original_perform_action(provider, restoreId, kAccessibilityFocusAction, arguments);
+    }
+    announceReliably(parent.host, parent.window, parent.nodeId, "已取消托起");
+    return true;
+}
+
+bool cancelLiftSession(int32_t nodeId) {
+    // Key/back callbacks do not carry a provider that is valid for this call.
+    return cancelLiftSession(nullptr, nodeId);
+}
+
+bool placementsMatch(const std::vector<FavoritePlacement> &expected, const char *stage = nullptr) {
     std::vector<int64_t> ids;
     ids.reserve(expected.size());
     for (const auto &item : expected) ids.push_back(item.id);
     std::vector<FavoritePlacement> actual;
-    if (!loadFavoritePlacements(ids, actual)) return false;
+    if (!loadFavoritePlacements(ids, actual)) {
+        if (stage != nullptr && g_diagnostics.session() != 0) {
+            nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
+                    "move db stage=%s read_failed=1 expected=%zu", stage, expected.size());
+        }
+        return false;
+    }
+    bool matched = true;
     for (size_t i = 0; i < expected.size(); ++i) {
         const auto &want = expected[i];
         const auto &got = actual[i];
         if (want.id != got.id || want.container != got.container
                 || want.screen != got.screen || want.cellX != got.cellX
-                || want.cellY != got.cellY) return false;
+                || want.cellY != got.cellY) matched = false;
     }
-    return true;
+    if ((stage != nullptr || matched) && g_diagnostics.session() != 0) {
+        for (size_t i = 0; i < expected.size(); ++i) {
+            const auto &want = expected[i];
+            const auto &got = actual[i];
+            nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
+                    "move db stage=%s matched=%d id=%lld want=%lld/%d/%d,%d actual=%lld/%d/%d,%d span=%dx%d",
+                    stage == nullptr ? "committed" : stage, matched ? 1 : 0,
+                    static_cast<long long>(want.id), static_cast<long long>(want.container),
+                    want.screen, want.cellX, want.cellY, static_cast<long long>(got.container),
+                    got.screen, got.cellX, got.cellY, got.spanX, got.spanY);
+        }
+    }
+    return matched;
 }
 
 bool updateFavoritePlacements(const std::vector<FavoritePlacement> &expected) {
@@ -1970,7 +2396,8 @@ bool updateFavoritePlacements(const std::vector<FavoritePlacement> &expected) {
 
 bool waitForPlacements(const std::vector<FavoritePlacement> &expected) {
     for (int attempt = 0; attempt < 40; ++attempt) {
-        if (placementsMatch(expected)) return true;
+        if (placementsMatch(expected, attempt == 0 ? "initial"
+                : attempt == 39 ? "timeout" : nullptr)) return true;
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     return false;
@@ -1985,7 +2412,7 @@ void loadDynamicShortcuts(AppTarget &target) {
     void *context = launcherContext();
     void *query = g_shortcut_query_default();
     void *user = newUser(target.user);
-    if (!g_shortcut_probe_logged.exchange(true)) __android_log_print(ANDROID_LOG_INFO,
+    if (!g_shortcut_probe_logged.exchange(true)) nativeLog(ANDROID_LOG_INFO,
             "ActionGridNative", "shortcut path context=%p query=%p user=%p get=%p",
             context, query, user, reinterpret_cast<void *>(g_launcher_apps_get_shortcuts));
     if (context == nullptr || query == nullptr || user == nullptr) {
@@ -1997,7 +2424,7 @@ void loadDynamicShortcuts(AppTarget &target) {
             ? RustResult48{} : g_launcher_apps_has_permission(context);
     if (g_launcher_apps_has_permission != nullptr
             && !g_shortcut_permission_logged.exchange(true)) {
-        __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+        nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                 "shortcut permission status=%u value=%u error_code=%d",
                 permission.data[0], permission.data[1], nodeField<int32_t>(permission.data, 8));
     }
@@ -2128,7 +2555,7 @@ bool startShortcut(const DynamicShortcut &shortcut) {
                     g_intent_set_component(intent, component);
                     RustResult48 result = g_scene_start_activity(
                             scene, intent, 1, nullptr, 1, 0, -1, nullptr);
-                    __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+                    nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                             "wechat shortcut activity id=%s result=%d",
                             shortcut.id.c_str(), nodeField<int32_t>(result.data, 8));
                     if (rustResultOk(result, "start shortcut activity")) return true;
@@ -2194,7 +2621,7 @@ bool startAppInfo(const AppTarget &target) {
                 g_intent_set_component(intent, component);
                 RustResult48 result = g_scene_start_activity(
                         scene, intent, 1, nullptr, 1, 0, -1, nullptr);
-                __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+                nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                         "clone app info package=%s user=%d result=%d", target.package.c_str(),
                         target.user, nodeField<int32_t>(result.data, 8));
                 if (rustResultOk(result, "clone app info")) return true;
@@ -2274,7 +2701,7 @@ bool startUninstall(const AppTarget &target) {
             scene, intent, 1, nullptr, 1, 0, -1, options);
     // Scene_start_activity borrows the options Bundle; release it after the call.
     g_bundle_drop(options);
-    __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+    nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
             "uninstall trampoline package=%s result=%d", target.package.c_str(),
             nodeField<int32_t>(result.data, 8));
     bool success = rustResultOk(result, "start uninstall trampoline");
@@ -2366,6 +2793,7 @@ bool nodeSelected(const void *node) {
 }
 
 bool isLiftedSource(int32_t nodeId) {
+    if (g_lifted_screen.load() >= 0 && g_lifted_screen.load() != g_visible_screen.load()) return false;
     std::lock_guard lock(g_session_mutex);
     return std::any_of(g_sources.begin(), g_sources.end(),
             [nodeId](const auto &source) { return source.id == nodeId; });
@@ -2385,92 +2813,232 @@ bool isLiftedSourceId(int32_t id) {
             [id](const auto &source) { return source.id == id; });
 }
 
-int32_t findDropParentNode() {
-    const int32_t centerX = g_source.bounds.centerX();
-    const int32_t centerY = g_source.bounds.centerY();
-    for (const char *resource : {"com.miui.home:id/screen_content",
-            "com.miui.home:id/hotseat", "com.miui.home:id/workspace"}) {
-        for (const auto &node : g_workspace) {
-            if (node.resource == resource && centerX >= node.bounds.left
-                    && centerX < node.bounds.right && centerY >= node.bounds.top
-                    && centerY < node.bounds.bottom) {
-                return node.id;
-            }
-        }
-    }
-    return g_source.id;
-}
-
 int32_t findCurrentDropParentNode() {
     for (const char *resource : {"com.miui.home:id/screen_content",
             "com.miui.home:id/workspace", "com.miui.home:id/hotseat"}) {
         for (const auto &node : g_workspace) {
-            if (node.resource == resource) return node.id;
+            if (node.resource != resource) continue;
+            int32_t parent = -1;
+            for (const auto &icon : g_workspace) {
+                if (!icon.icon() || hotseatNodeLocked(icon) || !descendsFromLocked(icon, node.id)) continue;
+                if (parent < 0) parent = icon.parent;
+                while (parent != node.id && !descendsFromLocked(icon, parent)) {
+                    auto found = std::find_if(g_workspace.begin(), g_workspace.end(), [&](const auto &entry) {
+                        return entry.id == parent && entry.host == node.host;
+                    });
+                    if (found == g_workspace.end() || found->parent < 0 || found->parent == parent) {
+                        parent = node.id;
+                        break;
+                    }
+                    parent = found->parent;
+                }
+            }
+            return parent < 0 ? node.id : parent;
         }
     }
     return g_source.id;
 }
 
+int32_t findDropParentNode() {
+    return findCurrentDropParentNode();
+}
+
 void rebuildSlots() {
-    std::vector<int32_t> lefts;
-    std::vector<int32_t> tops;
-    int32_t width = 270;
-    int32_t height = 282;
+    const int32_t screen = g_visible_screen.load(std::memory_order_acquire);
+    const int32_t previousScreen = g_grid_screen;
+    const bool previousGridUsable = previousScreen == screen && !g_grid_cells.empty();
+    Bounds page{};
+    bool pageFound = false;
+    auto usable = [](const Bounds &bounds) {
+        return bounds.left >= 0 && bounds.top >= 0
+                && bounds.width() > 0 && bounds.height() > 0;
+    };
+    // screen_content is the exact desktop host on most builds.  7748 can
+    // expose only workspace while a page is being rebuilt, so use it as a
+    // verified host fallback and clip the hotseat below it.
+    for (const char *resource : {"com.miui.home:id/screen_content",
+            "com.miui.home:id/workspace"}) {
+        for (const auto &node : g_workspace) {
+            if (node.resource == resource && usable(node.bounds)) {
+                page = node.bounds;
+                pageFound = true;
+                break;
+            }
+        }
+        if (pageFound) break;
+    }
     for (const auto &node : g_workspace) {
-        if (!node.icon() || node.parent == 49 || node.bounds.top > 2000) continue;
-        lefts.push_back(node.bounds.left);
-        tops.push_back(node.bounds.top);
-        width = node.bounds.width();
-        height = node.bounds.height();
+        if (node.resource == "com.miui.home:id/hotseat" && usable(node.bounds)
+                && node.bounds.top > page.top && node.bounds.top < page.bottom) {
+            page.bottom = std::min(page.bottom, node.bounds.top);
+        }
     }
-    std::sort(lefts.begin(), lefts.end());
-    lefts.erase(std::unique(lefts.begin(), lefts.end()), lefts.end());
-    std::sort(tops.begin(), tops.end());
-    tops.erase(std::unique(tops.begin(), tops.end()), tops.end());
+    if (!pageFound || !usable(page)) {
+        nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
+                "grid unavailable: page bounds=%d,%d,%d,%d nodes=%zu screen=%d",
+                page.left, page.top, page.right, page.bottom, g_workspace.size(), screen);
+        if (!previousGridUsable) {
+            g_slots.clear();
+            g_grid_cells.clear();
+            g_grid_screen = -1;
+        }
+        return;
+    }
 
-    int32_t columns = std::max(1, g_grid_columns.load(std::memory_order_relaxed));
-    int32_t rows = std::max(1, g_grid_rows.load(std::memory_order_relaxed));
-    columns = std::max(columns, static_cast<int32_t>(lefts.size()));
-    rows = std::max(rows, static_cast<int32_t>(tops.size()));
-    if (lefts.empty()) lefts = {42, 324, 606, 888};
-    if (tops.empty()) tops = {153};
+    int32_t columns = g_cell_count_x == nullptr ? g_grid_columns.load() : g_cell_count_x();
+    int32_t rows = g_cell_count_y == nullptr ? g_grid_rows.load() : g_cell_count_y();
+    std::vector<ObservedNode> icons;
+    for (const auto &node : g_workspace) {
+        if (node.icon() && !hotseatNodeLocked(node) && node.bounds.centerX() >= page.left
+                && node.bounds.centerX() < page.right && node.bounds.centerY() >= page.top
+                && node.bounds.centerY() < page.bottom) icons.push_back(node);
+    }
+    // A transient getter failure must not invalidate a lifted target.  The
+    // last verified dimensions are valid for every page of this launcher.
+    if (columns <= 0 && previousGridUsable) columns = g_grid_columns.load();
+    if (rows <= 0 && previousGridUsable) rows = g_grid_rows.load();
+    // Older profiles lack verified DeviceConfig getters.  On a page with one
+    // icon, derive the full physical grid from the host and the icon cell;
+    // inferring from icon ordinals would expose no empty cells at all.
+    if ((columns <= 0 || rows <= 0) && !icons.empty()) {
+        const auto &cell = icons.front().bounds;
+        if (columns <= 0 && cell.width() > 0) {
+            columns = static_cast<int32_t>(std::lround(
+                    static_cast<double>(page.width()) / cell.width()));
+        }
+        if (rows <= 0 && cell.height() > 0) {
+            rows = static_cast<int32_t>(std::lround(
+                    static_cast<double>(page.height()) / cell.height()));
+        }
+        columns = std::clamp(columns, 1, 10);
+        rows = std::clamp(rows, 1, 12);
+    }
+    if (columns <= 0 || rows <= 0 || columns > kVirtualNodeCount
+            || rows > kVirtualNodeCount / columns) {
+        nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
+                "grid unavailable: dimensions=%dx%d visible_icons=%zu", columns, rows, icons.size());
+        if (!previousGridUsable) {
+            g_slots.clear();
+            g_grid_cells.clear();
+            g_grid_screen = -1;
+        }
+        return;
+    }
 
-    const int32_t leftStep = lefts.size() > 1
-            ? std::max(1, lefts[1] - lefts[0]) : std::max(1, width);
-    const int32_t topStep = std::max(1, height);
-    while (static_cast<int32_t>(lefts.size()) < columns) {
-        lefts.push_back(lefts.back() + leftStep);
+    std::vector<SnapshotFavorite> favorites;
+    {
+        std::lock_guard lock(g_snapshot_mutex);
+        for (const auto &favorite : g_snapshot.favorites) {
+            if (favorite.placement.container == kDesktopContainer
+                    && favorite.placement.screen == screen + 1) {
+                favorites.push_back(favorite);
+            }
+        }
     }
-    while (static_cast<int32_t>(tops.size()) < rows) {
-        tops.push_back(tops.back() + topStep);
-    }
-    g_grid_columns.store(columns, std::memory_order_release);
-    g_grid_rows.store(rows, std::memory_order_release);
-    g_slots.clear();
+    // Calibrate from known cell indexes, not the ordinal of the occupied rows.
+    // A missing column must leave a physical hole in the touch grid.
+    auto axis = [&](bool horizontal, int32_t count, int32_t begin, int32_t end) {
+        std::vector<std::pair<int32_t, float>> anchors;
+        for (const auto &icon : icons) {
+            const SnapshotFavorite *match = nullptr;
+            for (const auto &favorite : favorites) {
+                if (favorite.placement.spanX != 1 || favorite.placement.spanY != 1) continue;
+                if (!labelMatches(icon.label, favorite.title)
+                        && !labelMatches(icon.label, favorite.label)) continue;
+                if (match != nullptr) { match = nullptr; break; }
+                match = &favorite;
+            }
+            if (match == nullptr) continue;
+            int32_t index = horizontal ? match->placement.cellX : match->placement.cellY;
+            if (index >= 0 && index < count) anchors.emplace_back(index,
+                    horizontal ? icon.bounds.centerX() : icon.bounds.centerY());
+        }
+        float step = static_cast<float>(end - begin) / count;
+        float origin = static_cast<float>(begin);
+        std::vector<float> steps;
+        for (size_t i = 0; i < anchors.size(); ++i) {
+            for (size_t j = i + 1; j < anchors.size(); ++j) {
+                int32_t distance = anchors[j].first - anchors[i].first;
+                if (distance == 0) continue;
+                float measured = (anchors[j].second - anchors[i].second) / distance;
+                if (measured > step * 0.7f && measured < step * 1.3f) steps.push_back(measured);
+            }
+        }
+        if (!steps.empty()) {
+            std::sort(steps.begin(), steps.end());
+            step = steps[steps.size() / 2];
+            std::vector<float> origins;
+            for (const auto &[index, center] : anchors) origins.push_back(center - (index + 0.5f) * step);
+            std::sort(origins.begin(), origins.end());
+            origin = origins[origins.size() / 2];
+        }
+        return std::pair<float, float>{origin, step};
+    };
+    const auto [originX, stepX] = axis(true, columns, page.left, page.right);
+    const auto [originY, stepY] = axis(false, rows, page.top, page.bottom);
+    std::vector<Slot> newSlots;
+    std::vector<Slot> newGridCells;
     for (int32_t row = 0; row < rows; ++row) {
         for (int32_t column = 0; column < columns; ++column) {
-            Bounds cell{lefts[column], tops[row], lefts[column] + width,
-                    tops[row] + height};
+            Bounds cell{
+                 column == 0 ? page.left : std::clamp(static_cast<int32_t>(std::lround(originX + column * stepX)), page.left, page.right),
+                 row == 0 ? page.top : std::clamp(static_cast<int32_t>(std::lround(originY + row * stepY)), page.top, page.bottom),
+                 column == columns - 1 ? page.right : std::clamp(static_cast<int32_t>(std::lround(originX + (column + 1) * stepX)), page.left, page.right),
+                 row == rows - 1 ? page.bottom : std::clamp(static_cast<int32_t>(std::lround(originY + (row + 1) * stepY)), page.top, page.bottom)};
+            if (cell.width() <= 0 || cell.height() <= 0) continue;
+            newGridCells.push_back({cell, row, column});
             bool occupied = false;
-            for (const auto &node : g_workspace) {
-                if (!node.icon() || node.parent == 49 || node.bounds.top > 2000) continue;
-                if (isLiftedSourceId(node.id)) continue;
-                if (cell.centerX() >= node.bounds.left && cell.centerX() < node.bounds.right
-                        && cell.centerY() >= node.bounds.top && cell.centerY() < node.bounds.bottom) {
+            for (const auto &favorite : favorites) {
+                const auto &item = favorite.placement;
+                if (column >= item.cellX && column < item.cellX + item.spanX
+                        && row >= item.cellY && row < item.cellY + item.spanY) {
                     occupied = true;
                     break;
                 }
             }
-            if (!occupied) g_slots.push_back({cell, row, column});
+            for (const auto &node : icons) {
+                if (node.bounds.centerX() >= cell.left && node.bounds.centerX() < cell.right
+                        && node.bounds.centerY() >= cell.top && node.bounds.centerY() < cell.bottom) {
+                    occupied = true;
+                    break;
+                }
+            }
+            if (!occupied) newSlots.push_back({cell, row, column});
         }
     }
-    if (g_slots.size() > static_cast<size_t>(kVirtualNodeCount)) {
-        g_slots.resize(kVirtualNodeCount);
+    if (newGridCells.empty()) {
+        if (!previousGridUsable) {
+            g_slots.clear();
+            g_grid_cells.clear();
+            g_grid_screen = -1;
+        }
+        return;
+    }
+    g_grid_columns.store(columns, std::memory_order_release);
+    g_grid_rows.store(rows, std::memory_order_release);
+    g_grid_cells = std::move(newGridCells);
+    g_slots = std::move(newSlots);
+    g_grid_screen = screen;
+    const int64_t diagnosticSession = g_diagnostics.session();
+    if (diagnosticSession != 0) {
+        std::string occupancy(static_cast<size_t>(rows * (columns + 1)), 'x');
+        for (int row = 0; row < rows; ++row) occupancy[row * (columns + 1) + columns] = '/';
+        for (const auto &slot : g_slots) occupancy[slot.row * (columns + 1) + slot.column] = '.';
+        const std::string signature = std::to_string(g_grid_screen) + ":" + occupancy;
+        if (g_diagnostics_grid_session != diagnosticSession || signature != g_diagnostics_last_grid) {
+            g_diagnostics_grid_session = diagnosticSession;
+            g_diagnostics_last_grid = signature;
+            nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
+                    "grid screen=%d size=%dx%d page=%d,%d,%d,%d icons=%zu favorites=%zu slots=%zu occupancy(x=occupied,.=free)=%s",
+                    g_grid_screen, columns, rows, page.left, page.top, page.right, page.bottom,
+                    icons.size(), favorites.size(), g_slots.size(), occupancy.c_str());
+        }
     }
 }
 
 void readTree(void *provider, int32_t id, std::vector<ObservedNode> &nodes, int depth) {
-    if (depth > 20 || nodes.size() >= 512 || isVirtualNode(id)) return;
+    if (g_original_create_node == nullptr || g_node_drop == nullptr
+            || depth > 20 || nodes.size() >= 512 || isVirtualNode(id)) return;
     for (const auto &node : nodes) if (node.id == id) return;
     NodeResult result = g_original_create_node(provider, id);
     if ((result.absent & 1U) != 0 || result.node == nullptr) return;
@@ -2498,8 +3066,13 @@ void refreshLiftSessionForPage(void *provider) {
     int32_t newParent = -1;
     AccessibilityEventSource oldParentSource;
     AccessibilityEventSource newParentSource;
+    bool keepHover = false, keepFocus = false;
+    const int32_t oldHover = g_virtual_hovered_id.load();
+    const int32_t oldFocus = g_virtual_focused_id.load();
     {
         std::lock_guard lock(g_session_mutex);
+        if (!g_lifted.load(std::memory_order_acquire)) return;
+        const int32_t oldScreen = g_grid_screen;
         oldParent = g_drop_parent_node_id.load(std::memory_order_acquire);
         oldParentSource = {
                 g_drop_parent_host_id.load(std::memory_order_acquire),
@@ -2518,38 +3091,107 @@ void refreshLiftSessionForPage(void *provider) {
         newParentSource = {
                 g_drop_parent_host_id.load(std::memory_order_acquire),
                 g_drop_parent_window_id.load(std::memory_order_acquire), newParent};
+        const bool samePage = oldScreen == g_grid_screen
+                && oldParentSource.host == newParentSource.host
+                && oldParentSource.window == newParentSource.window;
+        keepHover = samePage && slotIndexForVirtualIdLocked(oldHover) >= 0;
+        keepFocus = samePage && slotIndexForVirtualIdLocked(oldFocus) >= 0;
     }
-    const int32_t oldHover = g_virtual_hovered_id.exchange(-1, std::memory_order_acq_rel);
-    const int32_t oldFocus = g_virtual_focused_id.exchange(-1, std::memory_order_acq_rel);
     const AccessibilityEventSource oldHoverSource{
             oldParentSource.host, oldParentSource.window, oldHover};
     const AccessibilityEventSource oldFocusSource{
             oldParentSource.host, oldParentSource.window, oldFocus};
-    if (isVirtualNode(oldHover)) sendEvent(oldHoverSource, 256);
-    if (isVirtualNode(oldFocus)) sendEvent(oldFocusSource, 65536);
+    int32_t expected = oldHover;
+    if (!keepHover && g_virtual_hovered_id.compare_exchange_strong(expected, -1)
+            && isVirtualNode(oldHover)) sendEvent(oldHoverSource, 256);
+    expected = oldFocus;
+    if (!keepFocus && g_virtual_focused_id.compare_exchange_strong(expected, -1)
+            && isVirtualNode(oldFocus)) sendEvent(oldFocusSource, 65536);
     if (oldParent != newParent) sendEvent(oldParentSource, kTypeWindowContentChanged);
     sendEvent(newParentSource, kTypeWindowContentChanged);
-    __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+    nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
             "lift page refreshed nodes=%zu old_parent=%d new_parent=%d page=%d",
             nodeCount, oldParent, newParent,
             g_visible_screen.load(std::memory_order_acquire) + 1);
 }
 
 void scheduleLiftSessionRefresh(bool lifted) {
-    if (!lifted) return;
-    const auto provider = g_last_provider.load(std::memory_order_acquire);
-    if (provider == nullptr) return;
-    std::thread([provider] {
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        refreshLiftSessionForPage(provider);
-    }).detach();
+    // The next root accessibility query refreshes the lifted tree while the
+    // provider is still owned by that call.  Never retain its raw pointer in
+    // a detached thread: the launcher can destroy it during a page switch.
+    (void) lifted;
+}
+
+bool sendPageAnnouncementWithSource(int32_t host, int32_t window, int32_t virtualId,
+        int32_t page, int32_t totalPages, const std::string &text) {
+    void *controller = g_event_controller.load(std::memory_order_acquire);
+    if (controller == nullptr || text.empty() || g_event_new == nullptr
+            || g_event_drop == nullptr || g_original_send_event == nullptr
+            || g_event_set_source == nullptr || g_event_push_text == nullptr
+            || g_rstring_from_utf16 == nullptr) return false;
+
+    // The native reader accepts a real scroll record, while TalkBack also
+    // accepts the announcement record used by older public AIDL builds.  The
+    // setters are resolved from the verified public ABI, so use the richer
+    // record only when the complete setter set is available.
+    const bool scrollRecord = g_event_set_item_count != nullptr
+            && g_event_set_from_index != nullptr && g_event_set_to_index != nullptr;
+    const int32_t type = scrollRecord ? kTypeViewScrolled : kTypeAnnouncement;
+    void *event = g_event_new(type);
+    if (event == nullptr) return false;
+    if (g_event_set_package != nullptr) {
+        RustRString package = g_rstring_from_utf16(
+                reinterpret_cast<const uint16_t *>(u"com.miui.home"), 13);
+        g_event_set_package(event, &package);
+    }
+    g_event_set_source(event, host, window, virtualId);
+    if (g_event_set_event_type != nullptr) g_event_set_event_type(event, type);
+    if (scrollRecord) {
+        g_event_set_item_count(event, std::max(1, totalPages));
+        g_event_set_from_index(event, std::max(0, page - 1));
+        g_event_set_to_index(event, std::max(0, page - 1));
+    }
+    const std::u16string value = utf16FromUtf8(text);
+    RustRString speech = g_rstring_from_utf16(
+            reinterpret_cast<const uint16_t *>(value.data()), value.size());
+    g_event_push_text(event, &speech);
+    g_original_send_event(controller, event);
+    g_event_drop(event);
+    return true;
+}
+
+bool announceConfirmedPage(int32_t page, const AccessibilityEventSource &source) {
+    const int32_t surfaceValue = g_surface_state.load(std::memory_order_acquire);
+    const SurfaceState surface = static_cast<SurfaceState>(surfaceValue);
+    if (surfaceValue != static_cast<int32_t>(SurfaceState::kWorkspace)
+            && !g_page_state_known.load(std::memory_order_acquire)) return false;
+    int32_t count = 0;
+    if (!desktopItemCountForPage(page, count)) return false;
+    int32_t previous;
+    {
+        std::lock_guard lock(g_page_announcement_mutex);
+        if (g_announced_page == page) return true;
+        previous = g_announced_page;
+        g_announced_page = page;
+    }
+    const int32_t totalPages = g_total_pages.load(std::memory_order_acquire);
+    const std::string text = "第 " + std::to_string(page) + " 页共 "
+            + std::to_string(count) + " 项";
+    const bool sent = sendPageAnnouncementWithSource(source.host, source.window, source.nodeId,
+            page, totalPages, text);
+    if (!sent) {
+        std::lock_guard lock(g_page_announcement_mutex);
+        if (g_announced_page == page) g_announced_page = previous;
+    }
+    nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
+            "page speech page=%d items=%d sent=%d source=%d/%d window=%d",
+            page, count, sent ? 1 : 0, source.host, source.nodeId, source.window);
+    return sent;
 }
 
 bool rewritePageScrollEvent(void *event, bool &suppressOriginal) {
     suppressOriginal = false;
     if (event == nullptr) return false;
-    if (g_surface_state.load(std::memory_order_acquire)
-            != static_cast<int32_t>(SurfaceState::kWorkspace)) return false;
     int32_t type = nodeField<int32_t>(event, kEventTypeOffset);
     int32_t itemCount = nodeField<int32_t>(event, kEventItemCountOffset);
     int32_t fromIndex = nodeField<int32_t>(event, kEventFromIndexOffset);
@@ -2557,11 +3199,15 @@ bool rewritePageScrollEvent(void *event, bool &suppressOriginal) {
     uint64_t source = nodeField<uint64_t>(event, kEventSourceOffset);
     const int32_t window = nodeField<int32_t>(event, kEventWindowOffset);
     const int32_t workspaceWindow = g_workspace_window_id.load(std::memory_order_acquire);
-    if (type == kTypeAnnouncement && source == kFlutterPageAnnouncementSource) {
+    if (workspaceWindow >= 0 && window != workspaceWindow) return false;
+    if (type == kTypeAnnouncement) {
         int32_t page = 0;
         std::string originalText = eventString(event, kEventTextOffset);
         int32_t totalPages = 0;
         if (parsePageIndicator(originalText, page, &totalPages)) {
+            if (g_launcher_window_focused.load(std::memory_order_acquire) == 0) {
+                return false;
+            }
             if (workspaceWindow == -1) {
                 g_workspace_window_id.store(window, std::memory_order_release);
             }
@@ -2569,22 +3215,9 @@ bool rewritePageScrollEvent(void *event, bool &suppressOriginal) {
             g_visible_screen.store(page - 1, std::memory_order_release);
             g_total_pages.store(totalPages, std::memory_order_release);
             g_page_state_known.store(true, std::memory_order_release);
-            const bool predictedPage = g_predicted_page.exchange(-1,
-                    std::memory_order_acq_rel) == page;
-            if (predictedPage) {
-                suppressOriginal = true;
-            } else {
-                int32_t count = 0;
-                if (!desktopItemCountForPage(page, count)) return false;
-                std::string description = "第 " + std::to_string(page)
-                        + " 页共 " + std::to_string(count) + " 项";
-                int32_t host = static_cast<int32_t>(source & 0xffffffffU);
-                int32_t virtualId = static_cast<int32_t>(source >> 32U);
-                if (!sendAnnouncementWithSource(host, window, virtualId, description)) {
-                    return false;
-                }
-                suppressOriginal = true;
-            }
+            if (!announceConfirmedPage(page, {static_cast<int32_t>(source), window,
+                    static_cast<int32_t>(source >> 32U)})) return false;
+            suppressOriginal = true;
             scheduleLiftSessionRefresh(lifted);
             return true;
         }
@@ -2594,38 +3227,25 @@ bool rewritePageScrollEvent(void *event, bool &suppressOriginal) {
         std::lock_guard lock(g_event_mutex);
         sourceMatched = g_page_source_keys.find(source) != g_page_source_keys.end();
     }
-    if (!sourceMatched) {
+    if (!sourceMatched && (workspaceWindow < 0
+            || window != workspaceWindow
+            || !g_page_state_known.load(std::memory_order_acquire))) {
         return false;
     }
     if (workspaceWindow == -1) {
         g_workspace_window_id.store(window, std::memory_order_release);
     }
     if (type != kTypeViewScrolled || itemCount <= 0
-            || fromIndex < 0 || toIndex < fromIndex
-            || g_event_set_event_type == nullptr || g_event_push_text == nullptr
-            || g_rstring_from_utf16 == nullptr) {
+            || fromIndex < 0 || fromIndex >= itemCount || toIndex < fromIndex) {
         return false;
     }
     const bool lifted = g_lifted.load(std::memory_order_acquire);
-    int32_t count = 0;
     int32_t page = fromIndex + 1;
     g_visible_screen.store(page - 1, std::memory_order_release);
     g_page_state_known.store(true, std::memory_order_release);
-    if (!desktopItemCountForPage(page, count)) {
-        return false;
-    }
-    if (g_event_set_item_count == nullptr || g_event_set_from_index == nullptr
-            || g_event_set_to_index == nullptr) return false;
-    std::string description = "第 " + std::to_string(page)
-            + " 页共 " + std::to_string(count) + " 项";
-    std::u16string text = utf16FromUtf8(description);
-    RustRString value = g_rstring_from_utf16(
-            reinterpret_cast<const uint16_t *>(text.data()), text.size());
-    g_event_set_event_type(event, kTypeAnnouncement);
-    g_event_set_item_count(event, -1);
-    g_event_set_from_index(event, -1);
-    g_event_set_to_index(event, -1);
-    g_event_push_text(event, &value);
+    if (!announceConfirmedPage(page, {static_cast<int32_t>(source), window,
+            static_cast<int32_t>(source >> 32U)})) return false;
+    suppressOriginal = true;
     scheduleLiftSessionRefresh(lifted);
     return true;
 }
@@ -2708,6 +3328,18 @@ bool sendAnnouncementWithSource(int32_t host, int32_t window, int32_t virtualId,
     return true;
 }
 
+bool announceReliably(int32_t host, int32_t window, int32_t virtualId,
+        const std::string &text) {
+    if (text.empty()) return false;
+    if (sendAnnouncementWithSource(host, window, virtualId, text)) return true;
+    // The accessibility event controller is replaced during Home transitions.
+    // Keep the speech request until a synchronous provider/event callback can
+    // send it; never retain that callback's raw provider pointer in a worker.
+    queueSurfaceAnnouncement(text);
+    flushSurfaceAnnouncements();
+    return false;
+}
+
 bool sendAnnouncement(int32_t nodeId, const std::string &text) {
     const int32_t host = isVirtualNode(nodeId)
             ? g_drop_parent_host_id.load(std::memory_order_acquire)
@@ -2719,15 +3351,31 @@ bool sendAnnouncement(int32_t nodeId, const std::string &text) {
 }
 
 void queueSurfaceAnnouncement(const std::string &text) {
-    if (text.empty() || sendAnnouncement(-1, text)) return;
+    if (g_launcher_window_focused.load(std::memory_order_acquire) == 0) return;
+    if (text.empty()) return;
+    if (g_focus_callback_active.load(std::memory_order_acquire)) {
+        std::lock_guard lock(g_surface_announcement_mutex);
+        if (g_pending_surface_announcements.empty()
+                || g_pending_surface_announcements.back() != text) {
+            g_pending_surface_announcements.push_back(text);
+        }
+        if (text == "系统桌面") g_home_announcement_pending.store(true,
+                std::memory_order_release);
+        return;
+    }
+    if (sendAnnouncement(-1, text)) return;
     std::lock_guard lock(g_surface_announcement_mutex);
     if (g_pending_surface_announcements.empty()
             || g_pending_surface_announcements.back() != text) {
         g_pending_surface_announcements.push_back(text);
     }
+    if (text == "系统桌面") g_home_announcement_pending.store(true,
+            std::memory_order_release);
 }
 
 void flushSurfaceAnnouncements() {
+    if (g_launcher_window_focused.load(std::memory_order_acquire) == 0) return;
+    if (g_focus_callback_active.load(std::memory_order_acquire)) return;
     for (;;) {
         std::string text;
         {
@@ -2736,78 +3384,14 @@ void flushSurfaceAnnouncements() {
             text = g_pending_surface_announcements.front();
             g_pending_surface_announcements.pop_front();
         }
-        if (sendAnnouncement(-1, text)) continue;
+        if (sendAnnouncement(-1, text)) {
+            if (text == "系统桌面") g_home_announcement_pending.store(false,
+                    std::memory_order_release);
+            continue;
+        }
         std::lock_guard lock(g_surface_announcement_mutex);
         g_pending_surface_announcements.push_front(std::move(text));
         return;
-    }
-}
-
-bool predictPageSwipe(float startX, float startY, float endX, float endY) {
-    if (static_cast<SurfaceState>(g_surface_state.load(std::memory_order_acquire))
-            != SurfaceState::kWorkspace
-            || !g_page_state_known.load(std::memory_order_acquire)) return false;
-    float deltaX = endX - startX;
-    float deltaY = endY - startY;
-    if (std::fabs(deltaX) < 200.0f || std::fabs(deltaX) <= std::fabs(deltaY) * 1.2f) {
-        return false;
-    }
-    int32_t currentPage = g_visible_screen.load(std::memory_order_acquire) + 1;
-    int32_t totalPages = g_total_pages.load(std::memory_order_acquire);
-    int32_t targetPage = currentPage + (deltaX < 0.0f ? 1 : -1);
-    if (targetPage <= 0 || (totalPages > 0 && targetPage > totalPages)) return false;
-    int32_t count = 0;
-    if (!desktopItemCountForPage(targetPage, count)) return false;
-    std::string description = "第 " + std::to_string(targetPage)
-            + " 页共 " + std::to_string(count) + " 项";
-    if (!sendAnnouncement(-1, description)) return false;
-    g_predicted_page.store(targetPage, std::memory_order_release);
-    g_visible_screen.store(targetPage - 1, std::memory_order_release);
-    return true;
-}
-
-void handlePageSwipeMotion(int32_t action, float x, float y) {
-    if (action == 0) {
-        std::lock_guard lock(g_page_swipe_mutex);
-        g_page_swipe_tracking = true;
-        g_page_swipe_announced = false;
-        g_page_swipe_start_x = x;
-        g_page_swipe_start_y = y;
-        g_predicted_page.store(-1, std::memory_order_release);
-        return;
-    }
-    if (action == 5 || action == 2) {
-        {
-            std::lock_guard lock(g_page_swipe_mutex);
-            if (action == 2 && g_page_swipe_tracking
-                    && !g_page_swipe_announced
-                    && predictPageSwipe(g_page_swipe_start_x, g_page_swipe_start_y, x, y)) {
-                g_page_swipe_announced = true;
-            }
-        }
-        return;
-    }
-    if (action != 1) return;
-    float startX = 0.0f;
-    float startY = 0.0f;
-    bool alreadyAnnounced = false;
-    {
-        std::lock_guard lock(g_page_swipe_mutex);
-        if (!g_page_swipe_tracking) return;
-        g_page_swipe_tracking = false;
-        alreadyAnnounced = g_page_swipe_announced;
-        startX = g_page_swipe_start_x;
-        startY = g_page_swipe_start_y;
-    }
-    if (alreadyAnnounced) {
-        if (g_lifted.load(std::memory_order_acquire)) {
-            refreshLiftSessionForPage(g_last_provider.load(std::memory_order_acquire));
-        }
-        return;
-    }
-    if (predictPageSwipe(startX, startY, x, y)
-            && g_lifted.load(std::memory_order_acquire)) {
-        refreshLiftSessionForPage(g_last_provider.load(std::memory_order_acquire));
     }
 }
 
@@ -2858,72 +3442,76 @@ void handleRecentSwipeMotion(int32_t action, float x, float y) {
     }
 }
 
-void updateTouchExplorationTarget(int32_t action, float x, float y) {
-    if (!g_lifted.load(std::memory_order_acquire) || !moveActionsReady()) return;
+int32_t virtualNodeAt(float x, float y) {
+    std::lock_guard lock(g_session_mutex);
+    for (size_t index = 0; index < g_slots.size(); ++index) {
+        const Slot &slot = g_slots[index];
+        if (x >= slot.bounds.left && x < slot.bounds.right
+                && y >= slot.bounds.top && y < slot.bounds.bottom) {
+            return virtualIdForSlot(slot);
+        }
+    }
+    return -1;
+}
+
+bool updateTouchExplorationTarget(int32_t action, float x, float y) {
+    if (!g_lifted.load(std::memory_order_acquire) || !moveActionsReady()) return false;
     constexpr int32_t kActionHoverMove = 7;
     constexpr int32_t kActionHoverEnter = 9;
     constexpr int32_t kActionHoverExit = 10;
     if (action != kActionHoverMove && action != kActionHoverEnter
-            && action != kActionHoverExit) return;
+            && action != kActionHoverExit) return false;
     if (action == kActionHoverExit) {
         const int32_t previous = g_virtual_hovered_id.exchange(-1,
                 std::memory_order_acq_rel);
         if (isVirtualNode(previous)) {
             sendEvent(previous, 256);
-            const int32_t focused = g_virtual_focused_id.exchange(-1,
-                    std::memory_order_acq_rel);
-            if (focused == previous) sendEvent(previous, 65536);
         }
-        return;
+        // Touch exploration ends before the user's double tap. Keep its target.
+        return isVirtualNode(previous);
     }
-    int32_t target = -1;
-    {
-        std::lock_guard lock(g_session_mutex);
-        for (size_t index = 0; index < g_slots.size(); ++index) {
-            const Slot &slot = g_slots[index];
-            if (x >= slot.bounds.left && x < slot.bounds.right
-                    && y >= slot.bounds.top && y < slot.bounds.bottom) {
-                target = kVirtualNodeBase + static_cast<int32_t>(index);
-                break;
-            }
-        }
-    }
+    const int32_t target = virtualNodeAt(x, y);
     const int32_t previous = g_virtual_hovered_id.exchange(target,
             std::memory_order_acq_rel);
-    if (previous == target) return;
-    if (isVirtualNode(previous)) {
-        sendEvent(previous, 256);   // TYPE_VIEW_HOVER_EXIT
-        const int32_t focused = g_virtual_focused_id.exchange(-1,
-                std::memory_order_acq_rel);
-        if (focused == previous) sendEvent(previous, 65536);
+    if (previous != target && isVirtualNode(previous)) sendEvent(previous, 256);
+    if (!isVirtualNode(target)) {
+        const int32_t focused = g_virtual_focused_id.exchange(-1);
+        if (isVirtualNode(focused)) sendEvent(focused, 65536);
+        return false;
     }
-    if (isVirtualNode(target)) {
-        sendEvent(target, 128);   // TYPE_VIEW_HOVER_ENTER
-        g_virtual_focused_id.store(target, std::memory_order_release);
-        sendEvent(target, 32768); // TYPE_VIEW_ACCESSIBILITY_FOCUSED
-    }
+    if (previous == target) return true;
+    const int32_t focused = g_virtual_focused_id.exchange(target);
+    if (focused != target && isVirtualNode(focused)) sendEvent(focused, 65536);
+    sendEvent(target, 128); // TYPE_VIEW_HOVER_ENTER
+    if (focused != target) sendEvent(target, 32768);
+    return true;
 }
 
-bool onLauncherMotionV2(void *scene, void *window, void *event) {
-    bool result = g_original_launcher_motion_v2 == nullptr
-            ? false : g_original_launcher_motion_v2(scene, window, event);
-    void *motionEvent = event;
-    if (window != nullptr && g_motion_action_masked != nullptr) {
-        const int32_t windowAction = g_motion_action_masked(window);
-        if (windowAction == 7 || windowAction == 9 || windowAction == 10)
-            motionEvent = window;
+void onLauncherMotion(void *scene, void *event) {
+    if (event != nullptr && g_motion_action_masked != nullptr
+            && g_motion_raw_x != nullptr && g_motion_raw_y != nullptr) {
+        const int32_t action = g_motion_action_masked(event);
+        const float x = g_motion_raw_x(event, 0);
+        const float y = g_motion_raw_y(event, 0);
+        const bool wasVirtual = isVirtualNode(g_virtual_hovered_id.load());
+        if (!wasVirtual && (action == 7 || action == 9) && g_lifted.load()
+                && moveActionsReady() && isVirtualNode(virtualNodeAt(x, y))) {
+            // Clear native hover before announcing the virtual target; forwarding
+            // the original hover would let the icon behind the empty cell win.
+            if (g_original_launcher_motion != nullptr && g_motion_clone != nullptr
+                    && g_motion_drop != nullptr && g_motion_set_action != nullptr) {
+                void *exit = g_motion_clone(event);
+                if (exit != nullptr) {
+                    g_motion_set_action(exit, 10);
+                    g_original_launcher_motion(scene, exit);
+                    g_motion_drop(exit);
+                }
+            }
+        }
+        if (updateTouchExplorationTarget(action, x, y)) return;
+        handleRecentSwipeMotion(action, x, y);
     }
-    if (motionEvent == nullptr || g_motion_action_masked == nullptr || g_motion_raw_x == nullptr
-            || g_motion_raw_y == nullptr) return result;
-    int32_t action = g_motion_action_masked(motionEvent);
-    if (g_lifted.load(std::memory_order_acquire)
-            && (action == 9 || action == 10)) {
-    }
-    handlePageSwipeMotion(action, g_motion_raw_x(motionEvent, 0), g_motion_raw_y(motionEvent, 0));
-    handleRecentSwipeMotion(action, g_motion_raw_x(motionEvent, 0), g_motion_raw_y(motionEvent, 0));
-    if (!g_lifted.load(std::memory_order_acquire)) return result;
-    updateTouchExplorationTarget(action, g_motion_raw_x(motionEvent, 0), g_motion_raw_y(motionEvent, 0));
-    return result;
+    if (g_original_launcher_motion != nullptr) g_original_launcher_motion(scene, event);
 }
 
 bool isVirtualNode(int32_t nodeId) {
@@ -2951,16 +3539,177 @@ AccessibilityEventSource captureDropParentEventSource(int32_t fallbackNodeId) {
 
 std::string virtualNodeDescription(int32_t nodeId) {
     if (!isVirtualNode(nodeId)) return {};
-    const int32_t slot = nodeId - kVirtualNodeBase;
     std::lock_guard lock(g_session_mutex);
+    const int32_t slot = slotIndexForVirtualIdLocked(nodeId);
     if (slot < 0 || slot >= static_cast<int32_t>(g_slots.size())) return {};
-    return "放置到第" + std::to_string(g_slots[slot].row + 1)
-            + "行第" + std::to_string(g_slots[slot].column + 1) + "列";
+    return "移至第 " + std::to_string(g_slots[slot].row + 1)
+            + " 行第 " + std::to_string(g_slots[slot].column + 1) + " 列";
 }
 
 uint64_t packBounds(int32_t first, int32_t second) {
     return static_cast<uint32_t>(first)
             | (static_cast<uint64_t>(static_cast<uint32_t>(second)) << 32U);
+}
+
+int32_t gridNodeAtCellLocked(int32_t row, int32_t column) {
+    for (const auto &node : g_workspace) {
+        if (!node.icon() || hotseatNodeLocked(node)) continue;
+        for (const auto &cell : g_grid_cells) {
+            if (cell.row != row || cell.column != column) continue;
+            const int32_t centerX = node.bounds.centerX();
+            const int32_t centerY = node.bounds.centerY();
+            if (centerX >= cell.bounds.left && centerX < cell.bounds.right
+                    && centerY >= cell.bounds.top && centerY < cell.bounds.bottom) {
+                return node.id;
+            }
+        }
+    }
+    for (const auto &slot : g_slots) {
+        if (slot.row == row && slot.column == column) {
+            return virtualIdForSlot(slot);
+        }
+    }
+    return -1;
+}
+
+int32_t previousGridNodeLocked(int32_t row, int32_t column) {
+    int32_t previous = -1;
+    for (const auto &cell : g_grid_cells) {
+        if (cell.row > row || (cell.row == row && cell.column >= column)) break;
+        const int32_t candidate = gridNodeAtCellLocked(cell.row, cell.column);
+        if (candidate >= 0) previous = candidate;
+    }
+    return previous;
+}
+
+int32_t nextGridNodeLocked(int32_t row, int32_t column) {
+    for (const auto &cell : g_grid_cells) {
+        if (cell.row < row || (cell.row == row && cell.column <= column)) continue;
+        const int32_t candidate = gridNodeAtCellLocked(cell.row, cell.column);
+        if (candidate >= 0) return candidate;
+    }
+    return -1;
+}
+
+void rememberCurrentGridNode(void *node) {
+    const ObservedNode current = describeNode(node);
+    if (!current.icon()) return;
+    std::lock_guard lock(g_session_mutex);
+    for (auto &previous : g_workspace) {
+        if (previous.resource != current.resource
+                || (!labelMatches(previous.label, current.label)
+                        && !labelMatches(current.label, previous.label))
+                || previous.bounds.centerX() != current.bounds.centerX()
+                || previous.bounds.centerY() != current.bounds.centerY()) continue;
+        if (g_lifted_screen.load() == g_visible_screen.load()) {
+            for (auto &source : g_sources) {
+                if (source.id == previous.id) source = current;
+            }
+            if (g_source.id == previous.id) g_source = current;
+        }
+        previous = current;
+        return;
+    }
+}
+
+void setTraversalAfterForCell(void *node, int32_t row, int32_t column,
+        int32_t fallbackHost) {
+    if (node == nullptr || g_node_set_traversal_after == nullptr) return;
+    int32_t previous = -1;
+    int32_t next = -1;
+    int32_t host = fallbackHost;
+    int32_t nextHost = fallbackHost;
+    {
+        std::lock_guard lock(g_session_mutex);
+        previous = previousGridNodeLocked(row, column);
+        next = nextGridNodeLocked(row, column);
+        for (const auto &candidate : g_workspace) {
+            if (candidate.id == previous) {
+                host = candidate.host;
+            }
+            if (candidate.id == next) nextHost = candidate.host;
+        }
+    }
+    if (previous >= 0) {
+        g_node_set_traversal_after(node, host, previous);
+    }
+    if (next >= 0 && g_node_set_traversal_before != nullptr) {
+        g_node_set_traversal_before(node, nextHost, next);
+    }
+}
+
+void setTraversalAfterForVirtualNode(void *node, int32_t slot) {
+    if (node == nullptr || g_node_set_traversal_after == nullptr) return;
+    int32_t row = -1, column = -1;
+    {
+        std::lock_guard lock(g_session_mutex);
+        if (slot < 0 || slot >= static_cast<int32_t>(g_slots.size())) return;
+        const Slot &target = g_slots[static_cast<size_t>(slot)];
+        row = target.row;
+        column = target.column;
+    }
+    const int32_t host = g_drop_parent_host_id.load(std::memory_order_acquire);
+    setTraversalAfterForCell(node, row, column, host);
+}
+
+void setTraversalAfterForRealNode(void *node) {
+    if (node == nullptr || g_node_set_traversal_after == nullptr) return;
+    const Bounds bounds = nodeField<Bounds>(node, kNodeBoundsOffset);
+    int32_t row = -1;
+    int32_t column = -1;
+    {
+        std::lock_guard lock(g_session_mutex);
+        if (hotseatNodeLocked(describeNode(node))) return;
+        for (const auto &cell : g_grid_cells) {
+            if (bounds.centerX() >= cell.bounds.left && bounds.centerX() < cell.bounds.right
+                    && bounds.centerY() >= cell.bounds.top && bounds.centerY() < cell.bounds.bottom) {
+                row = cell.row;
+                column = cell.column;
+                break;
+            }
+        }
+    }
+    if (row < 0 || column < 0) return;
+    const int64_t source = nodeField<int64_t>(node, 0x338);
+    setTraversalAfterForCell(node, row, column, static_cast<int32_t>(source));
+}
+
+void repairFolderBounds(void *node, int32_t sourceId) {
+    if (node == nullptr || g_node_set_bounds == nullptr) return;
+    const Bounds current = nodeField<Bounds>(node, kNodeBoundsOffset);
+    if (current.right > current.left && current.bottom > current.top) return;
+    const std::string label = nodeString(node, 0x138);
+    Bounds repaired{};
+    Bounds parent{};
+    int32_t parentId = -1;
+    {
+        std::lock_guard lock(g_session_mutex);
+        for (const auto &candidate : g_workspace) {
+            if (candidate.id == sourceId && candidate.resource == "com.miui.home:id/folder"
+                    && (label.empty() || candidate.label == label)
+                    && candidate.bounds.right > candidate.bounds.left
+                    && candidate.bounds.bottom > candidate.bounds.top) {
+                repaired = candidate.bounds;
+                parentId = candidate.parent;
+                break;
+            }
+        }
+        for (const auto &candidate : g_workspace) {
+            if (candidate.id == parentId) {
+                parent = candidate.bounds;
+                break;
+            }
+        }
+    }
+    if (repaired.right <= repaired.left || repaired.bottom <= repaired.top) return;
+    g_node_set_bounds(node, packBounds(repaired.left, repaired.top),
+            packBounds(repaired.right, repaired.bottom));
+    if (g_node_set_parent_bounds != nullptr && parent.right > parent.left
+            && parent.bottom > parent.top) {
+        g_node_set_parent_bounds(node,
+                packBounds(repaired.left - parent.left, repaired.top - parent.top),
+                packBounds(repaired.right - parent.left, repaired.bottom - parent.top));
+    }
 }
 
 void setNodeString(NodeSetStringFn setter, void *node, const char16_t *text) {
@@ -2975,14 +3724,13 @@ NodeResult makeVirtualNode(int32_t nodeId) {
     if (g_node_new == nullptr || !isVirtualNode(nodeId) || !moveActionsReady()) return result;
     void *node = g_node_new();
     if (node == nullptr) return result;
-    int32_t slot = nodeId - kVirtualNodeBase;
+    int32_t slot = -1;
     Bounds cell{};
     Bounds parentBounds{};
-    int32_t column = -1;
-    int32_t row = -1;
     int32_t parentNodeId = -1;
     {
         std::lock_guard lock(g_session_mutex);
+        slot = slotIndexForVirtualIdLocked(nodeId);
         if (slot < 0 || slot >= static_cast<int32_t>(g_slots.size())) {
             if (g_node_drop != nullptr) g_node_drop(node);
             return result;
@@ -2995,25 +3743,16 @@ NodeResult makeVirtualNode(int32_t nodeId) {
                 break;
             }
         }
-        column = g_slots[slot].column;
-        row = g_slots[slot].row;
     }
     setNodeString(g_node_set_package_name, node, u"com.miui.home");
     setNodeString(g_node_set_class_name, node, u"android.view.View");
-    char16_t description[64]{};
-    std::u16string text = u"放置到第";
-    for (char digit : std::to_string(row + 1)) text.push_back(static_cast<char16_t>(digit));
-    text += u"行第";
-    for (char digit : std::to_string(column + 1)) text.push_back(static_cast<char16_t>(digit));
-    text += u"列";
-    std::char_traits<char16_t>::copy(description, text.c_str(),
-            std::min(text.size(), sizeof(description) / sizeof(description[0]) - 1U));
-    setNodeString(g_node_set_content_description, node, description);
+    const std::u16string description = utf16FromUtf8(virtualNodeDescription(nodeId));
+    setNodeString(g_node_set_content_description, node, description.c_str());
     if (g_node_set_source != nullptr) {
         const int32_t host = g_drop_parent_host_id.load(std::memory_order_acquire);
         const int32_t window = g_drop_parent_window_id.load(std::memory_order_acquire);
         g_node_set_source(node, host, nodeId, window);
-        g_node_set_parent(node, host, parentNodeId, window);
+        if (g_node_set_parent != nullptr) g_node_set_parent(node, host, parentNodeId);
     }
     if (g_node_set_bounds != nullptr) {
         g_node_set_bounds(node, packBounds(cell.left, cell.top),
@@ -3034,6 +3773,7 @@ NodeResult makeVirtualNode(int32_t nodeId) {
         g_node_set_accessibility_focused(node,
                 g_virtual_focused_id.load(std::memory_order_acquire) == nodeId);
     }
+    setTraversalAfterForVirtualNode(node, slot);
     if (g_action_new != nullptr && g_action_drop != nullptr
             && g_rstring_from_utf16 != nullptr && g_original_add_action != nullptr) {
         auto addAction = [node](int32_t actionId, const char16_t *label) {
@@ -3069,69 +3809,157 @@ NodeResult onFindFocus(void *provider, int32_t focusType) {
             ? NodeResult{1U, nullptr} : g_original_find_focus(provider, focusType);
 }
 
+void orderGridChildren(void *node) {
+    // The verified AIDL Option<Vec<i64>> owns this buffer; reorder its IDs in
+    // place so readers using getChild(index) see the same order as touch.
+    if ((nodeField<uint64_t>(node, 0x30) >> 63U) != 0) return;
+    const size_t count = nodeField<size_t>(node, 0x40);
+    auto *children = nodeField<int64_t *>(node, 0x38);
+    if (children == nullptr || count == 0 || count > nodeField<size_t>(node, 0x30)
+            || count > 512 + kVirtualNodeCount) return;
+    std::lock_guard lock(g_session_mutex);
+    auto rank = [&](int64_t child) {
+        const int32_t id = static_cast<int32_t>(child >> 32U);
+        if (isVirtualNode(id)) return id - kVirtualNodeBase;
+        int32_t first = kVirtualNodeCount;
+        for (const auto &item : g_workspace) {
+            if (!item.icon() || hotseatNodeLocked(item)
+                    || (item.id != id && !descendsFromLocked(item, id))) continue;
+            for (const auto &cell : g_grid_cells) {
+                if (item.bounds.centerX() >= cell.bounds.left && item.bounds.centerX() < cell.bounds.right
+                        && item.bounds.centerY() >= cell.bounds.top && item.bounds.centerY() < cell.bounds.bottom) {
+                    first = std::min(first, cell.row * g_grid_columns.load() + cell.column);
+                }
+            }
+        }
+        if (first != kVirtualNodeCount) return first;
+        for (const auto &item : g_workspace) {
+            if (item.id != id || hotseatNodeLocked(item)) continue;
+            for (const auto &cell : g_grid_cells) {
+                if (item.bounds.left >= cell.bounds.left && item.bounds.left < cell.bounds.right
+                        && item.bounds.top >= cell.bounds.top && item.bounds.top < cell.bounds.bottom) {
+                    return cell.row * g_grid_columns.load() + cell.column;
+                }
+            }
+        }
+        return first;
+    };
+    auto *end = std::remove_if(children, children + count, [&](int64_t child) {
+        const int32_t id = static_cast<int32_t>(child >> 32U);
+        return isVirtualNode(id) && slotIndexForVirtualIdLocked(id) < 0;
+    });
+    std::stable_sort(children, end, [&](int64_t left, int64_t right) { return rank(left) < rank(right); });
+    const size_t length = static_cast<size_t>(std::unique(children, end) - children);
+    std::memcpy(static_cast<uint8_t *>(node) + 0x40, &length, sizeof(length));
+}
+
+void traceDiagnosticsNode(void *node, int32_t nodeId, uint32_t before) {
+    if (g_diagnostics.session() == 0 || !isIconNode(node)) return;
+    int budget = g_diagnostics_node_budget.load();
+    while (budget > 0) {
+        if (!g_diagnostics_node_budget.compare_exchange_weak(budget, budget - 1)) continue;
+        const Bounds bounds = nodeField<Bounds>(node, kNodeBoundsOffset);
+        nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
+                "icon actions node=%d focus=%d page=%d bounds=%d,%d,%d,%d added=%u cap=0x%x injectors=%d",
+                nodeId, g_launcher_window_focused.load(), g_visible_screen.load() + 1,
+                bounds.left, bounds.top, bounds.right, bounds.bottom,
+                g_custom_action_calls.load() - before, g_capabilities.load(),
+                g_original_add_action && g_action_new && g_action_drop && g_rstring_from_utf16 ? 1 : 0);
+        break;
+    }
+}
+
 NodeResult onCreateNode(void *provider, int32_t nodeId) {
-    if (isVirtualNode(nodeId) && g_lifted.load(std::memory_order_acquire)
-            && moveActionsReady()) {
-        return makeVirtualNode(nodeId);
+    if (isVirtualNode(nodeId)) {
+        return g_lifted.load(std::memory_order_acquire) && moveActionsReady()
+                ? makeVirtualNode(nodeId) : NodeResult{1U, nullptr};
     }
     NodeResult result = g_original_create_node == nullptr
             ? NodeResult{1U, nullptr} : g_original_create_node(provider, nodeId);
+    if ((result.absent & 1U) != 0 || result.node == nullptr) return result;
+    if (g_focus_callback_active.load(std::memory_order_acquire)) {
+        g_focus_callback_node_observed.store(true, std::memory_order_release);
+    }
+    const uint32_t actionsBefore = g_custom_action_calls.load();
+    if (g_launcher_window_focused.load(std::memory_order_acquire) == 0) {
+        // Home can build/cache these nodes inside its focus callback, before
+        // our foreground state changes. Their actions must already be present.
+        injectIconActions(result.node);
+        injectRecentActions(result.node);
+        traceDiagnosticsNode(result.node, nodeId, actionsBefore);
+        return result;
+    }
     if ((result.absent & 1U) == 0 && result.node != nullptr) {
         int64_t source = nodeField<int64_t>(result.node, 0x338);
         g_host_view_id.store(static_cast<int32_t>(source));
         g_window_id.store(nodeField<int32_t>(result.node, 0x418));
         observeSurfaceNode(provider, nodeId, result.node);
+        observePendingPlacement(describeNode(result.node));
+        if (nodeId == -1) {
+            // A root query is a safe provider lifetime boundary.  Build the
+            // surface snapshot here instead of handing this raw provider to a
+            // background poller after the accessibility call has returned.
+            std::vector<ObservedNode> nodes;
+            readTree(provider, -1, nodes);
+            observePendingPlacements(nodes);
+            if (!nodes.empty()) observeSurfaceTree(provider, nodes);
+        }
         const std::string pageDescription = nodeString(result.node, 0x138);
-        int32_t indicatorPage = 0;
         const bool lifted = g_lifted.load(std::memory_order_acquire);
-        const int32_t predictedPage = g_predicted_page.load(std::memory_order_acquire);
-        // Accessibility scrolls do not fill g_predicted_page; only reject a known
-        // stale indicator while a touch prediction is still in flight.
-        const bool pageSignalAccepted = !lifted || predictedPage <= 0
-                || (parsePageIndicator(pageDescription, indicatorPage)
-                        && indicatorPage == predictedPage);
-        const bool pageChanged = pageSignalAccepted
-                && rememberVisibleScreen(pageDescription);
+        const bool hadPage = g_page_state_known.load(std::memory_order_acquire);
+        const bool pageChanged = rememberVisibleScreen(pageDescription);
         rememberPageSource(result.node);
+        if (pageChanged && hadPage) {
+            announceConfirmedPage(g_visible_screen.load() + 1,
+                    {static_cast<int32_t>(source), nodeField<int32_t>(result.node, 0x418),
+                            static_cast<int32_t>(source >> 32U)});
+        }
         if (pageChanged && g_lifted.load(std::memory_order_acquire)) {
             refreshLiftSessionForPage(provider);
         }
+        bool knownPage = false;
+        if (lifted) {
+            std::lock_guard lock(g_session_mutex);
+            knownPage = std::any_of(g_workspace.begin(), g_workspace.end(), [&](const auto &item) {
+                return item.id == nodeId && (item.resource == "com.miui.home:id/screen_content"
+                        || item.resource == "com.miui.home:id/workspace");
+            });
+        }
+        const std::string resource = nodeString(result.node, 0x1b8);
+        if (lifted && (resource == "com.miui.home:id/screen_content"
+                || resource == "com.miui.home:id/workspace") && !knownPage) {
+            refreshLiftSessionForPage(provider);
+        }
+        if (g_lifted.load(std::memory_order_acquire)) rememberCurrentGridNode(result.node);
         injectIconActions(result.node);
+        if (g_lifted.load(std::memory_order_acquire) && isIconNode(result.node)) {
+            setTraversalAfterForRealNode(result.node);
+        }
         injectRecentActions(result.node);
     }
-    const std::string nodeResource = result.node == nullptr
-            ? std::string() : nodeString(result.node, 0x1b8);
-    const Bounds nodeBounds = result.node == nullptr
-            ? Bounds{} : nodeField<Bounds>(result.node, kNodeBoundsOffset);
-    const bool visibleScreenContent = nodeResource == "com.miui.home:id/screen_content"
-            && nodeBounds.right > nodeBounds.left && nodeBounds.bottom > nodeBounds.top;
     if ((result.absent & 1U) == 0 && result.node != nullptr
             && g_lifted.load(std::memory_order_acquire)
             && moveActionsReady()
-            && (visibleScreenContent
-                    || nodeId == g_drop_parent_node_id.load(std::memory_order_acquire))
+            && nodeId == g_drop_parent_node_id.load(std::memory_order_acquire)
             && g_node_add_child != nullptr) {
         // HyperOS 4 may allocate a fresh provider node id on every tree read.
         // Bind the virtual children to the currently returned visible page.
-        if (visibleScreenContent) {
-            g_drop_parent_host_id.store(static_cast<int32_t>(
-                    nodeField<int64_t>(result.node, 0x338)),
-                    std::memory_order_release);
-            g_drop_parent_window_id.store(nodeField<int32_t>(result.node, 0x418),
-                    std::memory_order_release);
-            g_drop_parent_node_id.store(nodeId, std::memory_order_release);
-        }
-        size_t slotCount = 0;
+        g_drop_parent_host_id.store(static_cast<int32_t>(nodeField<int64_t>(result.node, 0x338)));
+        g_drop_parent_window_id.store(nodeField<int32_t>(result.node, 0x418));
+        std::vector<int32_t> slotIds;
         {
             std::lock_guard lock(g_session_mutex);
-            slotCount = std::min(g_slots.size(), static_cast<size_t>(kVirtualNodeCount));
+            for (const auto &slot : g_slots) slotIds.push_back(virtualIdForSlot(slot));
         }
-        for (size_t i = 0; i < slotCount; ++i) {
+        for (int32_t id : slotIds) {
             g_node_add_child(result.node,
                     g_drop_parent_host_id.load(std::memory_order_acquire),
-                    kVirtualNodeBase + i);
+                    id);
         }
+        orderGridChildren(result.node);
     }
+    flushSurfaceAnnouncements();
+    traceDiagnosticsNode(result.node, nodeId, actionsBefore);
     return result;
 }
 
@@ -3150,11 +3978,11 @@ void injectDirectAction(void *node, int32_t id, const char16_t *label) {
         g_original_add_action(node, action);
         g_action_drop(action);
         if (g_custom_action_calls.fetch_add(1, std::memory_order_relaxed) == 0) {
-            __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+            nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                     "Rust direct action injected id=%d", id);
         }
     } else {
-        __android_log_print(ANDROID_LOG_WARN, "ActionGridNative",
+        nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
                 "Rust direct action constructor returned null id=%d", id);
     }
 }
@@ -3169,6 +3997,7 @@ void injectDirectActionText(void *node, int32_t id, const std::u16string &label)
     if (action != nullptr) {
         g_original_add_action(node, action);
         g_action_drop(action);
+        g_custom_action_calls.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -3234,27 +4063,6 @@ bool injectTouch(int64_t down, int32_t action, float x, float y) {
     return (result & 1U) != 0;
 }
 
-void restoreVisibleScreen(int32_t targetScreen) {
-    if (targetScreen <= 0 || g_motion_new == nullptr || g_input_event == nullptr
-            || g_input_drop == nullptr || g_inject_input == nullptr) return;
-    std::this_thread::sleep_for(std::chrono::milliseconds(900));
-    int32_t current = std::max(0, g_visible_screen.load(std::memory_order_acquire));
-    int32_t swipes = targetScreen - current;
-    if (swipes <= 0) return;
-    for (int32_t index = 0; index < swipes; ++index) {
-        int64_t down = uptimeMillis();
-        injectTouch(down, 0, 1030.0f, 1200.0f);
-        std::this_thread::sleep_for(std::chrono::milliseconds(30));
-        injectTouch(down, 2, 170.0f, 1200.0f);
-        std::this_thread::sleep_for(std::chrono::milliseconds(30));
-        injectTouch(down, 1, 170.0f, 1200.0f);
-        std::this_thread::sleep_for(std::chrono::milliseconds(450));
-    }
-    __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
-            "Restored visible page target=%d current=%d", targetScreen + 1,
-            g_visible_screen.load(std::memory_order_acquire) + 1);
-}
-
 bool nodeBounds(void *provider, int32_t nodeId, Bounds &bounds, std::string *label = nullptr) {
     if (g_create_node == nullptr || g_node_drop == nullptr) return false;
     NodeResult result = g_create_node(provider, nodeId);
@@ -3264,6 +4072,26 @@ bool nodeBounds(void *provider, int32_t nodeId, Bounds &bounds, std::string *lab
     g_node_drop(result.node);
     return bounds.left >= 0 && bounds.top >= 0
             && bounds.right > bounds.left && bounds.bottom > bounds.top;
+}
+
+bool isFolderNode(void *provider, int32_t nodeId) {
+    if (g_create_node == nullptr || g_node_drop == nullptr) return false;
+    NodeResult result = g_create_node(provider, nodeId);
+    if ((result.absent & 1U) != 0 || result.node == nullptr) return false;
+    const bool folder = nodeString(result.node, 0x1b8) == "com.miui.home:id/folder";
+    g_node_drop(result.node);
+    return folder;
+}
+
+bool isDesktopIconNode(void *provider, int32_t nodeId, ObservedNode *observed = nullptr) {
+    if (g_create_node == nullptr || g_node_drop == nullptr) return false;
+    NodeResult result = g_create_node(provider, nodeId);
+    if ((result.absent & 1U) != 0 || result.node == nullptr) return false;
+    const std::string resource = nodeString(result.node, 0x1b8);
+    const bool icon = resource == "com.miui.home:id/folder" || isIconNode(result.node);
+    if (icon && observed != nullptr) *observed = describeNode(result.node);
+    g_node_drop(result.node);
+    return icon;
 }
 
 bool isRecentTaskLabel(const std::string &label) {
@@ -3312,13 +4140,16 @@ bool hasWorkspaceSurface(const std::vector<ObservedNode> &nodes) {
 
 void clearWorkspacePageContext() {
     {
+        std::lock_guard lock(g_page_announcement_mutex);
+        g_announced_page = -1;
+    }
+    {
         std::lock_guard lock(g_event_mutex);
         g_page_source_keys.clear();
     }
     g_workspace_window_id.store(-1, std::memory_order_release);
     g_visible_screen.store(0, std::memory_order_release);
     g_total_pages.store(0, std::memory_order_release);
-    g_predicted_page.store(-1, std::memory_order_release);
     g_page_state_known.store(false, std::memory_order_release);
 }
 
@@ -3372,7 +4203,6 @@ void setSurfaceState(SurfaceState next, void *provider) {
                 std::lock_guard lock(g_recent_state_mutex);
                 g_pending_recent_removals.clear();
             }
-            g_predicted_page.store(-1, std::memory_order_release);
             resetRecentSnapshot();
             queueSurfaceAnnouncement("进入多任务界面");
         }
@@ -3386,7 +4216,9 @@ void setSurfaceState(SurfaceState next, void *provider) {
                 }
             }
             resetRecentSnapshot();
-            if (previous == SurfaceState::kRecents) queueSurfaceAnnouncement("系统桌面");
+            if (previous == SurfaceState::kRecents || previous == SurfaceState::kOther) {
+                queueSurfaceAnnouncement("系统桌面");
+            }
         }
         return;
     }
@@ -3396,8 +4228,146 @@ void setSurfaceState(SurfaceState next, void *provider) {
     }
 }
 
+void onLauncherWindowFocus(void *window, bool focused) {
+    if (focused && g_diagnostics.session() != 0) g_diagnostics_node_budget.store(8);
+    if (!focused) g_focus_generation.fetch_add(1, std::memory_order_acq_rel);
+    // Mark Home focused before its callback rebuilds cached nodes.  Those
+    // nodes are otherwise treated as background queries and never identify
+    // the workspace surface.  Announcements raised inside the callback are
+    // held until the callback returns (or until a later provider query).
+    if (focused) {
+        g_focus_callback_node_observed.store(false, std::memory_order_release);
+        g_focus_callback_active.store(true, std::memory_order_release);
+    }
+    const int32_t previous = g_launcher_window_focused.exchange(focused ? 1 : 0,
+            std::memory_order_acq_rel);
+    if (focused && g_original_launcher_focus != nullptr) g_original_launcher_focus(window, true);
+    nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
+            "window focus %d -> %d lifted=%d page=%d cap=0x%x node_calls=%u injected=%u",
+            previous, focused ? 1 : 0, g_lifted.load() ? 1 : 0, g_visible_screen.load() + 1,
+            g_capabilities.load(), g_node_action_calls.load(), g_custom_action_calls.load());
+    wakeDiagnosticsWorker();
+    if (!focused && previous != 0) {
+        g_resume_scans.store(0);
+        g_consume_back_up.store(false);
+        g_last_provider.store(nullptr, std::memory_order_release);
+        g_event_controller.store(nullptr, std::memory_order_release);
+        endPendingPlacement();
+        if (g_lifted.load(std::memory_order_acquire)) {
+            const auto parent = captureDropParentEventSource(-1);
+            clearLiftSession();
+            sendEvent(parent, kTypeWindowContentChanged);
+        }
+        setSurfaceState(SurfaceState::kOther, g_last_provider.load());
+        {
+            std::lock_guard lock(g_surface_mutex);
+            g_has_recent_surface_time = false;
+            g_surface_candidate = SurfaceState::kUnknown;
+            g_surface_candidate_repeats = 0;
+        }
+        {
+            std::lock_guard lock(g_surface_announcement_mutex);
+            g_pending_surface_announcements.clear();
+        }
+        g_home_announcement_pending.store(false, std::memory_order_release);
+    } else if (focused && previous != 1) {
+        g_resume_scans.store(5);
+        g_surface_scan_requested.store(true, std::memory_order_release);
+    }
+    if (focused) {
+        g_focus_callback_active.store(false, std::memory_order_release);
+        const uint64_t generation = g_focus_generation.fetch_add(1,
+                std::memory_order_acq_rel) + 1;
+        // If no node query follows a quick app-to-Home return, wait briefly
+        // for a recents/workspace sample before speaking the desktop fallback.
+        // A normal root query flushes the same pending item first.
+        if (previous != 1 && (!g_focus_callback_node_observed.load(
+                std::memory_order_acquire)
+                || g_home_announcement_pending.load(std::memory_order_acquire))) {
+            std::thread([generation] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                if (g_focus_generation.load(std::memory_order_acquire) != generation
+                        || g_launcher_window_focused.load(std::memory_order_acquire) != 1) return;
+                if (g_home_announcement_pending.load(std::memory_order_acquire)) {
+                    flushSurfaceAnnouncements();
+                    return;
+                }
+                const SurfaceState surface = static_cast<SurfaceState>(
+                        g_surface_state.load(std::memory_order_acquire));
+                if (surface == SurfaceState::kOther || surface == SurfaceState::kUnknown) {
+                    queueSurfaceAnnouncement("系统桌面");
+                    flushSurfaceAnnouncements();
+                }
+            }).detach();
+        }
+    }
+    if (!focused && g_original_launcher_focus != nullptr) g_original_launcher_focus(window, false);
+}
+
+bool onLauncherKey(void *scene, void *event) {
+    if (event != nullptr && g_key_code != nullptr && g_key_action != nullptr
+            && g_key_code(event) == 4) {
+        const int32_t action = g_key_action(event);
+        if (action == 0 && (g_consume_back_up.load() || cancelLiftSession(-1))) {
+            g_consume_back_up.store(true);
+            return true;
+        }
+        if (action == 1 && g_consume_back_up.exchange(false)) return true;
+        // Some accessibility services deliver only the key-up event.
+        if (action == 1 && cancelLiftSession(-1)) return true;
+    }
+    return g_original_launcher_key != nullptr && g_original_launcher_key(scene, event);
+}
+
+void onLauncherBack(void *helper) {
+    cancelLiftSession(-1);
+    // The launcher owns the gesture callback and must finish its native cleanup.
+    if (g_original_launcher_back != nullptr) g_original_launcher_back(helper);
+}
+
+void installLauncherLifecycleHooks(LauncherAbiProfile profile) {
+    const bool current = profile == LauncherAbiProfile::kCurrent8565;
+    if ((!current && profile != LauncherAbiProfile::kLegacy7748)
+            || !g_launcher_fingerprint_ready.load() || !g_launcher_system_compatible.load()
+            || g_api == nullptr || g_api->hook_func == nullptr) return;
+    auto *base = static_cast<uint8_t *>(launcherLibraryBase());
+    if (base == nullptr) return;
+    if (g_key_code == nullptr) g_key_code = reinterpret_cast<MotionActionFn>(
+            findLoadedSymbol("libhyper_os_ui_public.so", "input_KeyEvent_getKeyCode"));
+    if (g_key_action == nullptr) g_key_action = reinterpret_cast<MotionActionFn>(
+            findLoadedSymbol("libhyper_os_ui_public.so", "input_KeyEvent_getAction"));
+    if (g_key_code == nullptr || g_key_action == nullptr
+            || g_launcher_lifecycle_hook_attempted.exchange(true)) return;
+    constexpr uint32_t focusPrologue[] = {0xd102c3ffU, 0xa9057bfdU, 0xf90033fbU,
+            0xa90767faU, 0xa9085ff8U, 0xa90957f6U, 0xa90a4ff4U, 0x910143fdU};
+    constexpr uint32_t inputPrologue[] = {0xd10483ffU, 0xa90c7bfdU, 0xa90d6ffcU,
+            0xa90e67faU, 0xa90f5ff8U, 0xa91057f6U, 0xa9114ff4U, 0x910303fdU};
+    auto install = [&](uintptr_t offset, const uint32_t *prologue, size_t size,
+            void *replacement, const char *name) -> void * {
+        void *target = base + offset;
+        if (std::memcmp(target, prologue, size) != 0) return nullptr;
+        void *backup = nullptr;
+        const int result = g_api->hook_func(target, replacement, &backup);
+        nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
+                "Launcher %s hook result=%d", name, result);
+        return result == 0 ? backup : nullptr;
+    };
+    g_original_launcher_focus = reinterpret_cast<LauncherFocusFn>(install(
+            current ? 0x772360 : 0x757b34, focusPrologue, sizeof(focusPrologue),
+            reinterpret_cast<void *>(&onLauncherWindowFocus), "window focus"));
+    if (g_key_code != nullptr && g_key_action != nullptr) {
+        g_original_launcher_key = reinterpret_cast<LauncherKeyFn>(install(
+                current ? 0x97a484 : 0x9736ec, inputPrologue, sizeof(inputPrologue),
+                reinterpret_cast<void *>(&onLauncherKey), "key"));
+    }
+    g_original_launcher_back = reinterpret_cast<LauncherBackFn>(install(
+            current ? 0x725c54 : 0x720ffc, inputPrologue, sizeof(inputPrologue),
+            reinterpret_cast<void *>(&onLauncherBack), "back gesture"));
+}
+
 void observeSurfaceSample(void *provider, SurfaceState observed,
         const std::vector<ObservedNode> &nodes) {
+    if (g_launcher_window_focused.load(std::memory_order_acquire) == 0) return;
     if (observed == SurfaceState::kRecents) {
         std::lock_guard lock(g_surface_mutex);
         g_last_recent_surface = std::chrono::steady_clock::now();
@@ -3466,7 +4436,7 @@ void observeRecentSnapshot(void *provider, const std::vector<ObservedNode> &node
 }
 
 void observeSurfaceTree(void *provider, const std::vector<ObservedNode> &nodes) {
-    if (nodes.empty()) return;
+    if (nodes.empty() || g_launcher_window_focused.load(std::memory_order_acquire) == 0) return;
     for (const auto &node : nodes) {
         if (isRecentTaskLabel(node.label)
                 || isEmptyRecentsLabel(node.label)
@@ -3490,33 +4460,18 @@ void surfacePollLoop() {
     for (;;) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         flushSurfaceAnnouncements();
-        const bool requested = g_surface_scan_requested.exchange(false,
-                std::memory_order_acq_rel);
-        if (!requested && static_cast<SurfaceState>(
-                g_surface_state.load(std::memory_order_acquire)) != SurfaceState::kRecents) {
-            continue;
-        }
-        void *provider = g_last_provider.load(std::memory_order_acquire);
-        if (provider == nullptr || g_original_create_node == nullptr) continue;
-        std::vector<ObservedNode> nodes;
-        readTree(provider, -1, nodes);
-        if (hasRecentSurface(nodes) || hasWorkspaceSurface(nodes)) {
-            observeSurfaceTree(provider, nodes);
-        } else if (requested) {
-            observeSurfaceSample(provider, SurfaceState::kOther, nodes);
-        }
     }
 }
 
 void ensureSurfacePoller() {
-    if (!g_surface_poll_started.exchange(true, std::memory_order_acq_rel)) {
-        std::thread(surfacePollLoop).detach();
-    }
+    // Surface and announcement work is driven by the synchronous provider
+    // hooks.  A background scan cannot prove that its raw provider is alive.
 }
 
 
 void observeSurfaceNode(void *provider, int32_t nodeId, void *node) {
-    if (provider == nullptr || node == nullptr) return;
+    if (provider == nullptr || node == nullptr
+            || g_launcher_window_focused.load(std::memory_order_acquire) == 0) return;
     g_last_provider.store(provider, std::memory_order_release);
     if (nodeId != -1) {
         const std::string resource = nodeString(node, 0x1b8);
@@ -3582,28 +4537,12 @@ bool callLauncherProviderAction(void *provider, int32_t nodeId, int32_t actionId
 
 std::pair<float, float> recentTouchPoint(void *provider, int32_t nodeId,
         const Bounds &bounds) {
-    std::vector<std::pair<float, float>> candidates{
-        {static_cast<float>(bounds.left + 24), static_cast<float>(bounds.centerY())},
-        {static_cast<float>(bounds.right - 24), static_cast<float>(bounds.centerY())},
-        {static_cast<float>(bounds.centerX()), static_cast<float>(bounds.top + 24)},
-        {static_cast<float>(bounds.centerX()), static_cast<float>(bounds.bottom - 24)},
-        {static_cast<float>(bounds.centerX()), static_cast<float>(bounds.centerY())},
-    };
-    std::vector<ObservedNode> recentNodes;
-    readTree(provider, -1, recentNodes);
-    auto coveredByOtherCard = [&recentNodes, nodeId](float x, float y) {
-        return std::any_of(recentNodes.begin(), recentNodes.end(), [nodeId, x, y](const auto &node) {
-            return node.id != nodeId && isRecentTaskLabel(node.label)
-                    && x >= node.bounds.left && x < node.bounds.right
-                    && y >= node.bounds.top && y < node.bounds.bottom;
-        });
-    };
-    auto point = std::find_if(candidates.begin(), candidates.end(), [&bounds, &coveredByOtherCard](const auto &candidate) {
-        return candidate.first >= bounds.left && candidate.first < bounds.right
-                && candidate.second >= bounds.top && candidate.second < bounds.bottom
-                && !coveredByOtherCard(candidate.first, candidate.second);
-    });
-    return point == candidates.end() ? candidates.front() : *point;
+    (void) provider;
+    (void) nodeId;
+    // The gesture is launched from a detached worker.  Use the bounds already
+    // validated on the action thread instead of dereferencing a provider that
+    // may have been destroyed by a recents transition.
+    return {static_cast<float>(bounds.centerX()), static_cast<float>(bounds.centerY())};
 }
 
 bool resolveRecentTaskId(void *provider, int32_t nodeId, const std::string &label,
@@ -3614,7 +4553,7 @@ bool resolveRecentTaskId(void *provider, int32_t nodeId, const std::string &labe
             || g_recent_task_get_task_id == nullptr) {
         return false;
     }
-    __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+    nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
             "recent target node=%d label=%s package=%s activity=%s user=%d",
             nodeId, label.c_str(), target.package.c_str(), target.activity.c_str(), target.user);
     int32_t limit = g_task_get_max_recent_tasks != nullptr
@@ -3664,7 +4603,7 @@ bool resolveRecentTaskId(void *provider, int32_t nodeId, const std::string &labe
         if (!found && user == target.user && packageMatch) {
             taskId = id;
             found = id >= 0;
-            __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+            nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                     "recent task matched node=%d id=%d package=%s base=%s",
                     nodeId, taskId, target.package.c_str(), componentPackage.c_str());
         }
@@ -3673,14 +4612,14 @@ bool resolveRecentTaskId(void *provider, int32_t nodeId, const std::string &labe
         taskId = packageTaskId;
         target.user = packageTaskUser;
         found = true;
-        __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+        nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                 "recent task matched by package node=%d id=%d package=%s user=%d",
                 nodeId, taskId, target.package.c_str(), target.user);
     }
     // ponytail: the returned vector owns every RecentTaskInfo; dropping an
     // element here makes the vector destructor free it a second time.
     dropRustVec(result.tasks);
-    __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+    nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
             "recent resolve node=%d found=%d task=%d package=%s",
             nodeId, found ? 1 : 0, taskId, target.package.c_str());
     return found;
@@ -3689,7 +4628,7 @@ bool resolveRecentTaskId(void *provider, int32_t nodeId, const std::string &labe
 bool performDirectRecentAction(int32_t actionId, const AppTarget &target, int32_t taskId) {
     if (taskId < 0) return false;
     if (actionId == kRecentSplitAction && g_launcher_launch_sosc != nullptr) {
-        __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+        nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                 "recent split task=%d package=%s", taskId, target.package.c_str());
         g_launcher_launch_sosc(taskId);
         return true;
@@ -3701,7 +4640,7 @@ bool performDirectRecentAction(int32_t actionId, const AppTarget &target, int32_
         if (component == nullptr) return false;
         // The launcher helper consumes the ComponentName (and drops it).
         bool success = g_launcher_start_freeform(component, taskId, target.user, 1);
-        __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+        nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                 "recent freeform task=%d package=%s success=%d", taskId,
                 target.package.c_str(), success ? 1 : 0);
         return success;
@@ -3761,7 +4700,7 @@ bool startRecentAppFlow(int32_t taskId, const AppTarget &target) {
     if (component == nullptr) return false;
     g_intent_set_component(intent, component);
     RustResult48 result = g_scene_start_activity(scene, intent, 1, nullptr, 1, 0, -1, nullptr);
-    __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+    nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
             "recent app flow task=%d package=%s activity=%s result=%d", taskId,
             target.package.c_str(), target.activity.c_str(), nodeField<int32_t>(result.data, 8));
     return rustResultOk(result, "start app flow");
@@ -3777,8 +4716,8 @@ bool closeRecentTask(void *provider, int32_t nodeId) {
     }
     const std::string removalName = recentCardName(label);
     rememberRecentRemoval(removalName);
-    std::thread([provider, bounds, nodeId, removalName] {
-        const auto point = recentTouchPoint(provider, nodeId, bounds);
+    std::thread([bounds, nodeId, removalName] {
+        const auto point = recentTouchPoint(nullptr, nodeId, bounds);
         const float x = point.first;
         const float startY = point.second;
         const float endY = std::max(1.0f,
@@ -3790,7 +4729,7 @@ bool closeRecentTask(void *provider, int32_t nodeId) {
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
         const bool upOk = injectTouch(down, 1, x, endY);
         if (!(downOk && moveOk && upOk)) acknowledgeRecentRemoval(removalName);
-        __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+        nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                 "recent close gesture node=%d start=%.0f end=%.0f result=%d/%d/%d",
                 nodeId, startY, endY, downOk ? 1 : 0, moveOk ? 1 : 0, upOk ? 1 : 0);
         sendEvent(nodeId, 2048);
@@ -3803,8 +4742,8 @@ bool lockRecentTask(void *provider, int32_t nodeId, const Bounds &bounds) {
             || g_input_drop == nullptr || g_inject_input == nullptr) {
         return false;
     }
-    std::thread([provider, bounds, nodeId] {
-        const auto point = recentTouchPoint(provider, nodeId, bounds);
+    std::thread([bounds, nodeId] {
+        const auto point = recentTouchPoint(nullptr, nodeId, bounds);
         const float x = point.first;
         const float startY = point.second;
         const float distance = static_cast<float>(std::max(600, bounds.height() / 2));
@@ -3816,7 +4755,7 @@ bool lockRecentTask(void *provider, int32_t nodeId, const Bounds &bounds) {
         const bool moveOk = injectTouch(down, 2, x, (startY + endY) * 0.5f);
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
         const bool upOk = injectTouch(down, 1, x, endY);
-        __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+        nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                 "recent lock gesture node=%d start=%.0f end=%.0f result=%d/%d/%d",
                 nodeId, startY, endY, downOk ? 1 : 0, moveOk ? 1 : 0, upOk ? 1 : 0);
         sendEvent(nodeId, 2048);
@@ -3826,57 +4765,129 @@ bool lockRecentTask(void *provider, int32_t nodeId, const Bounds &bounds) {
 
 bool buildModelMove(void *provider, int32_t nodeId, int32_t actionId,
         std::vector<FavoritePlacement> &sources,
-        std::vector<FavoritePlacement> &expected, WireWriter &wire) {
+        std::vector<FavoritePlacement> &expected, WireWriter &wire,
+        std::string &failureReason) {
+    failureReason = "托起状态已失效，请重新托起";
     std::vector<ObservedNode> selected;
     std::vector<Slot> slots;
+    std::vector<FavoritePlacement> cachedSources;
     {
         std::lock_guard lock(g_session_mutex);
-        if (!g_lifted.load(std::memory_order_acquire) || g_sources.empty()) return false;
-        selected = g_sources;
-        slots = g_slots;
-    }
-    if (selected.empty()) return false;
-
-    sources.reserve(selected.size());
-    for (const auto &node : selected) {
-        AppTarget target;
-        const int32_t liftedScreen = g_lifted_screen.load(std::memory_order_acquire);
-        const int32_t screenHint = liftedScreen >= 0 ? liftedScreen + 1 : -1;
-        if (!resolveAppTarget(node.id, node.label, target, screenHint)
-                || target.placement.id < 0) {
-            __android_log_print(ANDROID_LOG_WARN, "ActionGridNative",
-                    "HyperOS4 move source unresolved node=%d label=%s",
-                    node.id, node.label.c_str());
+        if (!g_lifted.load(std::memory_order_acquire) || g_sources.empty()) {
+            nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
+                    "HyperOS4 move source session missing node=%d action=0x%x lifted=%d sources=%zu slots=%zu",
+                    nodeId, actionId, g_lifted.load(std::memory_order_acquire) ? 1 : 0,
+                    g_sources.size(), g_slots.size());
             return false;
         }
-        sources.push_back(target.placement);
+        selected = g_sources;
+        cachedSources = g_source_placements;
+        slots = g_slots;
+    }
+    if (selected.empty()) {
+        nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
+                "HyperOS4 move selected source list empty node=%d action=0x%x", nodeId, actionId);
+        return false;
     }
 
+    failureReason = "未能确认托起的图标，请取消后重新托起";
+    sources.reserve(selected.size());
+    if (cachedSources.size() == selected.size()) {
+        bool cacheMatches = true;
+        for (size_t index = 0; index < selected.size(); ++index) {
+            // Captured in selection order at lift time: favorite IDs and
+            // accessibility node IDs belong to different namespaces.
+            if (cachedSources[index].id < 0
+                    || !workspaceContainer(cachedSources[index].container)) {
+                cacheMatches = false;
+                break;
+            }
+        }
+        if (cacheMatches) {
+            sources = cachedSources;
+            nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
+                    "HyperOS4 move reused lift source placements count=%zu", sources.size());
+        }
+    }
+    if (sources.empty()) {
+        for (const auto &node : selected) {
+            AppTarget target;
+            const int32_t liftedScreen = g_lifted_screen.load(std::memory_order_acquire);
+            const int32_t screenHint = liftedScreen >= 0 ? liftedScreen + 1 : -1;
+            if (!resolveAppTarget(node.id, node.label, target, screenHint,
+                        node.resource == "com.miui.home:id/folder" ? 2 : 0)
+                    || target.placement.id < 0
+                    || !workspaceContainer(target.placement.container)) {
+                LauncherSnapshot snapshot;
+                {
+                    std::lock_guard lock(g_snapshot_mutex);
+                    snapshot = g_snapshot;
+                }
+                nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
+                        "HyperOS4 move source unresolved stage=source node=%d action=0x%x label=%s sources=%zu slots=%zu grid=%dx%d screen=%d snapshot_ready=%d generation=%llu",
+                        node.id, actionId, node.label.c_str(), selected.size(), slots.size(),
+                        g_grid_rows.load(), g_grid_columns.load(), liftedScreen + 1,
+                        snapshot.ready ? 1 : 0,
+                        static_cast<unsigned long long>(snapshot.generation));
+                return false;
+            }
+            sources.push_back(target.placement);
+        }
+    }
+
+    failureReason = "目标位置已变化，请重新选择位置";
     FavoritePlacement base = sources.front();
     int32_t startSlot = -1;
     if (isVirtualNode(nodeId)) {
-        startSlot = nodeId - kVirtualNodeBase;
-        if (startSlot < 0 || startSlot + static_cast<int32_t>(sources.size())
-                > static_cast<int32_t>(slots.size())) return false;
+        for (size_t index = 0; index < slots.size(); ++index) {
+            if (virtualIdForSlot(slots[index]) == nodeId) {
+                startSlot = static_cast<int32_t>(index);
+                break;
+            }
+        }
+        if (startSlot < 0) {
+            nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
+                    "HyperOS4 move stale virtual target stage=slot node=%d action=0x%x slots=%zu grid=%dx%d lifted_screen=%d",
+                    nodeId, actionId, slots.size(), g_grid_rows.load(), g_grid_columns.load(),
+                    g_lifted_screen.load() + 1);
+            return false;
+        }
+        if (startSlot + static_cast<int32_t>(sources.size())
+                > static_cast<int32_t>(slots.size())) {
+            failureReason = "没有可拖放的位置";
+            nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
+                    "HyperOS4 move insufficient virtual slots stage=slot node=%d action=0x%x start=%d sources=%zu slots=%zu grid=%dx%d",
+                    nodeId, actionId, startSlot, sources.size(), slots.size(),
+                    g_grid_rows.load(), g_grid_columns.load());
+            return false;
+        }
         base.container = kDesktopContainer;
         // Accessibility page indexes are zero-based; launcher favorites.screen
         // is one-based (the first desktop page is screen=1).
         base.screen = g_visible_screen.load(std::memory_order_acquire) + 1;
     } else {
-        if (provider == nullptr) return false;
+        if (provider == nullptr) {
+            nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
+                    "HyperOS4 move target provider missing node=%d action=0x%x", nodeId, actionId);
+            return false;
+        }
         std::string label;
         Bounds ignored{};
         if (!nodeBounds(provider, nodeId, ignored, &label)) {
-            __android_log_print(ANDROID_LOG_WARN, "ActionGridNative",
-                    "HyperOS4 move target node unavailable node=%d", nodeId);
+            nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
+                    "HyperOS4 move target node unavailable stage=target node=%d action=0x%x sources=%zu slots=%zu",
+                    nodeId, actionId, sources.size(), slots.size());
             return false;
         }
         AppTarget target;
-        if (!resolveAppTarget(nodeId, label, target)
-                || target.placement.id < 0) {
-            __android_log_print(ANDROID_LOG_WARN, "ActionGridNative",
-                    "HyperOS4 move target unresolved node=%d label=%s",
-                    nodeId, label.c_str());
+        if (!resolveAppTarget(nodeId, label, target, g_visible_screen.load() + 1,
+                    isFolderNode(provider, nodeId) ? 2 : 0)
+                || target.placement.id < 0
+                || !workspaceContainer(target.placement.container)) {
+            nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
+                    "HyperOS4 move target unresolved stage=target node=%d action=0x%x label=%s sources=%zu slots=%zu grid=%dx%d",
+                    nodeId, actionId, label.c_str(), sources.size(), slots.size(),
+                    g_grid_rows.load(), g_grid_columns.load());
             return false;
         }
         base = target.placement;
@@ -3885,24 +4896,40 @@ bool buildModelMove(void *provider, int32_t nodeId, int32_t actionId,
     expected.reserve(sources.size() + 32);
     std::vector<FavoritePlacement> shifted;
     if (startSlot < 0) {
-        if (actionId != kMoveBeforeAction && actionId != kMoveAfterAction) return false;
+        if (actionId != kMoveBeforeAction && actionId != kMoveAfterAction) {
+            nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
+                    "HyperOS4 move unsupported occupied-target action node=%d action=0x%x",
+                    nodeId, actionId);
+            return false;
+        }
         for (const auto &source : sources) {
             if (source.spanX != 1 || source.spanY != 1) {
-                __android_log_print(ANDROID_LOG_WARN, "ActionGridNative",
+                nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
                         "HyperOS4 move rejects non-single-cell source id=%lld",
                         static_cast<long long>(source.id));
                 return false;
             }
         }
         std::vector<FavoritePlacement> page;
-        if (!loadPagePlacements(base.container, base.screen, page)) return false;
+        if (!loadPagePlacements(base.container, base.screen, page)) {
+            failureReason = "未能读取目标页，请稍后重试";
+            nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
+                    "HyperOS4 move page load failed stage=reorder node=%d action=0x%x page=%d",
+                    nodeId, actionId, base.screen);
+            return false;
+        }
         std::unordered_set<int64_t> sourceIds;
         for (const auto &source : sources) sourceIds.insert(source.id);
         const int columns = std::max(1, g_grid_columns.load(std::memory_order_relaxed));
         const int rows = std::max(1, g_grid_rows.load(std::memory_order_relaxed));
         const int capacity = rows * columns;
         const int anchorRank = base.cellY * columns + base.cellX;
-        if (anchorRank < 0 || anchorRank >= capacity) return false;
+        if (anchorRank < 0 || anchorRank >= capacity) {
+            nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
+                    "HyperOS4 move anchor outside grid node=%d action=0x%x page=%d cell=%d,%d grid=%dx%d",
+                    nodeId, actionId, base.screen, base.cellX, base.cellY, rows, columns);
+            return false;
+        }
 
         std::sort(page.begin(), page.end(), [columns](const auto &left, const auto &right) {
             int leftRank = left.cellY * columns + left.cellX;
@@ -3914,7 +4941,8 @@ bool buildModelMove(void *provider, int32_t nodeId, int32_t actionId,
         int targetIndex = -1;
         for (const auto &item : page) {
             if (item.spanX != 1 || item.spanY != 1) {
-                __android_log_print(ANDROID_LOG_WARN, "ActionGridNative",
+                failureReason = "当前页面暂不支持图标重排，请选择空位";
+                nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
                         "HyperOS4 move rejects non-single-cell page item id=%lld",
                         static_cast<long long>(item.id));
                 return false;
@@ -3923,7 +4951,12 @@ bool buildModelMove(void *provider, int32_t nodeId, int32_t actionId,
             if (item.id == base.id) targetIndex = static_cast<int>(ordered.size());
             ordered.push_back(item);
         }
-        if (targetIndex < 0) return false;
+        if (targetIndex < 0) {
+            nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
+                    "HyperOS4 move anchor item missing stage=reorder node=%d action=0x%x target_id=%lld page_items=%zu",
+                    nodeId, actionId, static_cast<long long>(base.id), page.size());
+            return false;
+        }
         int insertion = targetIndex + (actionId == kMoveAfterAction ? 1 : 0);
         ordered.insert(ordered.begin() + insertion, sources.begin(), sources.end());
 
@@ -3931,7 +4964,8 @@ bool buildModelMove(void *provider, int32_t nodeId, int32_t actionId,
             int32_t nextScreen = -1;
             std::vector<FavoritePlacement> nextPage;
             if (!loadNextDesktopScreen(base.container, base.screen, nextScreen, nextPage)) {
-                __android_log_print(ANDROID_LOG_WARN, "ActionGridNative",
+                failureReason = "未能读取下一页，请稍后重试";
+                nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
                         "HyperOS4 move cannot inspect overflow page=%d",
                         base.screen);
                 return false;
@@ -3941,13 +4975,20 @@ bool buildModelMove(void *provider, int32_t nodeId, int32_t actionId,
                         return sourceIds.find(item.id) != sourceIds.end();
                     }), nextPage.end());
             if (!nextPage.empty()) {
-                __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+                failureReason = "当前页面剩余位置不足，请选择其他页面";
+                nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                         "HyperOS4 move rejected non-empty overflow page=%d",
                         nextScreen);
                 return false;
             }
             int overflowCount = static_cast<int>(ordered.size()) - capacity;
-            if (overflowCount > capacity) return false;
+            if (overflowCount > capacity) {
+                failureReason = "没有可拖放的位置";
+                nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
+                        "HyperOS4 move overflow exceeds capacity node=%d action=0x%x count=%d capacity=%d",
+                        nodeId, actionId, overflowCount, capacity);
+                return false;
+            }
             for (int index = 0; index < overflowCount; ++index) {
                 FavoritePlacement item = ordered[capacity + index];
                 item.container = base.container;
@@ -3957,7 +4998,7 @@ bool buildModelMove(void *provider, int32_t nodeId, int32_t actionId,
                 shifted.push_back(item);
             }
             ordered.resize(capacity);
-            __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+            nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                     "HyperOS4 move overflow count=%d targetPage=%d nextPage=%d",
                     overflowCount, base.screen, nextScreen);
         }
@@ -3980,13 +5021,29 @@ bool buildModelMove(void *provider, int32_t nodeId, int32_t actionId,
                     [&sources, index](const auto &item) {
                         return item.id == sources[index].id;
                     });
-            if (found == shifted.end()) return false;
+            if (found == shifted.end()) {
+                nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
+                        "HyperOS4 move source missing from reordered model node=%d action=0x%x source_id=%lld",
+                        nodeId, actionId, static_cast<long long>(sources[index].id));
+                return false;
+            }
             target = *found;
         }
         target.id = sources[index].id;
         target.itemType = sources[index].itemType;
         target.spanX = sources[index].spanX;
         target.spanY = sources[index].spanY;
+        if (target.container == kDesktopContainer
+                && (target.cellX < 0 || target.cellY < 0 || target.spanX <= 0 || target.spanY <= 0
+                || target.cellX > g_grid_columns.load() - target.spanX
+                || target.cellY > g_grid_rows.load() - target.spanY)) {
+            nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
+                    "HyperOS4 move target outside grid stage=final node=%d action=0x%x id=%lld page=%d cell=%d,%d span=%dx%d grid=%dx%d",
+                    nodeId, actionId, static_cast<long long>(target.id), target.screen,
+                    target.cellX, target.cellY, target.spanX, target.spanY,
+                    g_grid_rows.load(), g_grid_columns.load());
+            return false;
+        }
         expected.push_back(target);
     }
     std::unordered_set<int64_t> expectedIds;
@@ -3995,11 +5052,73 @@ bool buildModelMove(void *provider, int32_t nodeId, int32_t actionId,
         if (expectedIds.insert(item.id).second) expected.push_back(item);
     }
 
-    wire.put32(static_cast<int32_t>(sources.size()));
-    for (size_t index = 0; index < sources.size(); ++index) {
-        appendSparseItemInfo(wire, sources[index], expected[index]);
+    wire.put32(static_cast<int32_t>(expected.size()));
+    for (const auto &target : expected) {
+        appendSparseItemInfo(wire, target, target);
+    }
+    if (g_diagnostics.session() != 0) {
+        nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
+                "move plan node=%d action=0x%x sources=%zu targets=%zu page=%d grid=%dx%d bytes=%zu",
+                nodeId, actionId, sources.size(), expected.size(), g_visible_screen.load() + 1,
+                g_grid_columns.load(), g_grid_rows.load(), wire.bytes.size());
+        for (size_t index = 0; index < sources.size(); ++index) {
+            const auto &item = sources[index];
+            nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
+                    "move source node=%d label=%s id=%lld container=%lld page=%d cell=%d,%d span=%dx%d",
+                    selected[index].id, selected[index].label.c_str(), static_cast<long long>(item.id),
+                    static_cast<long long>(item.container), item.screen, item.cellX, item.cellY,
+                    item.spanX, item.spanY);
+        }
+        for (const auto &item : expected) {
+            nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
+                    "move target id=%lld container=%lld page=%d cell=%d,%d span=%dx%d",
+                    static_cast<long long>(item.id), static_cast<long long>(item.container),
+                    item.screen, item.cellX, item.cellY, item.spanX, item.spanY);
+        }
     }
     return !wire.bytes.empty();
+}
+
+struct VisiblePlacement {
+    FavoritePlacement item;
+    std::string label;
+    Bounds bounds;
+};
+
+bool findVisiblePlacements(const std::vector<ObservedNode> &nodes,
+        const std::vector<VisiblePlacement> &expected, ObservedNode &first) {
+    if (expected.empty()) return false;
+    int32_t page = 0;
+    for (const auto &node : nodes) {
+        if (parsePageIndicator(node.label, page)) break;
+    }
+    if (page != expected.front().item.screen) return false;
+    std::unordered_set<int32_t> matched;
+    for (const auto &target : expected) {
+        if (target.item.screen != page || target.bounds.width() <= 0
+                || target.bounds.height() <= 0) return false;
+        auto found = std::find_if(nodes.begin(), nodes.end(), [&](const auto &node) {
+            return node.icon() && matched.count(node.id) == 0
+                    && labelMatches(node.label, target.label)
+                    && node.bounds.centerX() >= target.bounds.left
+                    && node.bounds.centerX() < target.bounds.right
+                    && node.bounds.centerY() >= target.bounds.top
+                    && node.bounds.centerY() < target.bounds.bottom;
+        });
+        if (found == nodes.end()) return false;
+        if (matched.empty()) first = *found;
+        matched.insert(found->id);
+    }
+    return true;
+}
+
+std::string placementAnnouncement(const std::vector<VisiblePlacement> &placed) {
+    if (placed.empty()) return {};
+    const auto &first = placed.front();
+    // System Home's zh-CN announce_to_drop_workspace resource.
+    return "已放置在第" + std::to_string(first.item.screen)
+            + "页，第" + std::to_string(first.item.cellY + 1)
+            + "行，第" + std::to_string(first.item.cellX + 1) + "列";
 }
 
 bool performNativePlacement(void *provider, int32_t nodeId, int32_t actionId) {
@@ -4008,12 +5127,13 @@ bool performNativePlacement(void *provider, int32_t nodeId, int32_t actionId) {
     const bool frbModelReady = g_frb_dispatcher != nullptr
             && (capabilities & CAP_FRB_MODEL) != 0;
     const bool moveProfileReady = (capabilities & CAP_MOVE_PROFILE) != 0;
-    const bool privateAbiReady = (capabilities & (CAP_PRIVATE_BUILD_MATCH
+    const bool privateAbiReady = g_launcher_system_compatible.load(std::memory_order_acquire)
+            && (capabilities & (CAP_PRIVATE_BUILD_MATCH
             | CAP_PRIVATE_SYMBOLS)) == (CAP_PRIVATE_BUILD_MATCH | CAP_PRIVATE_SYMBOLS);
     if (actionId == kCreateFolderAction || !moveProfileReady || !frbModelReady
             || !privateAbiReady
             || alreadyRunning) {
-        __android_log_print(ANDROID_LOG_WARN, "ActionGridNative",
+        nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
                 "HyperOS4 placement rejected node=%d action=%d dispatcher=%p move=%d frb=%d private=%d running=%d",
                 nodeId, actionId, g_frb_dispatcher,
                 moveProfileReady ? 1 : 0, frbModelReady ? 1 : 0,
@@ -4030,87 +5150,143 @@ bool performNativePlacement(void *provider, int32_t nodeId, int32_t actionId) {
     std::vector<FavoritePlacement> sources;
     std::vector<FavoritePlacement> expected;
     WireWriter wire;
-    if (!buildModelMove(provider, nodeId, actionId, sources, expected, wire)) {
+    std::string failureReason;
+    if (!buildModelMove(provider, nodeId, actionId, sources, expected, wire, failureReason)) {
         g_model_move_running.store(false, std::memory_order_release);
         if (actionId == 0 || actionId == kMoveBeforeAction || actionId == kMoveAfterAction) {
-            sendAnnouncement(nodeId, "没有可拖放的位置");
+            const AccessibilityEventSource source = captureDropParentEventSource(nodeId);
+            announceReliably(source.host, source.window, source.nodeId, failureReason);
         }
         return false;
     }
     if (wire.bytes.empty()) {
         g_model_move_running.store(false, std::memory_order_release);
-        sendAnnouncement(nodeId, "放置失败，已保持原位置");
+        const AccessibilityEventSource source = captureDropParentEventSource(nodeId);
+        announceReliably(source.host, source.window, source.nodeId,
+                "放置失败，已保持原位置");
         return false;
     }
-    const AccessibilityEventSource eventSource = captureDropParentEventSource(nodeId);
+    AccessibilityEventSource eventSource = captureDropParentEventSource(nodeId);
+    eventSource.nodeId = -1; // The page node may be replaced by the native reload.
+    std::vector<VisiblePlacement> visibleTargets;
+    {
+        std::lock_guard lock(g_session_mutex);
+        if (!g_lifted.load() || g_sources.size() != sources.size()) {
+            g_model_move_running.store(false, std::memory_order_release);
+            return false;
+        }
+        for (size_t index = 0; index < sources.size(); ++index) {
+            const auto &item = expected[index];
+            auto cell = std::find_if(g_grid_cells.begin(), g_grid_cells.end(), [&](const auto &slot) {
+                return slot.row == item.cellY && slot.column == item.cellX;
+            });
+            visibleTargets.push_back({item, g_sources[index].label,
+                    cell == g_grid_cells.end() ? Bounds{} : cell->bounds});
+        }
+    }
+    std::vector<PendingPlacement> pendingTargets;
+    pendingTargets.reserve(visibleTargets.size());
+    for (const auto &target : visibleTargets) {
+        pendingTargets.push_back({target.item, target.label, target.bounds, false});
+    }
+    // Native dispatch may publish fresh nodes before it returns.
+    beginPendingPlacement(pendingTargets);
     const bool currentMoveProfile = g_current_frb_move_profile.load(
             std::memory_order_acquire);
     bool directDatabaseCommit = false;
     if (currentMoveProfile) {
-        // 8565 maps op 833 to move_item_in_database(ItemInfo), not the old
-        // batch operation. Keep this path to one source and an empty slot so
-        // the payload is exactly one ItemInfo without a vector count.
+        // 8565 op 833 takes one ItemInfo and four destination arguments.
+        // Keep this path to one source and an empty slot, without a vector count.
         if (sources.size() == 1 && isVirtualNode(nodeId)
                 && actionId == 0 && expected.size() == 1) {
             WireWriter itemWire;
             appendSparseItemInfo(itemWire, sources.front(), expected.front());
+            // move_item_in_database also decodes four destination arguments
+            // after ItemInfo; omitting them leaves the native model unchanged.
+            itemWire.put64(expected.front().container);
+            itemWire.put32(expected.front().screen);
+            itemWire.put32(expected.front().cellX);
+            itemWire.put32(expected.front().cellY);
             dispatchWire(kFrbMoveItemInDatabase, itemWire.bytes);
-            __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+            nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                     "HyperOS4 move_item_in_database dispatched id=%lld target=%d payload=%zu",
                     static_cast<long long>(sources.front().id), nodeId,
                     itemWire.bytes.size());
         } else {
-            // The new ABI has no verified batch entry point. Reorder occupied
-            // cells through the existing favorites transaction instead.
+            // 8565 batch model effects still lack runtime validation. Retain
+            // the existing favorites transaction for occupied cells.
             directDatabaseCommit = true;
-            __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+            nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                     "HyperOS4 occupied reorder using direct favorites transaction count=%zu target=%d",
                     expected.size(), nodeId);
         }
     } else {
         // Older verified profiles use the batch operation and its vector
         // envelope.
-        dispatchWire(kFrbUpdateItemDatabaseBatch, wire.bytes);
-        __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
-                "HyperOS4 model batch dispatched count=%zu target=%d",
-                expected.size(), nodeId);
+        const uint32_t operation = batchMoveOperation(
+                g_launcher_profile.load(std::memory_order_acquire));
+        if (operation == 0U) {
+            endPendingPlacement();
+            g_model_move_running.store(false, std::memory_order_release);
+            return false;
+        }
+        dispatchWire(operation, wire.bytes);
+        nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
+                "HyperOS4 model batch dispatched op=%u count=%zu target=%d bytes=%zu",
+                operation, expected.size(), nodeId, wire.bytes.size());
     }
-    const int32_t restoreScreen = g_visible_screen.load(std::memory_order_acquire);
-    std::thread([expected = std::move(expected), eventSource, nodeId, restoreScreen,
-                 directDatabaseCommit] {
+    std::thread([expected = std::move(expected), visibleTargets = std::move(visibleTargets),
+                 eventSource, directDatabaseCommit] {
         bool committed = directDatabaseCommit
-                ? updateFavoritePlacements(expected)
+                ? updateFavoritePlacements(expected) && waitForPlacements(expected)
                 : waitForPlacements(expected);
-        if (!committed && !directDatabaseCommit && updateFavoritePlacements(expected)) {
-            committed = waitForPlacements(expected);
-            __android_log_print(ANDROID_LOG_WARN, "ActionGridNative",
-                    "HyperOS4 placement timed out; direct favorite fallback committed=%d",
-                    committed ? 1 : 0);
+        if (committed && g_launcher_window_focused.load(std::memory_order_acquire) == 0) {
+            endPendingPlacement();
+            nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
+                    "HyperOS4 model move committed after Home lost focus; reload skipped");
+            g_model_move_running.store(false, std::memory_order_release);
+            return;
         }
         if (committed) {
             requestSnapshotRefresh(true);
             invokeWorkspaceReload();
             clearLiftSession();
+            // Readers need invalidation before they query the nodes we wait for.
             sendEvent(eventSource, kTypeWindowContentChanged);
-            if (restoreScreen > 0) {
-                std::thread(restoreVisibleScreen, restoreScreen).detach();
+            const bool visible = waitForPendingPlacementVisibility();
+            const bool persisted = placementsMatch(expected, "after_reload");
+            const bool focused = g_launcher_window_focused.load(std::memory_order_acquire) != 0;
+            if (focused) {
+                announceReliably(eventSource.host, eventSource.window, eventSource.nodeId,
+                        !persisted ? "桌面刷新后位置未能确认，请检查图标位置后重试"
+                        : visible ? placementAnnouncement(visibleTargets)
+                                : "位置已保存，但未确认桌面图标刷新，请重新进入桌面检查");
             }
-            __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
-                    "HyperOS4 model move committed restore_page=%d",
-                    restoreScreen + 1);
+            endPendingPlacement();
+            nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
+                    "HyperOS4 model move committed persisted=%d visible=%d focused=%d",
+                    persisted ? 1 : 0, visible ? 1 : 0, focused ? 1 : 0);
         } else {
-            __android_log_print(ANDROID_LOG_WARN, "ActionGridNative",
-                    "HyperOS4 model move verification timed out; session retained");
+            const bool focused = g_launcher_window_focused.load(std::memory_order_acquire) != 0;
+            if (focused) {
+                announceReliably(eventSource.host, eventSource.window, eventSource.nodeId,
+                        "未能确认移动，请检查图标位置后重试");
+            }
+            endPendingPlacement();
+            nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
+                    "HyperOS4 model move verification failed focused=%d", focused ? 1 : 0);
         }
         g_model_move_running.store(false, std::memory_order_release);
     }).detach();
     return true;
 }
 
-bool onPerformAction(void *provider, int32_t nodeId, int32_t actionId, void *arguments) {
+bool performActionImpl(void *provider, int32_t nodeId, int32_t actionId, void *arguments) {
+    if (isVirtualNode(nodeId) && (!g_lifted.load(std::memory_order_acquire)
+            || virtualNodeDescription(nodeId).empty())) return false;
     if (actionId == kMoveBeforeAction || actionId == kMoveAfterAction
             || actionId == kCreateFolderAction || (actionId == 16 && isVirtualNode(nodeId))) {
-        __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+        nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                 "placement action received node=%d action=0x%x lifted=%d virtual=%d",
                 nodeId, actionId, g_lifted.load(std::memory_order_acquire) ? 1 : 0,
                 isVirtualNode(nodeId) ? 1 : 0);
@@ -4121,7 +5297,7 @@ bool onPerformAction(void *provider, int32_t nodeId, int32_t actionId, void *arg
         if (!nodeBounds(provider, nodeId, bounds, &label) || !isRecentTaskLabel(label)) {
             return false;
         }
-        __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+        nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                 "recent action node=%d id=0x%x label=%s", nodeId, actionId, label.c_str());
         if (actionId == kRecentCloseAction) return closeRecentTask(provider, nodeId);
         if (actionId == kRecentLockAction) {
@@ -4154,7 +5330,24 @@ bool onPerformAction(void *provider, int32_t nodeId, int32_t actionId, void *arg
         }
         return false;
     }
+    ObservedNode opened;
+    if (actionId == 16 && !isVirtualNode(nodeId)
+            && !g_lifted.load(std::memory_order_acquire)
+            && isDesktopIconNode(provider, nodeId, &opened)) {
+        const bool success = g_original_perform_action != nullptr
+                && g_original_perform_action(provider, nodeId, actionId, arguments);
+        if (success) {
+            // Let the platform accessibility service produce the feedback.
+            // The module does not synthesize or play its own sound.
+            sendEvent(nodeId, kTypeViewClicked);
+        }
+        return success;
+    }
     if (actionId == kLiftAction) {
+        if (g_model_move_running.load()) {
+            sendAnnouncement(nodeId, "正在放置，请稍候");
+            return false;
+        }
         std::vector<ObservedNode> nodes;
         readTree(provider, -1, nodes);
         // The page indicator is part of the same accessibility tree as the
@@ -4170,27 +5363,46 @@ bool onPerformAction(void *provider, int32_t nodeId, int32_t actionId, void *arg
                 [nodeId](const auto &node) { return node.id == nodeId && node.icon(); });
         if (source != nodes.end()) {
             AppTarget placement;
-            if (resolveAppTarget(nodeId, source->label, placement)
-                    && placement.placement.screen > 0) {
-                // The source placement is the reliable page when the
-                // accessibility page indicator is stale during a swipe.
-                g_visible_screen.store(placement.placement.screen - 1,
-                        std::memory_order_release);
-                pageIndicatorSeen = true;
+            if (resolveAppTarget(nodeId, source->label, placement,
+                    g_visible_screen.load() + 1,
+                    source->resource == "com.miui.home:id/folder" ? 2 : 0)) {
+                if (!workspaceContainer(placement.placement.container)) {
+                    sendAnnouncement(nodeId, "暂不支持移动文件夹内项目");
+                    return false;
+                }
+                if (placement.placement.container == kDesktopContainer
+                        && placement.placement.screen > 0) {
+                    // The source placement is the reliable page when the
+                    // accessibility page indicator is stale during a swipe.
+                    g_visible_screen.store(placement.placement.screen - 1,
+                            std::memory_order_release);
+                    pageIndicatorSeen = true;
+                }
+            } else {
+                nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
+                        "HyperOS4 lift source placement unresolved node=%d label=%s",
+                        nodeId, source->label.c_str());
             }
         }
         const int32_t liftScreen = g_visible_screen.load(std::memory_order_acquire);
-        __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+        nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                 "Lift session page=%d tree_nodes=%zu indicator=%d", liftScreen + 1,
                 nodes.size(), pageIndicatorSeen ? 1 : 0);
+        size_t liftedCount = 0;
         {
             std::lock_guard lock(g_session_mutex);
             g_workspace = std::move(nodes);
             auto source = std::find_if(g_workspace.begin(), g_workspace.end(),
                     [nodeId](const auto &node) { return node.id == nodeId && node.icon(); });
-            if (source == g_workspace.end()) return false;
+            if (source == g_workspace.end()) {
+                nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
+                        "HyperOS4 lift source node missing node=%d tree_nodes=%zu",
+                        nodeId, g_workspace.size());
+                return false;
+            }
             g_source = *source;
             g_sources.clear();
+            g_source_placements.clear();
             if (g_source.selected) {
                 for (const auto &node : g_workspace) {
                     if (node.icon() && node.selected && node.host == g_source.host
@@ -4204,6 +5416,7 @@ bool onPerformAction(void *provider, int32_t nodeId, int32_t actionId, void *arg
                     [nodeId](const auto &node) { return node.id == nodeId; })) {
                 g_sources.insert(g_sources.begin(), g_source);
             }
+            liftedCount = g_sources.size();
             rebuildSlots();
             const int32_t parent = findDropParentNode();
             g_drop_parent_node_id.store(parent, std::memory_order_release);
@@ -4215,25 +5428,66 @@ bool onPerformAction(void *provider, int32_t nodeId, int32_t actionId, void *arg
                 }
             }
         }
+        std::vector<ObservedNode> sourceNodes;
+        {
+            std::lock_guard lock(g_session_mutex);
+            sourceNodes = g_sources;
+        }
+        std::vector<FavoritePlacement> sourcePlacements;
+        sourcePlacements.reserve(sourceNodes.size());
+        bool sourcePlacementsReady = !sourceNodes.empty();
+        for (const auto &sourceNode : sourceNodes) {
+            AppTarget target;
+            if (!resolveAppTarget(sourceNode.id, sourceNode.label, target,
+                        g_visible_screen.load() + 1,
+                        sourceNode.resource == "com.miui.home:id/folder" ? 2 : 0)
+                    || target.placement.id < 0
+                    || !workspaceContainer(target.placement.container)) {
+                sourcePlacementsReady = false;
+                nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
+                        "HyperOS4 lift source placement cache deferred node=%d label=%s count=%zu",
+                        sourceNode.id, sourceNode.label.c_str(), sourceNodes.size());
+                break;
+            }
+            sourcePlacements.push_back(target.placement);
+        }
+        if (sourcePlacementsReady) {
+            std::lock_guard lock(g_session_mutex);
+            g_source_placements = std::move(sourcePlacements);
+        }
         g_lifted_node_id.store(nodeId, std::memory_order_release);
         g_lifted_screen.store(g_visible_screen.load(std::memory_order_acquire),
                 std::memory_order_release);
         g_lifted.store(true, std::memory_order_release);
         g_custom_action_calls.fetch_add(1, std::memory_order_relaxed);
-        sendEvent(g_drop_parent_node_id.load(), 2048);
+        const auto parent = captureDropParentEventSource(nodeId);
+        sendEvent(parent, kTypeWindowContentChanged);
+        // System Home's announce_for_drag + drag_multiple_item_name resources.
+        announceReliably(parent.host, parent.window, parent.nodeId,
+                liftedCount == 1 ? "已拖起"
+                        : "已拖起" + std::to_string(liftedCount) + "个图标");
         return true;
     }
     if (actionId == kCancelAction) {
-        if (!g_lifted.load(std::memory_order_acquire)) return false;
-        const int32_t parent = g_drop_parent_node_id.load(std::memory_order_acquire);
-        clearLiftSession();
-        sendAnnouncement(nodeId, "已取消托起");
-        sendEvent(parent >= 0 ? parent : nodeId, 2048);
-        return true;
+        return cancelLiftSession(provider, nodeId);
+    }
+    if (actionId == kEditFolderAction) {
+        if (!isFolderNode(provider, nodeId) || g_original_perform_action == nullptr) {
+            return false;
+        }
+        const bool success = g_original_perform_action(provider, nodeId, 32, arguments);
+        if (success) {
+            sendEvent(nodeId, kTypeViewClicked);
+        } else {
+            sendAnnouncement(nodeId, "文件夹编辑不可用，请重新定位文件夹");
+        }
+        return success;
     }
     if (isVirtualNode(nodeId) && g_lifted.load(std::memory_order_acquire)
             && actionId == kAccessibilityFocusAction) {
+        if (virtualNodeDescription(nodeId).empty()) return false;
         int32_t previous = g_virtual_focused_id.exchange(nodeId, std::memory_order_acq_rel);
+        if (previous == nodeId) return true;
         if (previous >= kVirtualNodeBase && previous != nodeId) {
             sendEvent(previous, 65536);
         }
@@ -4283,8 +5537,30 @@ bool onPerformAction(void *provider, int32_t nodeId, int32_t actionId, void *arg
         if (!success) sendAnnouncement(nodeId, shortcut.label + "不可用，请重新定位图标");
         return success;
     }
-    return g_original_perform_action != nullptr
+    if (isVirtualNode(nodeId)) return false;
+    const bool handled = g_original_perform_action != nullptr
             && g_original_perform_action(provider, nodeId, actionId, arguments);
+    if (handled && actionId == kAccessibilityFocusAction) {
+        const int32_t hovered = g_virtual_hovered_id.exchange(-1);
+        const int32_t focused = g_virtual_focused_id.exchange(-1);
+        if (isVirtualNode(hovered)) sendEvent(hovered, 256);
+        if (isVirtualNode(focused)) sendEvent(focused, 65536);
+    }
+    return handled;
+}
+
+bool onPerformAction(void *provider, int32_t nodeId, int32_t actionId, void *arguments) {
+    const bool trace = g_diagnostics.session() != 0
+            && (actionId == 16 || actionId >= kLiftAction || isVirtualNode(nodeId));
+    if (trace) nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
+            "action begin node=%d action=0x%x focus=%d lifted=%d page=%d hovered=%d focused=%d",
+            nodeId, actionId, g_launcher_window_focused.load(), g_lifted.load() ? 1 : 0,
+            g_visible_screen.load() + 1, g_virtual_hovered_id.load(), g_virtual_focused_id.load());
+    const bool handled = performActionImpl(provider, nodeId, actionId, arguments);
+    if (trace) nativeLog(handled ? ANDROID_LOG_INFO : ANDROID_LOG_WARN, "ActionGridNative",
+            "action end node=%d action=0x%x handled=%d lifted=%d move_pending=%d",
+            nodeId, actionId, handled ? 1 : 0, g_lifted.load() ? 1 : 0, g_model_move_running.load() ? 1 : 0);
+    return handled;
 }
 
 void *findLoadedHandle(const char *libraryBase) {
@@ -4312,6 +5588,9 @@ void resolveLauncherApis(void *handle) {
     RESOLVE_NATIVE(g_frb_dispatcher, FrbDispatcherFn, "frb_pde_ffi_dispatcher_primary");
     RESOLVE_NATIVE(g_motion_new, MotionNewFn, "input_MotionEvent_new");
     RESOLVE_NATIVE(g_motion_action_masked, MotionActionFn, "input_MotionEvent_getActionMasked");
+    RESOLVE_NATIVE(g_motion_set_action, MotionSetActionFn, "input_MotionEvent_setAction");
+    RESOLVE_NATIVE(g_motion_clone, MotionCloneFn, "input_MotionEvent_clone");
+    RESOLVE_NATIVE(g_motion_drop, DropFn, "input_MotionEvent_drop");
     RESOLVE_NATIVE(g_motion_raw_x, MotionFloatFn, "input_MotionEvent_getRawX");
     RESOLVE_NATIVE(g_motion_raw_y, MotionFloatFn, "input_MotionEvent_getRawY");
     RESOLVE_NATIVE(g_input_event, InputEventFn, "input_InputEvent_newWithMotionEvent");
@@ -4343,6 +5622,8 @@ void resolveLauncherApis(void *handle) {
     RESOLVE_NATIVE(g_intent_set_component, IntentSetComponentFn, "Intent_set_component");
     RESOLVE_NATIVE(g_intent_set_extras, IntentSetExtrasFn, "Intent_set_extras");
     RESOLVE_NATIVE(g_scene_start_activity, SceneStartActivityFn, "Scene_start_activity");
+    RESOLVE_NATIVE(g_key_code, MotionActionFn, "input_KeyEvent_getKeyCode");
+    RESOLVE_NATIVE(g_key_action, MotionActionFn, "input_KeyEvent_getAction");
     if (g_scene_start_activity == nullptr) {
         g_scene_start_activity = reinterpret_cast<SceneStartActivityFn>(
                 findLoadedSymbol("libhyper_os_ui_public.so", "Scene_start_activity"));
@@ -4371,6 +5652,10 @@ void resolveLauncherApis(void *handle) {
     RESOLVE_NATIVE(g_runtime_inc_strong, RuntimeIncStrongFn, "Runtime_inc_strong");
     RESOLVE_NATIVE(g_runtime_get_context, RuntimeGetContextFn, "Runtime_get_context");
     RESOLVE_NATIVE(g_content_resolver_new, ContentResolverNewFn, "content_resolver_new");
+    RESOLVE_NATIVE(g_content_resolver_delete, ContentResolverDeleteFn, "content_resolver_delete");
+    RESOLVE_NATIVE(g_content_resolver_call, ContentResolverCallFn, "content_resolver_operation_call");
+    RESOLVE_NATIVE(g_bundle_get_i64, BundleGetI64Fn, "Bundle_get_i64");
+    RESOLVE_NATIVE(g_bundle_insert_i64, BundleInsertI64Fn, "Bundle_insert_i64");
     RESOLVE_NATIVE(g_sqlite_open_v2, SqliteOpenV2Fn, "sqlite3_open_v2");
     RESOLVE_NATIVE(g_sqlite_prepare_v2, SqlitePrepareFn, "sqlite3_prepare_v2");
     RESOLVE_NATIVE(g_sqlite_step, SqliteStepFn, "sqlite3_step");
@@ -4383,7 +5668,7 @@ void resolveLauncherApis(void *handle) {
     RESOLVE_NATIVE(g_sqlite_exec, SqliteExecFn, "sqlite3_exec");
 #undef RESOLVE_NATIVE
     requestSnapshotRefresh(true);
-    __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+    nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
             "shortcut relay symbols intent=%p action=%p component=%p scene=%p",
             reinterpret_cast<void *>(g_intent_default),
             reinterpret_cast<void *>(g_intent_set_action),
@@ -4399,7 +5684,7 @@ void resolveLauncherApis(void *handle) {
         } else {
             g_original_content_resolver_new = g_content_resolver_new;
         }
-        __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+        nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                 "Runtime capture hook result=%d", result);
     }
     if (g_scene_start_activity != nullptr && g_api != nullptr && g_api->hook_func != nullptr
@@ -4410,7 +5695,7 @@ void resolveLauncherApis(void *handle) {
         if (result == 0 && backup != nullptr) {
             g_original_scene_start_activity = reinterpret_cast<SceneStartActivityFn>(backup);
         }
-        __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+        nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                 "Scene start capture hook result=%d target=%p backup=%p",
                 result, reinterpret_cast<void *>(g_scene_start_activity), backup);
     }
@@ -4443,31 +5728,35 @@ void resolveLauncherApis(void *handle) {
                     reinterpret_cast<uintptr_t>(base) + kLauncherLaunchSoscOffset);
         }
     }
-    if (motionBuildMatch && !g_launcher_motion_hook_attempted.exchange(true)
+    const uintptr_t motionOffset = profile == LauncherAbiProfile::kCurrent8565 ? 0xd40fd8
+            : profile == LauncherAbiProfile::kLegacy7748 ? 0xd37904 : 0;
+    if (motionOffset != 0 && g_launcher_fingerprint_ready.load()
+            && !g_launcher_motion_hook_attempted.exchange(true)
             && g_api != nullptr && g_api->hook_func != nullptr
             && g_motion_action_masked != nullptr && g_motion_raw_x != nullptr
-            && g_motion_raw_y != nullptr) {
-        // This is the verified HyperOS 4 libapp_launcher/libapp pair. The Rust
-        // local symbol is not exported, so keep the offset behind the paired
-        // ELF fingerprint gate and never use it for another launcher build.
-        constexpr uintptr_t kLauncherMotionV2Offset = 0xd40fd8;
+            && g_motion_raw_y != nullptr && g_motion_clone != nullptr
+            && g_motion_drop != nullptr && g_motion_set_action != nullptr) {
         void *base = launcherLibraryBase();
         void *target = base == nullptr ? nullptr
                 : reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(base)
-                        + kLauncherMotionV2Offset);
-        if (target != nullptr) {
+                        + motionOffset);
+        constexpr uint32_t prologue[] = {
+                0xd103c3ffU, 0xa90c7bfdU, 0xf9006bf5U, 0xa90e4ff4U, 0x910303fdU};
+        if (target != nullptr && std::memcmp(target, prologue, sizeof(prologue)) == 0) {
             void *backup = nullptr;
             int result = g_api->hook_func(target,
-                    reinterpret_cast<void *>(&onLauncherMotionV2), &backup);
+                    reinterpret_cast<void *>(&onLauncherMotion), &backup);
             if (result == 0 && backup != nullptr) {
-                g_original_launcher_motion_v2 = reinterpret_cast<LauncherMotionV2Fn>(backup);
+                g_original_launcher_motion = reinterpret_cast<LauncherMotionFn>(backup);
             }
-            __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
-                    "Launcher motion v2 hook result=%d target=%p backup=%p build=%s",
+            nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
+                    "Launcher motion hook result=%d target=%p backup=%p build=%s",
                     result, target, backup, dartBuildId);
         }
     }
     g_trigger_workspace_reload = resolveWorkspaceReloadForProfile(profile, dartBuildId);
+    resolveGridCounts(profile);
+    installLauncherLifecycleHooks(profile);
     g_capabilities.fetch_and(~(CAP_FRB_MODEL | CAP_MOVE_PROFILE),
             std::memory_order_release);
     if (g_frb_dispatcher != nullptr && frbBuildMatch) {
@@ -4476,12 +5765,12 @@ void resolveLauncherApis(void *handle) {
             g_capabilities.fetch_or(CAP_MOVE_PROFILE, std::memory_order_release);
         }
     } else if (g_frb_dispatcher != nullptr) {
-        __android_log_print(ANDROID_LOG_WARN, "ActionGridNative",
+        nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
                 "FRB model ABI disabled: profile=%s libapp Build ID=%s fingerprint=%d",
                 launcherAbiProfileName(profile), dartBuildId,
                 g_launcher_fingerprint_ready.load(std::memory_order_acquire) ? 1 : 0);
     }
-    __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+    nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
             "Native LauncherApps APIs profile=%s shortcuts=%d appInfo=%d sqlite=%d frb_model=%d move=%d",
             launcherAbiProfileName(profile),
             shortcuts ? 1 : 0,
@@ -4489,6 +5778,8 @@ void resolveLauncherApis(void *handle) {
             g_sqlite_open_v2 != nullptr ? 1 : 0,
             (g_capabilities.load() & CAP_FRB_MODEL) != 0 ? 1 : 0,
             (g_capabilities.load() & CAP_MOVE_PROFILE) != 0 ? 1 : 0);
+    g_diagnostics_apis_ready.store(true, std::memory_order_release);
+    ensureDiagnosticsWorker();
 }
 
 void resolvePrivate(const char *name, void *handle) {
@@ -4497,7 +5788,7 @@ void resolvePrivate(const char *name, void *handle) {
     char buildId[sizeof(g_private_build_id)] = {};
     const bool privateBuildIdReady = readBuildId(name, buildId, sizeof(buildId));
     if (!privateBuildIdReady) {
-        __android_log_print(ANDROID_LOG_WARN, "ActionGridNative",
+        nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
                 "Rust accessibility library has no readable Build ID: %s; using ELF fingerprint",
                 name);
     }
@@ -4516,16 +5807,24 @@ void resolvePrivate(const char *name, void *handle) {
     readBuildId("libhyper_os_ui_public.so", uiId, sizeof(uiId));
     std::lock_guard lock(g_mutex);
     std::memcpy(g_private_build_id, buildId, sizeof(g_private_build_id));
-    if (!systemFingerprintReady || !profileMatchesSystemAbi(profile, buildId, aidlId, uiId,
+    if (!systemFingerprintReady || !knownSystemAbi(
             privateFingerprint, aidlFingerprint, uiFingerprint)) {
+        g_launcher_system_compatible.store(false, std::memory_order_release);
         g_capabilities.fetch_and(~(CAP_PRIVATE_BUILD_MATCH | CAP_PRIVATE_SYMBOLS
                 | CAP_SELECTION_STATE | CAP_FRB_MODEL | CAP_MOVE_PROFILE),
                 std::memory_order_release);
-        __android_log_print(ANDROID_LOG_WARN, "ActionGridNative",
+        nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
                 "Rust accessibility ABI mismatch: profile=%s private=%s aidl=%s ui=%s fingerprint=%d",
                 launcherAbiProfileName(profile), buildId, aidlId, uiId,
                 systemFingerprintReady ? 1 : 0);
         return;
+    }
+    const bool paired = profileMatchesSystemAbi(profile, buildId, aidlId, uiId,
+            privateFingerprint, aidlFingerprint, uiFingerprint);
+    g_launcher_system_compatible.store(paired, std::memory_order_release);
+    if (paired) installLauncherLifecycleHooks(profile);
+    if (!paired) {
+        g_capabilities.fetch_and(~(CAP_FRB_MODEL | CAP_MOVE_PROFILE), std::memory_order_release);
     }
     g_capabilities.fetch_or(CAP_PRIVATE_BUILD_MATCH, std::memory_order_release);
     g_capabilities.fetch_or(CAP_SELECTION_STATE, std::memory_order_release);
@@ -4543,7 +5842,7 @@ void resolvePrivate(const char *name, void *handle) {
         if (result == 0 && backup != nullptr) {
             g_original_send_event = reinterpret_cast<EventSendFn>(backup);
         }
-        __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+        nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                 "Rust send event hook result=%d symbol=%p backup=%p",
                 result, sendEvent, backup);
     }
@@ -4555,7 +5854,7 @@ void resolvePrivate(const char *name, void *handle) {
     if (createNode != nullptr && providerPerformAction != nullptr
             && interactionPerformAction != nullptr && connectionPerformAction != nullptr) {
         g_capabilities.fetch_or(CAP_PRIVATE_SYMBOLS, std::memory_order_release);
-        __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+        nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
             "Rust ABI symbols resolved for verified ELF fingerprint");
         if (g_original_create_node == nullptr) {
             g_create_node = reinterpret_cast<CreateNodeFn>(createNode);
@@ -4570,7 +5869,7 @@ void resolvePrivate(const char *name, void *handle) {
                 } else {
                     g_original_create_node = reinterpret_cast<CreateNodeFn>(createNode);
                 }
-                __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+                nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                         "Rust create node hook result=%d", result);
             } else {
                 g_original_create_node = reinterpret_cast<CreateNodeFn>(createNode);
@@ -4581,7 +5880,7 @@ void resolvePrivate(const char *name, void *handle) {
             int result = g_api->hook_func(providerPerformAction,
                     reinterpret_cast<void *>(&onPerformAction), &backup);
             if (result == 0) g_original_perform_action = reinterpret_cast<PerformActionFn>(backup);
-            __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+            nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                     "Rust perform action hook result=%d", result);
         }
         if (providerFindFocus != nullptr && g_original_find_focus == nullptr
@@ -4595,13 +5894,13 @@ void resolvePrivate(const char *name, void *handle) {
             } else {
                 g_original_find_focus = reinterpret_cast<FindFocusFn>(providerFindFocus);
             }
-            __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+            nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                     "Rust provider find focus hook result=%d symbol=%p backup=%p",
                     result, providerFindFocus, backup);
         }
     } else {
         g_capabilities.fetch_and(~CAP_PRIVATE_SYMBOLS, std::memory_order_release);
-        __android_log_print(ANDROID_LOG_WARN, "ActionGridNative",
+        nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
                 "Rust ABI symbols are incomplete; native actions remain hidden");
     }
 }
@@ -4615,7 +5914,7 @@ void resolvePublic(void *handle) {
     ElfFingerprint fingerprint{};
     if (!readModuleFingerprint("libhyper_os_accessibility_public.so", fingerprint)
             || !fingerprintMatches(fingerprint, kPublicFingerprint)) {
-        __android_log_print(ANDROID_LOG_WARN, "ActionGridNative",
+        nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
                 "Rust public accessibility ELF fingerprint mismatch: build=%s", buildId);
         g_capabilities.fetch_and(~(CAP_PUBLIC_BUILD_MATCH | CAP_PUBLIC_NODE_API
                 | CAP_NODE_HOOK_INSTALLED | CAP_PAGE_SCROLL_EVENT), std::memory_order_release);
@@ -4644,7 +5943,7 @@ void resolvePublic(void *handle) {
     for (const char *symbol : symbols) {
         if (dlsym(handle, symbol) == nullptr) {
             g_capabilities.fetch_and(~CAP_PUBLIC_NODE_API, std::memory_order_release);
-            __android_log_print(ANDROID_LOG_WARN, "ActionGridNative",
+            nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
                     "Rust public node symbol missing: %s", symbol);
             return;
         }
@@ -4661,8 +5960,17 @@ void resolvePublic(void *handle) {
             dlsym(handle, "AccessibilityNodeInfo_add_child_with_id"));
     g_node_set_source = reinterpret_cast<NodeSetSourceFn>(
             dlsym(handle, "AccessibilityNodeInfo_set_soruce"));
-    g_node_set_parent = reinterpret_cast<NodeSetSourceFn>(
+    g_node_set_parent = reinterpret_cast<NodeSetParentFn>(
             dlsym(handle, "AccessibilityNodeInfo_set_parent"));
+    g_node_set_traversal_after = reinterpret_cast<NodeSetTraversalFn>(
+            dlsym(handle, "AccessibilityNodeInfo_set_traversal_after"));
+    g_node_set_traversal_before = reinterpret_cast<NodeSetTraversalFn>(
+            dlsym(handle, "AccessibilityNodeInfo_set_traversal_before"));
+    if (g_node_set_traversal_before == nullptr) {
+        g_node_set_traversal_before = reinterpret_cast<NodeSetTraversalFn>(findLoadedSymbol(
+                "libhyper_os_aidl.dylib.so",
+                "_RNvMs6_NtNtNtNtNtNtCs2GTLDA1zkMw_13hyper_os_aidl3src3ext7android4view13accessibility27accessibility_node_info_extNtNtNtNtNtBf_7android4view13accessibility21AccessibilityNodeInfo21AccessibilityNodeInfo20set_traversal_before"));
+    }
     g_node_set_important = reinterpret_cast<NodeSetBoolFn>(
             dlsym(handle, "AccessibilityNodeInfo_set_important_for_accessibility"));
     g_node_set_accessibility_focused = reinterpret_cast<NodeSetBoolFn>(
@@ -4692,16 +6000,21 @@ void resolvePublic(void *handle) {
                 reinterpret_cast<void *>(&onSendEvent), &backup);
         if (result == 0 && backup != nullptr) {
             g_original_send_event = reinterpret_cast<EventSendFn>(backup);
-            __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+            nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                     "Accessibility public send hook installed");
         }
     }
-    bool eventReady = g_event_new != nullptr && g_event_drop != nullptr
-            && g_event_set_source != nullptr && g_event_set_event_type != nullptr
-            && g_event_set_item_count != nullptr && g_event_set_from_index != nullptr
-            && g_event_set_to_index != nullptr && g_event_push_text != nullptr
-            && g_original_send_event != nullptr;
-    if (eventReady) g_capabilities.fetch_or(CAP_PAGE_SCROLL_EVENT, std::memory_order_release);
+    const bool announcementReady = g_event_new != nullptr && g_event_drop != nullptr
+            && g_event_set_source != nullptr && g_event_push_text != nullptr
+            && g_rstring_from_utf16 != nullptr && g_original_send_event != nullptr;
+    if (announcementReady) {
+        // The older public suite has no scroll-record setters.  It still
+        // accepts an announcement event, so keep page rewriting enabled and
+        // let sendPageAnnouncementWithSource choose the available record.
+        g_capabilities.fetch_or(CAP_PAGE_SCROLL_EVENT, std::memory_order_release);
+    } else {
+        g_capabilities.fetch_and(~CAP_PAGE_SCROLL_EVENT, std::memory_order_release);
+    }
     g_node_set_bounds = reinterpret_cast<NodeSetBoundsFn>(
             dlsym(handle, "AccessibilityNodeInfo_set_bounds_in_screen"));
     g_node_set_parent_bounds = reinterpret_cast<NodeSetBoundsFn>(
@@ -4729,11 +6042,12 @@ void resolvePublic(void *handle) {
             abiStable == nullptr ? dlsym(RTLD_DEFAULT, kRStringFromUtf16)
                                  : dlsym(abiStable, kRStringFromUtf16));
     if (g_action_new == nullptr || g_action_drop == nullptr || g_rstring_from_utf16 == nullptr) {
-        __android_log_print(ANDROID_LOG_WARN, "ActionGridNative",
+        nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
                 "Rust action constructor ABI is unavailable; custom actions remain hidden");
     }
-    __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
-            "Rust public node ABI resolved; installing node action hook");
+    nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
+            "Rust public node ABI resolved; installing node action hook traversal=%d",
+            g_node_set_traversal_after != nullptr ? 1 : 0);
     auto addAction = reinterpret_cast<AddActionFn>(
             dlsym(handle, "AccessibilityNodeInfo_add_action"));
     if (!g_node_hook_attempted.exchange(true, std::memory_order_acq_rel)
@@ -4744,10 +6058,10 @@ void resolvePublic(void *handle) {
         if (result == 0 && backup != nullptr) {
             g_original_add_action = reinterpret_cast<AddActionFn>(backup);
             g_capabilities.fetch_or(CAP_NODE_HOOK_INSTALLED, std::memory_order_release);
-            __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+            nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                 "Rust node action hook installed; direct TalkBack action enabled");
         } else {
-            __android_log_print(ANDROID_LOG_WARN, "ActionGridNative",
+            nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
                     "Rust node action hook rejected: %d", result);
         }
     }
@@ -4762,7 +6076,7 @@ void onAddAction(void *node, void *action) {
     }
     uint32_t count = g_node_action_calls.fetch_add(1, std::memory_order_relaxed) + 1U;
     if (count == 1U) {
-        __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+        nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                 "Rust accessibility node action stream observed");
     }
     if (g_original_add_action != nullptr) {
@@ -4771,44 +6085,77 @@ void onAddAction(void *node, void *action) {
 }
 
 void injectIconActions(void *node) {
-    if (isIconNode(node)) {
-            int32_t sourceId = static_cast<int32_t>(
-                    nodeField<int64_t>(node, 0x338) >> 32U);
-            bool lifted = g_lifted.load(std::memory_order_acquire);
-            bool liftedSource = isLiftedSource(sourceId);
-            bool moveReady = moveActionsReady();
-            if (!lifted || !liftedSource) {
-                injectDirectAction(node, kLiftAction,
-                        nodeSelected(node) ? kMultiLiftLabel : kLiftLabel);
-            }
-            if (lifted) {
-                injectDirectAction(node, kCancelAction, kCancelLabel);
-            }
-            if (lifted && !liftedSource && moveReady) {
-                std::string label = nodeString(node, 0x138);
-                std::u16string spoken = u"移到 ";
-                spoken += utf16FromUtf8(label);
-                std::u16string before = spoken;
-                before += u"前面";
-                std::u16string after = spoken;
-                after += u"后面";
-                injectDirectActionText(node, kMoveBeforeAction, before);
-                injectDirectActionText(node, kMoveAfterAction, after);
-            } else if (!lifted) {
-                AppTarget target = targetForNode(sourceId, node);
-                if (!target.package.empty() && !target.activity.empty()) {
-                    injectDirectAction(node, kAppInfoAction, kAppInfoLabel);
-                    if (target.user == 0 && uninstallLaunchReady()) {
-                        injectDirectAction(node, kUninstallAction, kUninstallLabel);
-                    }
-                    for (size_t index = 0; index < target.shortcuts.size()
-                            && index < static_cast<size_t>(kDynamicActionCount); ++index) {
-                        injectDirectActionText(node, kDynamicActionBase + static_cast<int32_t>(index),
-                                utf16FromUtf8(target.shortcuts[index].label));
-                    }
+    const std::string resource = node == nullptr ? std::string() : nodeString(node, 0x1b8);
+    const bool folder = resource == "com.miui.home:id/folder";
+    const bool icon = resource == "com.miui.home:id/icon_icon";
+    if (!folder && (!icon || !isIconNode(node))) return;
+    if (folder) {
+        // HyperOS 4's native launcher may expose FolderIcon as a Button.
+        // Keep the desktop item a generic view so TalkBack presents its
+        // explicit actions instead of a button role.
+        setNodeString(g_node_set_class_name, node, u"android.view.View");
+    }
+    const int32_t sourceId = static_cast<int32_t>(
+            nodeField<int64_t>(node, 0x338) >> 32U);
+    if (folder) repairFolderBounds(node, sourceId);
+    const bool lifted = g_lifted.load(std::memory_order_acquire);
+    const bool liftedSource = isLiftedSource(sourceId);
+    const bool moveReady = moveActionsReady();
+    const std::string iconLabel = nodeString(node, 0x138);
+    if (!lifted || !liftedSource) {
+        injectDirectAction(node, kLiftAction,
+                nodeSelected(node) ? kMultiLiftLabel : kLiftLabel);
+    }
+    if (folder && !lifted) {
+        injectDirectAction(node, kEditFolderAction, kEditFolderLabel);
+    }
+    if (lifted) {
+        injectDirectAction(node, kCancelAction, kCancelLabel);
+        const Bounds bounds = nodeField<Bounds>(node, kNodeBoundsOffset);
+        std::string location;
+        {
+            std::lock_guard lock(g_session_mutex);
+            const bool hotseat = hotseatNodeLocked(describeNode(node));
+            if (hotseat) location = "，底栏";
+            for (const auto &cell : g_grid_cells) {
+                if (hotseat) break;
+                if (bounds.centerX() >= cell.bounds.left && bounds.centerX() < cell.bounds.right
+                        && bounds.centerY() >= cell.bounds.top && bounds.centerY() < cell.bounds.bottom) {
+                    location = "，第 " + std::to_string(cell.row + 1)
+                            + " 行第 " + std::to_string(cell.column + 1) + " 列";
+                    break;
                 }
             }
         }
+        if (!location.empty()) {
+            const auto description = utf16FromUtf8(iconLabel + location);
+            setNodeString(g_node_set_content_description, node, description.c_str());
+        }
+    }
+    if (lifted && !liftedSource && moveReady) {
+        std::u16string spoken = u"移到 ";
+        spoken += utf16FromUtf8(iconLabel);
+        std::u16string before = spoken;
+        before += u"前面";
+        std::u16string after = spoken;
+        after += u"后面";
+        injectDirectActionText(node, kMoveBeforeAction, before);
+        injectDirectActionText(node, kMoveAfterAction, after);
+    } else if (!lifted) {
+        AppTarget target = targetForNode(sourceId, node);
+        if (!target.package.empty() && !target.activity.empty()) {
+            injectDirectAction(node, kAppInfoAction, kAppInfoLabel);
+            if (target.user == 0 && uninstallLaunchReady()) {
+                injectDirectAction(node, kUninstallAction, kUninstallLabel);
+            }
+            for (size_t index = 0; index < target.shortcuts.size()
+                    && index < static_cast<size_t>(kDynamicActionCount); ++index) {
+                injectDirectActionText(node,
+                        kDynamicActionBase + static_cast<int32_t>(index),
+                        utf16FromUtf8(target.shortcuts[index].label));
+            }
+        }
+    }
 }
 
 void injectRecentActions(void *node) {
@@ -4833,12 +6180,42 @@ void injectRecentActions(void *node) {
             recentActionLabel(kRecentCloseAction, locked));
 }
 
+void logDiagnosticsSnapshot(const char *reason) {
+    g_diagnostics_node_budget.store(8);
+    nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
+            "diagnostics %s module=%s profile=%s fingerprint=%d system=%d cap=0x%x focus=%d page=%d grid=%dx%d",
+            reason, ACTIONGRID_VERSION, launcherAbiProfileName(g_launcher_profile.load()),
+            g_launcher_fingerprint_ready.load() ? 1 : 0, g_launcher_system_compatible.load() ? 1 : 0,
+            g_capabilities.load(), g_launcher_window_focused.load(), g_visible_screen.load() + 1,
+            g_grid_columns.load(), g_grid_rows.load());
+    nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
+            "diagnostics hooks node=%d action=%d focus=%d motion=%d event=%d node_calls=%u injected=%u",
+            g_original_create_node ? 1 : 0, g_original_perform_action ? 1 : 0,
+            g_original_launcher_focus ? 1 : 0, g_original_launcher_motion ? 1 : 0,
+            g_original_send_event ? 1 : 0, g_node_action_calls.load(), g_custom_action_calls.load());
+    {
+        std::lock_guard lock(g_session_mutex);
+        nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
+                "diagnostics grid lifted=%d sources=%zu placements=%zu slots=%zu cells=%zu grid_screen=%d virtual_focus=%d moving=%d",
+                g_lifted.load() ? 1 : 0, g_sources.size(), g_source_placements.size(),
+                g_slots.size(), g_grid_cells.size(), g_grid_screen, g_virtual_focused_id.load(),
+                g_model_move_running.load() ? 1 : 0);
+    }
+    {
+        std::lock_guard lock(g_snapshot_mutex);
+        nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
+                "diagnostics snapshot ready=%d generation=%llu favorites=%zu pages=%zu",
+                g_snapshot.ready ? 1 : 0, static_cast<unsigned long long>(g_snapshot.generation),
+                g_snapshot.favorites.size(), g_snapshot.pageCounts.size());
+    }
+}
+
 void onLibraryLoaded(const char *name, void *handle) {
     const char *base = baseName(name);
     if (std::strcmp(base, "libapp_launcher.so") == 0) {
         g_capabilities.fetch_or(CAP_LAUNCHER_SEEN, std::memory_order_release);
         resolveLauncherApis(handle);
-        __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+        nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                 "Rust launcher loaded; native backend is observing");
     } else if (std::strcmp(base, "libapp.so") == 0) {
         char dartBuildId[33] = {};
@@ -4866,6 +6243,7 @@ void onLibraryLoaded(const char *name, void *handle) {
             resolvePrivate("libhyper_os_accessibility_private.dylib.so", privateHandle);
         }
     }
+    ensureDiagnosticsWorker();
 }
 
 }  // namespace
@@ -4873,7 +6251,7 @@ void onLibraryLoaded(const char *name, void *handle) {
 extern "C" __attribute__((visibility("default"), used))
 NativeOnModuleLoaded native_init(const NativeAPIEntries *entries) {
     g_api = entries;
-    __android_log_print(ANDROID_LOG_INFO, "ActionGridNative",
+    nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
             "native_init version=%u; Rust actions are capability-gated",
             entries == nullptr ? 0U : entries->version);
     ensureSurfacePoller();

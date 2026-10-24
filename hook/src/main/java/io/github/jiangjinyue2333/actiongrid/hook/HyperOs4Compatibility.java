@@ -14,14 +14,12 @@ public final class HyperOs4Compatibility {
     }
 
     public static boolean isNativeCandidate(int sdk, long launcherVersion, boolean hasCode) {
-        return sdk == 37 && launcherVersion >= 800000000L && !hasCode;
+        return sdk >= 37 && launcherVersion >= 800000000L && !hasCode;
     }
 
     public static boolean supports(int sdk, long launcherVersion, boolean hasCode) {
-        return isNativeCandidate(sdk, launcherVersion, hasCode)
-                && (launcherVersion == CURRENT_SUPPORTED_LAUNCHER_VERSION
-                || launcherVersion == PREVIOUS_SUPPORTED_LAUNCHER_VERSION
-                || launcherVersion == OLDER_SUPPORTED_LAUNCHER_VERSION);
+        // This selects the backend. Native code validates each actual ABI before use.
+        return isNativeCandidate(sdk, launcherVersion, hasCode);
     }
 
     public static String profileName(long launcherVersion) {
@@ -34,7 +32,7 @@ public final class HyperOs4Compatibility {
         if (launcherVersion == OLDER_SUPPORTED_LAUNCHER_VERSION) {
             return "8.01.02.7653（旧 FRB profile）";
         }
-        return "未知 8.x profile";
+        return "自动检测接口兼容性";
     }
 
     static int cellIndex(int center, int start, int size, int count) {

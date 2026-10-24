@@ -19,7 +19,6 @@
         android:name=".ActionGridApp"
         android:allowBackup="false"
         android:extractNativeLibs="false"
-        android:multiArch="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:description="@string/app_description"
         android:icon="@mipmap/ic_launcher"

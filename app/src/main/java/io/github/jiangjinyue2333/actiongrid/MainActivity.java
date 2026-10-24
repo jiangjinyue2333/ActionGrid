@@ -37,6 +37,7 @@ import io.github.jiangjinyue2333.actiongrid.update.UpdateDownloader;
 import io.github.jiangjinyue2333.actiongrid.update.UpdateManifest;
 import io.github.jiangjinyue2333.actiongrid.update.UpdateNotification;
 import io.github.jiangjinyue2333.actiongrid.update.UpdateState;
+import io.github.jiangjinyue2333.actiongrid.update.UpdateSource;
 import io.github.libxposed.service.HookedTarget;
 import io.github.libxposed.service.XposedService;
 
@@ -57,7 +58,12 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
     private Button openAbout;
     private Button restartHome;
     private Button checkUpdates;
+    private Button selectUpdateSource;
+    private TextView updateSourceSummary;
     private Switch loggingSwitch;
+    private Switch pageOrderSwitch;
+    private TextView pageOrderSummary;
+    private boolean updatingPageOrder;
     private final ExecutorService backgroundExecutor = Executors.newSingleThreadExecutor();
     private final BroadcastReceiver updateReceiver = new BroadcastReceiver() {
         @Override
@@ -69,6 +75,8 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
     private boolean updateReceiverRegistered;
     private UpdateManifest pendingUpdateAfterNotificationPermission;
     private boolean homeRestartInProgress;
+    private boolean exportingLogs;
+    private boolean updatingLogging;
     private XposedService service;
 
     @Override
@@ -108,6 +116,7 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
     @Override
     protected void onResume() {
         super.onResume();
+        refreshLogStatus();
         if (pendingUpdateAfterNotificationPermission != null
                 && UpdateNotification.canNotify(this)) {
             UpdateManifest pending = pendingUpdateAfterNotificationPermission;
@@ -126,6 +135,9 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
     public void onServiceChanged(XposedService value) {
         service = value;
         runOnUiThread(this::refreshStatus);
+        if (value != null && PageOrderSettings.supports(installedHomeInfo())) {
+            PageOrderSettings.pushToModule(value, this);
+        }
     }
 
     private void bindViews() {
@@ -140,7 +152,11 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
         openAbout = findViewById(R.id.open_about);
         restartHome = findViewById(R.id.restart_home);
         checkUpdates = findViewById(R.id.check_updates);
+        selectUpdateSource = findViewById(R.id.select_update_source);
+        updateSourceSummary = findViewById(R.id.update_source_summary);
         loggingSwitch = findViewById(R.id.logging_switch);
+        pageOrderSwitch = findViewById(R.id.page_order_switch);
+        pageOrderSummary = findViewById(R.id.page_order_summary);
         ((TextView) findViewById(R.id.version_text)).setText(
                 getString(R.string.version_format, BuildConfig.VERSION_NAME));
         loggingSwitch.setChecked(LogStore.isEnabled(this));
@@ -154,24 +170,48 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
         findViewById(R.id.open_source_repository)
                 .setOnClickListener(view -> openSourceRepository());
         loggingSwitch.setOnCheckedChangeListener((button, enabled) -> {
+            if (updatingLogging) return;
             LogStore.setEnabled(this, enabled);
-            aboutStatus.setText(enabled ? "已开始记录新日志" : "日志记录已关闭，旧日志已清除");
-            findViewById(R.id.send_logs).setEnabled(enabled && LogStore.hasLogs(this));
+            boolean active = LogStore.isEnabled(this);
+            updatingLogging = true;
+            loggingSwitch.setChecked(active);
+            updatingLogging = false;
+            aboutStatus.setText(active ? R.string.logging_started
+                    : enabled ? R.string.logging_failed : R.string.logging_stopped);
+            if (active) {
+                String summary = diagnosticsSummary();
+                backgroundExecutor.execute(() -> LogStore.append(this, "environment", summary));
+            }
+            refreshLogStatus();
+        });
+        pageOrderSwitch.setOnCheckedChangeListener((button, reversed) -> {
+            if (updatingPageOrder || !PageOrderSettings.supports(installedHomeInfo())) {
+                return;
+            }
+            PageOrderSettings.setReversed(this, reversed);
+            if (!PageOrderSettings.pushToModule(service, this)) {
+                statusMessage.setText(R.string.page_order_sync_failed);
+                return;
+            }
+            statusMessage.setText(reversed
+                    ? R.string.page_order_enabled : R.string.page_order_disabled);
         });
         findViewById(R.id.send_logs).setOnClickListener(view -> shareLogs());
         checkUpdates.setOnClickListener(view -> checkUpdates(true));
+        selectUpdateSource.setOnClickListener(view -> showUpdateSourceDialog());
         findViewById(R.id.restore_update_prompts).setOnClickListener(view -> {
             UpdateState.restorePrompts(this);
             updateIgnoredStatus();
             aboutStatus.setText(R.string.update_prompts_restored);
         });
         findViewById(R.id.send_logs).setEnabled(LogStore.hasLogs(this));
+        refreshUpdateSourceSummary();
     }
 
     private void confirmHomeRestart() {
         PackageInfo homeInfo = installedHomeInfo();
         if (isHyperOs4Home(homeInfo) && !isSupportedHyperOs4Home(homeInfo)) {
-            statusMessage.setText("当前澎湃 4 桌面版本未验证，已关闭原生动作；重启桌面无法解决此问题");
+            statusMessage.setText("当前桌面类型不适用原生动作后端");
             return;
         }
         if (homeRestartInProgress) {
@@ -251,6 +291,7 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
 
     private void refreshStatus() {
         PackageInfo homeInfo = installedHomeInfo();
+        refreshPageOrder(homeInfo);
         boolean hyperOs4 = isHyperOs4Home(homeInfo);
         String home = installedHomeVersion(homeInfo);
         setStatusRow(R.id.home_status_row, homeStatus, "小米桌面", home);
@@ -291,6 +332,16 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
             statusMessage.setText("读取模块状态失败");
             LogStore.append(this, "app", "读取框架状态失败 " + exception.getClass().getSimpleName());
         }
+    }
+
+    private void refreshPageOrder(PackageInfo homeInfo) {
+        boolean supported = PageOrderSettings.supports(homeInfo);
+        updatingPageOrder = true;
+        pageOrderSwitch.setEnabled(supported);
+        pageOrderSwitch.setChecked(supported && PageOrderSettings.isReversed(this));
+        updatingPageOrder = false;
+        pageOrderSummary.setText(supported
+                ? R.string.page_order_summary : R.string.page_order_unsupported);
     }
 
     private String runningTargetStatus(List<HookedTarget> targets) {
@@ -335,7 +386,7 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
             LogStore.append(this, "app", "读取桌面进程状态失败 "
                     + exception.getClass().getSimpleName());
         }
-        return "无法确认";
+        return "系统限制，暂时无法确认（不代表桌面未运行）";
     }
 
     private String hyperOs4ActionStatus(PackageInfo info, boolean homeScope, String process) {
@@ -343,8 +394,7 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
             return "澎湃 4 原生动作：未启用小米桌面作用域";
         }
         if (!isSupportedHyperOs4Home(info)) {
-            return "澎湃 4 原生动作：" + HyperOs4Compatibility.profileName(
-                    info == null ? 0L : info.getLongVersionCode()) + "不支持";
+            return "当前桌面不适用原生动作后端";
         }
         String profile = HyperOs4Compatibility.profileName(info.getLongVersionCode());
         return switch (process) {
@@ -352,7 +402,7 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
                     + "，桌面进程运行，等待 native ABI 校验";
             case "未运行" -> "澎湃 4 原生动作：" + profile + "，已启用，等待桌面进程";
             default -> "澎湃 4 原生动作：" + profile
-                    + "，已识别，native ABI 状态无法确认";
+                    + "，接口状态待确认";
         };
     }
 
@@ -361,17 +411,14 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
             return "澎湃 4 原生动作未启用：请勾选小米桌面作用域";
         }
         if (!isSupportedHyperOs4Home(info)) {
-            return "当前澎湃 4 桌面版本（"
-                    + HyperOs4Compatibility.profileName(
-                    info == null ? 0L : info.getLongVersionCode())
-                    + "）不在已验证 ABI 范围内，桌面动作已关闭";
+            return "当前桌面类型不适用原生动作后端";
         }
         String profile = HyperOs4Compatibility.profileName(info.getLongVersionCode());
         return switch (process) {
             case "运行中" -> "澎湃 4 原生动作（" + profile
-                    + "）已识别；native_init 完成 ABI 校验后可用，请再用 TalkBack 测试";
-            case "未运行" -> "澎湃 4 原生动作（" + profile + "）已启用；桌面进程启动后可用";
-            default -> "澎湃 4 原生动作（" + profile + "）已识别；正在确认 native ABI 状态";
+                    + "）按实际接口启用；移动接口不兼容时保留已兼容的基础动作";
+            case "未运行" -> "澎湃 4 原生动作等待桌面启动并检测接口";
+            default -> "当前桌面按实际接口检测兼容性；无法读取进程状态不代表桌面未运行。请在桌面检查可用操作";
         };
     }
 
@@ -449,11 +496,61 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
     }
 
     private void shareLogs() {
+        if (exportingLogs) return;
         if (!LogStore.hasLogs(this)) {
             aboutStatus.setText(R.string.no_logs);
             return;
         }
-        LogStore.append(this, "app", "用户请求发送日志");
+        exportingLogs = true;
+        loggingSwitch.setEnabled(false);
+        findViewById(R.id.send_logs).setEnabled(false);
+        aboutStatus.setText(R.string.preparing_logs);
+        String summary = diagnosticsSummary();
+        backgroundExecutor.execute(() -> {
+            try {
+                LogStore.append(this, "app", "用户请求发送日志");
+                LogStore.prepareExport(this, summary);
+                runOnUiThread(() -> finishLogExport(true));
+            } catch (IOException | RuntimeException failure) {
+                LogStore.append(this, "app", "整理日志失败 " + failure.getClass().getSimpleName());
+                runOnUiThread(() -> finishLogExport(false));
+            }
+        });
+    }
+
+    private void refreshLogStatus() {
+        ((TextView) findViewById(R.id.logging_connection_status)).setText(
+                getString(R.string.logging_connection_status, LogStore.nativeStatus(this)));
+        findViewById(R.id.send_logs).setEnabled(!exportingLogs && LogStore.hasLogs(this));
+    }
+
+    private String diagnosticsSummary() {
+        String readers = Settings.Secure.getString(getContentResolver(),
+                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+        return "ActionGrid diagnostics\nExported: " + java.time.Instant.now()
+                + "\nModule: " + BuildConfig.VERSION_NAME + " (" + BuildConfig.VERSION_CODE + ")"
+                + "\nDevice: " + Build.MANUFACTURER + " " + Build.MODEL
+                + "\nAndroid: " + Build.VERSION.RELEASE + " SDK " + Build.VERSION.SDK_INT
+                + "\nBuild: " + Build.FINGERPRINT
+                + "\nLauncher: " + homeStatus.getText()
+                + "\nFramework: " + moduleStatus.getText()
+                + "\nScope: " + scopeStatus.getText()
+                + "\nProcess: " + desktopProcessStatus.getText()
+                + "\nAccessibility services: " + (readers == null ? "none" : readers)
+                + "\nNative diagnostics: " + LogStore.nativeStatus(this)
+                + "\nTimes in UTC; native time=Unix seconds.\n";
+    }
+
+    private void finishLogExport(boolean success) {
+        if (isDestroyed()) return;
+        exportingLogs = false;
+        loggingSwitch.setEnabled(true);
+        refreshLogStatus();
+        if (!success) {
+            aboutStatus.setText(R.string.export_logs_failed);
+            return;
+        }
+        aboutStatus.setText(R.string.logs_ready);
         Intent send = new Intent(Intent.ACTION_SEND)
                 .setType("text/plain")
                 .putExtra(Intent.EXTRA_STREAM, DiagnosticsProvider.LOG_URI)
@@ -462,7 +559,11 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
                 DiagnosticsProvider.LOG_URI));
         Intent chooser = Intent.createChooser(send, getString(R.string.share_logs))
                 .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-        startActivity(chooser);
+        try {
+            startActivity(chooser);
+        } catch (RuntimeException failure) {
+            aboutStatus.setText(R.string.share_logs_failed);
+        }
     }
 
     private void openSourceRepository() {
@@ -474,55 +575,83 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
     }
 
     private void checkUpdates(boolean manual) {
+        UpdateSource source = UpdateState.source(this);
         checkUpdates.setEnabled(false);
         if (manual) {
-            aboutStatus.setText(R.string.checking_updates);
+            aboutStatus.setText(getString(R.string.checking_updates, source.label()));
         }
         backgroundExecutor.execute(() -> {
             try {
-                UpdateManifest manifest = UpdateClient.fetch();
-                runOnUiThread(() -> handleUpdateResult(manifest, manual));
+                UpdateManifest manifest = UpdateClient.fetch(source);
+                runOnUiThread(() -> handleUpdateResult(manifest, source, manual));
             } catch (IOException | IllegalArgumentException exception) {
                 LogStore.append(this, "app", "更新检查失败 "
-                        + exception.getClass().getSimpleName());
+                        + source.label() + " " + exception.getClass().getSimpleName());
                 runOnUiThread(() -> {
                     checkUpdates.setEnabled(true);
                     if (manual) {
-                        aboutStatus.setText(R.string.update_failed);
+                        aboutStatus.setText(getString(R.string.update_failed, source.label()));
                     }
                 });
             }
         });
     }
 
-    private void handleUpdateResult(UpdateManifest manifest, boolean manual) {
+    private void handleUpdateResult(UpdateManifest manifest, UpdateSource source, boolean manual) {
         checkUpdates.setEnabled(true);
         if (isDestroyed()) {
             return;
         }
         if (manifest.versionCode() <= BuildConfig.VERSION_CODE) {
             if (manual) {
-                aboutStatus.setText(R.string.latest_version);
+                aboutStatus.setText(getString(R.string.latest_version, source.label()));
             }
             return;
         }
-        if (!manual && UpdateState.ignoredVersion(this) == manifest.versionCode()) {
+        if (!manual && UpdateState.ignoredVersion(this, source) == manifest.versionCode()) {
             return;
         }
         String changelog = manifest.changelog().isEmpty()
                 ? "暂无更新说明"
                 : "• " + String.join("\n• ", manifest.changelog());
         new AlertDialog.Builder(this)
-                .setTitle("ActionGrid 更新")
-                .setMessage(getString(R.string.update_available, manifest.versionName(), changelog))
+                .setTitle("ActionGrid 更新 · " + source.label())
+                .setMessage(getString(R.string.update_available, source.label(),
+                        manifest.versionName(), changelog))
                 .setNeutralButton(R.string.update_now,
                         (dialog, which) -> startDownload(manifest))
                 .setNegativeButton(R.string.cancel, null)
                 .setPositiveButton(R.string.ignore_version, (dialog, which) -> {
-                    UpdateState.ignore(this, manifest.versionCode());
+                    UpdateState.ignore(this, source, manifest.versionCode());
                     updateIgnoredStatus();
                 })
                 .show();
+    }
+
+    private void showUpdateSourceDialog() {
+        UpdateSource[] sources = UpdateSource.values();
+        UpdateSource selected = UpdateState.source(this);
+        String[] labels = new String[sources.length];
+        for (int index = 0; index < sources.length; index++) {
+            labels[index] = sources[index].label();
+        }
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.update_source_title)
+                .setSingleChoiceItems(labels, selected.ordinal(), (dialog, which) -> {
+                    UpdateSource source = sources[which];
+                    UpdateState.setSource(this, source);
+                    refreshUpdateSourceSummary();
+                    updateIgnoredStatus();
+                    aboutStatus.setText(getString(R.string.update_source_changed, source.label()));
+                    dialog.dismiss();
+                })
+                .setNegativeButton(R.string.cancel, null)
+                .show();
+    }
+
+    private void refreshUpdateSourceSummary() {
+        UpdateSource source = UpdateState.source(this);
+        updateSourceSummary.setText(getString(R.string.update_source_summary, source.label()));
     }
 
     private void startDownload(UpdateManifest manifest) {
@@ -561,7 +690,7 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
     }
 
     private void updateIgnoredStatus() {
-        int ignored = UpdateState.ignoredVersion(this);
+        int ignored = UpdateState.ignoredVersion(this, UpdateState.source(this));
         TextView text = findViewById(R.id.ignored_version);
         View restore = findViewById(R.id.restore_update_prompts);
         if (ignored <= 0) {

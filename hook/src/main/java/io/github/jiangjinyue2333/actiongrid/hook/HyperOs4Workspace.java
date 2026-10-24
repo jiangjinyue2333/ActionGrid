@@ -30,6 +30,7 @@ final class HyperOs4Workspace {
     private static final String ICON_RESOURCE_ID = "com.miui.home:id/icon_icon";
     private static final String FOLDER_RESOURCE_ID = "com.miui.home:id/folder";
     private static final String SCREEN_RESOURCE_ID = "com.miui.home:id/screen_content";
+    private static final String WORKSPACE_RESOURCE_ID = "com.miui.home:id/workspace";
     private static final String HOTSEAT_RESOURCE_ID = "com.miui.home:id/hotseat";
     private static final long NODE_MAX_AGE_MILLIS = 30_000L;
     private static final long FAVORITES_REFRESH_THROTTLE_MILLIS = 300L;
@@ -232,7 +233,7 @@ final class HyperOs4Workspace {
             ObservedIcon icon = new ObservedIcon(sourceNodeId(node), bounds);
             if (isInsideHost(node, nodes, HOTSEAT_RESOURCE_ID)) {
                 hotseat.add(icon);
-            } else if (isInsideHost(node, nodes, SCREEN_RESOURCE_ID)
+            } else if (isInsideDesktopHost(node, nodes)
                     || bounds.centerY() < displayHeight * 4 / 5) {
                 desktop.add(icon);
             }
@@ -252,7 +253,43 @@ final class HyperOs4Workspace {
             int displayWidth,
             int displayHeight
     ) throws ReflectiveOperationException {
-        if (icons.size() < 2) {
+        if (icons.isEmpty()) {
+            return;
+        }
+        AccessibilityNodeInfo host = findHostNode(nodes, icons, kind);
+        Rect hostBounds = host == null ? new Rect() : bounds(host);
+        if (icons.size() == 1 && hostBounds.isEmpty()) {
+            return;
+        }
+        if (kind == GridKind.DESKTOP) {
+            for (AccessibilityNodeInfo node : nodes) {
+                if (!HOTSEAT_RESOURCE_ID.equals(node.getViewIdResourceName())) {
+                    continue;
+                }
+                Rect hotseatBounds = bounds(node);
+                if (!hotseatBounds.isEmpty()
+                        && hotseatBounds.top > hostBounds.top
+                        && hotseatBounds.top < hostBounds.bottom) {
+                    hostBounds.bottom = Math.min(hostBounds.bottom, hotseatBounds.top);
+                    break;
+                }
+            }
+        }
+        if (icons.size() == 1 && (hostBounds.width() <= 0 || hostBounds.height() <= 0)) {
+            return;
+        }
+        if (icons.size() == 1) {
+            ObservedIcon icon = icons.get(0);
+            int minRows = kind == GridKind.DESKTOP ? 4 : 1;
+            int columns = inferGridCount(hostBounds.width(), icon.bounds().width(), 3, 10);
+            int rows = kind == GridKind.DESKTOP
+                    ? inferGridCount(hostBounds.height(), icon.bounds().height(), minRows, 12) : 1;
+            if (columns <= 0 || rows <= 0) {
+                return;
+            }
+            long hostId = sourceNodeId(host);
+            window.grids.put(hostId, new Grid(hostId, kind, hostBounds,
+                    columns, rows, observedAt));
             return;
         }
         List<Integer> xCenters = clusterCenters(icons, true);
@@ -269,17 +306,31 @@ final class HyperOs4Workspace {
         if (xGap <= 0 || yGap <= 0) {
             return;
         }
-        Rect gridBounds = new Rect(
+        Rect gridBounds = hostBounds.isEmpty()
+                ? new Rect(
                 Math.max(0, xCenters.get(0) - xGap / 2),
                 Math.max(0, yCenters.get(0) - yGap / 2),
                 Math.min(displayWidth, xCenters.get(xCenters.size() - 1) + xGap / 2),
-                Math.min(displayHeight, yCenters.get(yCenters.size() - 1) + yGap / 2));
+                Math.min(displayHeight, yCenters.get(yCenters.size() - 1) + yGap / 2))
+                : new Rect(
+                Math.max(hostBounds.left, xCenters.get(0) - xGap / 2),
+                Math.max(hostBounds.top, yCenters.get(0) - yGap / 2),
+                Math.min(hostBounds.right, xCenters.get(xCenters.size() - 1) + xGap / 2),
+                Math.min(hostBounds.bottom, yCenters.get(yCenters.size() - 1) + yGap / 2));
         if (gridBounds.width() <= 0 || gridBounds.height() <= 0) {
             return;
         }
-        long hostId = findHostNodeId(nodes, icons, kind);
+        long hostId = host == null ? icons.get(0).nodeId() : sourceNodeId(host);
         window.grids.put(hostId, new Grid(hostId, kind, gridBounds,
                 xCenters.size(), yCenters.size(), observedAt));
+    }
+
+    private static int inferGridCount(int extent, int cellSize, int minimum, int maximum) {
+        if (extent <= 0 || cellSize <= 0) {
+            return 0;
+        }
+        return Math.max(minimum, Math.min(maximum,
+                Math.round((float) extent / cellSize)));
     }
 
     private static List<Integer> clusterCenters(List<ObservedIcon> icons, boolean horizontal) {
@@ -330,24 +381,34 @@ final class HyperOs4Workspace {
         return gaps.get(gaps.size() / 2);
     }
 
-    private long findHostNodeId(
+    private AccessibilityNodeInfo findHostNode(
             List<AccessibilityNodeInfo> nodes,
             List<ObservedIcon> icons,
             GridKind kind
     ) throws ReflectiveOperationException {
-        String resourceId = kind == GridKind.HOTSEAT ? HOTSEAT_RESOURCE_ID : SCREEN_RESOURCE_ID;
+        String primary = kind == GridKind.HOTSEAT ? HOTSEAT_RESOURCE_ID : SCREEN_RESOURCE_ID;
         int centerX = icons.get(0).bounds().centerX();
         int centerY = icons.get(0).bounds().centerY();
         for (AccessibilityNodeInfo node : nodes) {
-            if (!resourceId.equals(node.getViewIdResourceName())) {
+            String resourceId = node.getViewIdResourceName();
+            if (!(primary.equals(resourceId)
+                    || (kind == GridKind.DESKTOP && WORKSPACE_RESOURCE_ID.equals(resourceId)))) {
                 continue;
             }
             Rect bounds = bounds(node);
             if (bounds.contains(centerX, centerY)) {
-                return sourceNodeId(node);
+                return node;
             }
         }
-        return icons.get(0).nodeId();
+        return null;
+    }
+
+    private static boolean isInsideDesktopHost(
+            AccessibilityNodeInfo node,
+            List<AccessibilityNodeInfo> nodes
+    ) {
+        return isInsideHost(node, nodes, SCREEN_RESOURCE_ID)
+                || isInsideHost(node, nodes, WORKSPACE_RESOURCE_ID);
     }
 
     private static boolean isInsideHost(
@@ -400,14 +461,20 @@ final class HyperOs4Workspace {
         purge(window, now);
         List<DropTarget> targets = new ArrayList<>();
         Grid desktop = latestGrid(window, GridKind.DESKTOP, now);
-        if (desktop != null && window.desktopScreen != HyperOs4Compatibility.NO_SCREEN) {
+        HyperOs4Compatibility.FavoriteCell source = favorite(sourceItemId);
+        long desktopScreen = window.desktopScreen;
+        if (desktopScreen == HyperOs4Compatibility.NO_SCREEN && source != null
+                && source.container() == StableItemRef.CONTAINER_DESKTOP) {
+            desktopScreen = source.screenId();
+        }
+        if (desktop != null && desktopScreen != HyperOs4Compatibility.NO_SCREEN) {
             boolean[][] occupied = occupied(desktop.columns(), desktop.rows(),
-                    StableItemRef.CONTAINER_DESKTOP, window.desktopScreen);
+                    StableItemRef.CONTAINER_DESKTOP, desktopScreen);
             for (int row = 0; row < desktop.rows(); row++) {
                 for (int column = 0; column < desktop.columns(); column++) {
                     if (!occupied[column][row]) {
                         targets.add(target(desktop,
-                                StableItemRef.CONTAINER_DESKTOP, window.desktopScreen,
+                                StableItemRef.CONTAINER_DESKTOP, desktopScreen,
                                 column, row, "桌面，第" + (row + 1) + "行第"
                                         + (column + 1) + "列，空白"));
                     }
