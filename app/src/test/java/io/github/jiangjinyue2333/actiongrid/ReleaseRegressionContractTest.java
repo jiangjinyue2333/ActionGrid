@@ -393,16 +393,16 @@ public final class ReleaseRegressionContractTest {
     }
 
     @Test
-    public void nativePagerAnnouncementUsesScrollEvents() throws IOException {
+    public void nativePagerRewritesScrollEventsWithTalkBackAnnouncements() throws IOException {
         Path local = Path.of("src", "main", "cpp", "native_init.cpp");
         Path path = Files.exists(local) ? local : Path.of("app").resolve(local);
         String nativeSource = Files.readString(path);
 
         assertTrue(nativeSource.contains("kTypeViewScrolled = 4096"));
         assertTrue(nativeSource.contains("kTypeAnnouncement = 16384"));
-        assertTrue(nativeSource.contains("AccessibilityEvent_record_set_item_count"));
-        assertTrue(nativeSource.contains("AccessibilityEvent_record_set_from_index"));
-        assertTrue(nativeSource.contains("AccessibilityEvent_record_set_to_index"));
+        String announcement = between(nativeSource, "bool announceConfirmedPage(",
+                "bool rewritePageScrollEvent(");
+        assertTrue(announcement.contains("sendAnnouncementWithSource("));
         assertTrue(nativeSource.contains("AccessibilityEvent_record_push_text"));
         assertTrue(nativeSource.contains("onSendEvent"));
         assertTrue(nativeSource.contains("kTypeWindowContentChanged = 2048"));
@@ -570,6 +570,15 @@ public final class ReleaseRegressionContractTest {
         assertTrue(virtualNode.contains("!moveActionsReady()"));
         assertTrue(action.contains("if (lifted)"));
         assertTrue(action.contains("lifted && !liftedSource && moveReady"));
+    }
+
+    @Test
+    public void nativePageCapabilityIsCheckedAfterColdStartStringResolution() throws IOException {
+        String nativeSource = Files.readString(projectPath("app/src/main/cpp/native_init.cpp"));
+        String resolve = nativeSource.substring(nativeSource.indexOf("void resolvePublic(void *handle) {"));
+        int strings = resolve.indexOf("g_rstring_from_utf16 = reinterpret_cast<RStringFromUtf16Fn>");
+        int capability = resolve.indexOf("const bool announcementReady =");
+        assertTrue(strings >= 0 && capability > strings);
     }
 
     @Test

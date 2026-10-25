@@ -82,14 +82,6 @@ struct CapturedEvent {
     std::u16string text;
 };
 std::vector<CapturedEvent> events;
-int32_t capturedItemCount = -1;
-int32_t capturedFromIndex = -1;
-int32_t capturedToIndex = -1;
-
-void captureItemCount(void *, int32_t value) { capturedItemCount = value; }
-void captureFromIndex(void *, int32_t value) { capturedFromIndex = value; }
-void captureToIndex(void *, int32_t value) { capturedToIndex = value; }
-
 // Capture only Android ABI boundaries; the hooks and state machine are production code.
 struct AccessibilityCapture {
     AccessibilityCapture() {
@@ -132,8 +124,6 @@ struct AccessibilityCapture {
         g_event_controller.store(nullptr);
         g_event_new = nullptr; g_event_drop = nullptr;
         g_event_set_source = nullptr; g_rstring_from_utf16 = nullptr;
-        g_event_set_item_count = nullptr; g_event_set_from_index = nullptr;
-        g_event_set_to_index = nullptr;
         g_event_push_text = nullptr; g_original_send_event = nullptr;
         g_original_create_node = nullptr; g_create_node = nullptr; g_node_drop = nullptr;
         g_original_perform_action = nullptr; g_node_add_child = nullptr;
@@ -179,30 +169,55 @@ void missingPageBoundsKeepConfirmedGrid() {
             "a transient host-bounds loss invalidated the confirmed virtual target");
 }
 
-void pageAnnouncementUsesNativeRecordWhenAvailable() {
+void incompleteNodeTreeKeepsDatabaseCellsOccupied() {
+    AccessibilityCapture capture;
+    prepareGrid();
+    g_snapshot.ready = true;
+    g_snapshot.favorites.clear();
+    for (int32_t row = 0; row < 6; ++row) {
+        for (int32_t column = 0; column < 4; ++column) {
+            SnapshotFavorite favorite;
+            favorite.id = 100 + row * 4 + column;
+            favorite.placement = {favorite.id, kDesktopContainer, 3,
+                    column, row, 1, 1, 0};
+            g_snapshot.favorites.push_back(favorite);
+        }
+    }
+    rebuildSlots();
+    require(g_slots.empty() && !isVirtualNode(virtualNodeAt(150, 50)),
+            "incomplete accessibility tree exposed occupied desktop cells as empty");
+}
+
+void liftedSourceCellIsAvailableForDrop() {
+    AccessibilityCapture capture;
+    prepareGrid();
+    g_lifted_screen.store(g_visible_screen.load());
+    g_sources = {g_workspace[1]};
+    SnapshotFavorite favorite;
+    favorite.id = 101;
+    favorite.placement = {101, kDesktopContainer, 3, 0, 0, 1, 1, 0};
+    g_snapshot.favorites = {favorite};
+    g_source_placements = {favorite.placement};
+    rebuildSlots();
+    require(isVirtualNode(virtualNodeAt(50, 50)),
+            "the lifted icon still occupied its original desktop cell");
+    g_visible_screen.store(3);
+    g_snapshot.favorites.clear();
+    rebuildSlots();
+    require(!isVirtualNode(virtualNodeAt(50, 50)),
+            "a reused node ID on another page was mistaken for the lifted source");
+}
+
+void pageAnnouncementUsesTalkBackAnnouncementRecord() {
     AccessibilityCapture capture;
     g_snapshot.ready = true;
     g_snapshot.pageCounts = {{2, 7}};
     g_page_state_known.store(true);
     g_visible_screen.store(0);
     g_total_pages.store(3);
-    capturedItemCount = capturedFromIndex = capturedToIndex = -1;
-    g_event_set_item_count = captureItemCount;
-    g_event_set_from_index = captureFromIndex;
-    g_event_set_to_index = captureToIndex;
-    require(announceConfirmedPage(2, {10, 8, 30}) && events.size() == 1
-                    && events.back().type == kTypeViewScrolled
-                    && capturedItemCount == 3 && capturedFromIndex == 1
-                    && capturedToIndex == 1,
-            "native accessibility suite did not receive a scroll page record");
-    events.clear();
-    g_announced_page = -1;
-    g_event_set_item_count = nullptr;
-    g_event_set_from_index = nullptr;
-    g_event_set_to_index = nullptr;
     require(announceConfirmedPage(2, {10, 8, 30}) && events.size() == 1
                     && events.back().type == kTypeAnnouncement,
-            "older native accessibility suite lost the announcement fallback");
+            "page speech did not use the TalkBack announcement record");
 }
 
 void restoreNativeEventController() {
@@ -404,7 +419,7 @@ void pageSpeechHandlesWorkspaceAnnouncementSources() {
     // Recorded public ABI: window is at 0xc4; 0x90 is unrelated record state.
     putField(event, 0x90, int32_t{-1});
     putField(event, 0xc4, int32_t{8});
-    putString(event, kEventTextOffset, "第 2 页共 8 页");
+    putString(event, kEventTextOffset, "\n第 2 页共 8 页\n");
     putField(event, 0x38, size_t{64}); // Rust String capacity may exceed its length.
     bool suppressed = false;
     require(rewritePageScrollEvent(event.data(), suppressed) && suppressed
@@ -417,6 +432,28 @@ void pageSpeechHandlesWorkspaceAnnouncementSources() {
     putString(event, kEventTextOffset, "已打开文件夹");
     require(!rewritePageScrollEvent(event.data(), suppressed) && !suppressed,
             "unrelated native speech was suppressed");
+}
+
+void pageSpeechInterceptsAnnouncementDuringFocusCallback() {
+    AccessibilityCapture capture;
+    g_snapshot.ready = true;
+    g_snapshot.pageCounts = {{2, 11}};
+    g_page_state_known.store(true);
+    g_total_pages.store(8);
+    g_visible_screen.store(0);
+    g_workspace_host_id.store(7);
+    g_workspace_window_id.store(8);
+    g_launcher_window_focused.store(0);
+
+    TestNode event{};
+    putField(event, kEventTypeOffset, kTypeAnnouncement);
+    putField(event, kEventSourceOffset, (uint64_t{30} << 32U) | 7U);
+    putField(event, kEventWindowOffset, int32_t{8});
+    putString(event, kEventTextOffset, "第 2 页共 8 页");
+    bool suppressed = false;
+    require(rewritePageScrollEvent(event.data(), suppressed) && suppressed
+                    && events.size() == 1 && events.back().text == u"第 2 页共 11 项",
+            "focus callback allowed the raw page-count announcement through");
 }
 
 void pageSpeechSurvivesNativeWorkspaceSourceRebuild() {
@@ -452,6 +489,33 @@ void pageSpeechSurvivesNativeWorkspaceSourceRebuild() {
                     && events.size() == 2 && events.back().text == u"第 3 页共 17 项"
                     && g_workspace_window_id.load() == 9,
             "a rebuilt native workspace source fell back to the launcher's page speech");
+}
+
+void announcedPageRebuildsAReusedGridHost() {
+    AccessibilityCapture capture;
+    prepareGrid();
+    g_snapshot.ready = true;
+    g_snapshot.pageCounts = {{4, 1}};
+    SnapshotFavorite folder;
+    folder.id = 101;
+    folder.placement = {101, kDesktopContainer, 4, 2, 3, 1, 1, 2};
+    g_snapshot.favorites = {folder};
+    g_virtual_focused_id.store(virtualNodeAt(150, 50));
+    TestNode event{};
+    putField(event, kEventTypeOffset, kTypeAnnouncement);
+    putField(event, kEventSourceOffset, kFlutterPageAnnouncementSource);
+    putField(event, kEventWindowOffset, int32_t{8});
+    putString(event, kEventTextOffset, "第 4 页共 8 页");
+    bool suppressed = false;
+    require(rewritePageScrollEvent(event.data(), suppressed) && suppressed,
+            "page event did not confirm the new page");
+    returnedNode = testNode(10, -1, {0, 0, 400, 600}, "com.miui.home:id/screen_content", "");
+    g_node_drop = +[](void *) {};
+    onCreateNode(reinterpret_cast<void *>(1), 10);
+    require(g_grid_screen == 3 && g_slots.size() == 23,
+            "reused page host retained the previous page's empty cells");
+    require(g_virtual_focused_id.load() == -1,
+            "page change retained a virtual focus from the old page");
 }
 
 void moveUsesCachedFavoriteWhenSnapshotResolutionFails() {
@@ -495,6 +559,56 @@ void pendingPlacementRequiresTheDestinationPage() {
     g_visible_screen.store(2);
     observePendingPlacement(icon);
     require(g_pending_placements.front().visible, "destination icon did not confirm the move");
+}
+
+int placementFocusCalls = 0;
+void backCancellationRestoresTheSourceOnTheNextQuery() {
+    AccessibilityCapture capture;
+    prepareGrid();
+    g_lifted_screen.store(g_visible_screen.load());
+    g_source = g_workspace[1];
+    g_sources = {g_source};
+    g_source_placements = {{101, kDesktopContainer, 3, 0, 0, 1, 1, 0}};
+    placementFocusCalls = 0;
+    g_original_perform_action = +[](void *, int32_t id, int32_t action, void *arguments) {
+        require(id == 92 && action == kAccessibilityFocusAction && arguments != nullptr
+                        && static_cast<uintptr_t *>(arguments)[0] == 1,
+                "Back focused the wrong source or used an invalid Bundle");
+        ++placementFocusCalls;
+        return true;
+    };
+    require(cancelLiftSession(11), "Back did not cancel the lift");
+    returnedNode = testNode(92, 10, {0, 0, 100, 100}, "com.miui.home:id/icon_icon", "QQ");
+    onCreateNode(reinterpret_cast<void *>(1), 92);
+    require(placementFocusCalls == 1 && g_pending_placements.empty(),
+            "Back lost the source focus or left a stale restore request");
+}
+
+void placedIconReceivesFocusOnceAfterLiftCleanup() {
+    AccessibilityCapture capture;
+    prepareGrid();
+    struct Cleanup { ~Cleanup() { endPendingPlacement(); } } cleanup;
+    beginPendingPlacement({{{101, kDesktopContainer, 3, 1, 0, 1, 1, 0},
+            "QQ", {100, 0, 200, 100}, false}});
+    placementFocusCalls = 0;
+    g_original_perform_action = +[](void *, int32_t id, int32_t action, void *arguments) {
+        require(id == 92 && action == kAccessibilityFocusAction,
+                "placement focused an unrelated node");
+        require(arguments != nullptr && static_cast<uintptr_t *>(arguments)[0] == 1
+                        && static_cast<uintptr_t *>(arguments)[1] == 0,
+                "focus action would drop an invalid native Bundle");
+        ++placementFocusCalls;
+        return true;
+    };
+    returnedNode = testNode(91, 10, {100, 0, 200, 100}, "com.miui.home:id/icon_icon", "QQ");
+    onCreateNode(reinterpret_cast<void *>(1), 91);
+    require(placementFocusCalls == 0, "focus moved before lift cleanup");
+    clearLiftSession();
+    returnedNode = testNode(92, 10, {100, 0, 200, 100}, "com.miui.home:id/icon_icon", "QQ");
+    onCreateNode(reinterpret_cast<void *>(1), 92);
+    require(placementFocusCalls == 1, "placed icon did not regain accessibility focus");
+    onCreateNode(reinterpret_cast<void *>(1), 92);
+    require(placementFocusCalls == 1, "repeated node reads stole focus again");
 }
 
 void cancelledSwipeKeepsConfirmedPage() {
@@ -948,11 +1062,23 @@ void placementKeepsNodesObservedDuringDispatch() {
 }
 
 void cancelRemovesVirtualGridAndFocus() {
+    AccessibilityCapture capture;
     prepareGrid();
+    g_source = g_workspace[1];
+    placementFocusCalls = 0;
+    g_original_perform_action = +[](void *, int32_t id, int32_t action, void *arguments) {
+        require(id == 11 && action == kAccessibilityFocusAction && arguments != nullptr
+                        && static_cast<uintptr_t *>(arguments)[0] == 1
+                        && static_cast<uintptr_t *>(arguments)[1] == 0,
+                "cancel did not restore the source with a native None Bundle");
+        ++placementFocusCalls;
+        return true;
+    };
     updateTouchExplorationTarget(9, 150, 50);
-    require(onPerformAction(nullptr, 10, kCancelAction, nullptr), "cancel failed");
+    require(onPerformAction(reinterpret_cast<void *>(1), 10, kCancelAction, nullptr), "cancel failed");
     require(!g_lifted.load() && g_slots.empty() && g_grid_cells.empty()
-            && g_virtual_focused_id.load() == -1, "cancel left stale grid or focus");
+            && g_virtual_focused_id.load() == -1 && placementFocusCalls == 1,
+            "cancel left stale grid or focus");
 }
 
 std::vector<int64_t> childIds;
@@ -1010,22 +1136,29 @@ void returningHomeKeepsActionsOnNodesBuiltDuringFocusCallback() {
     }
 }
 
-void checkDropKeepsTheFavoriteCapturedAtLift(bool folder) {
+void checkDropKeepsTheFavoriteCapturedAtLift(bool folder, bool resourceTitle = false) {
     AccessibilityCapture capture;
     prepareGrid();
     g_lifted.store(false);
     g_visible_screen.store(3);
     SnapshotFavorite app;
     app.id = 101; app.title = folder ? "旅行交通" : "美团外卖";
+    if (resourceTitle) app.title = "com.miui.home:string/default_folder_title_tools";
     app.placement = {101, kDesktopContainer, 4, 0, 0, 1, 1, folder ? 2 : 0};
     g_snapshot.ready = true;
     g_snapshot.favorites = {app};
+    if (resourceTitle) {
+        auto other = app;
+        other.id = other.placement.id = 102;
+        other.placement.cellX = 3;
+        g_snapshot.favorites.push_back(other);
+    }
     readerTree.clear();
     readerTree.emplace(-1, testNode(10, -1, {0, 0, 400, 600},
             "com.miui.home:id/screen_content", "第 4 页共 4 页"));
     readerTree.emplace(90, testNode(90, 10, {0, 0, 100, 100},
             folder ? "com.miui.home:id/folder" : "com.miui.home:id/icon_icon",
-            app.title.c_str()));
+            resourceTitle ? "系统工具" : app.title.c_str()));
     childIds = {(int64_t{90} << 32) | 7};
     setChildren(readerTree.at(-1), childIds);
     g_original_create_node = +[](void *, int32_t id) -> NodeResult {
@@ -1038,6 +1171,20 @@ void checkDropKeepsTheFavoriteCapturedAtLift(bool folder) {
             "single application could not be lifted");
     require(g_source_placements.size() == 1 && g_source_placements[0].id == 101,
             "lift did not capture the database favorite identity");
+    if (resourceTitle) {
+        const Bounds bounds{0, 0, 100, 100};
+        AppTarget target;
+        require(!resolveAppTarget(90, "系统工具", target, 3, 2, &bounds),
+                "resource folder used the grid from another page");
+        require(!resolveAppTarget(90, "系统工具", target, 4, 2),
+                "resource folder resolved without physical bounds");
+        auto duplicate = app;
+        duplicate.id = duplicate.placement.id = 103;
+        g_snapshot.favorites.push_back(duplicate);
+        require(!resolveAppTarget(90, "系统工具", target, 4, 2, &bounds),
+                "ambiguous folder records selected an arbitrary favorite");
+        g_snapshot.favorites.pop_back();
+    }
     // A refreshed app label must not change the identity of an already lifted item.
     g_snapshot.favorites[0].title = "外卖";
     ++g_snapshot.generation;
@@ -1079,6 +1226,10 @@ void singleAppDropKeepsTheFavoriteCapturedAtLift() {
 
 void folderDropKeepsTheFavoriteAcrossPages() {
     checkDropKeepsTheFavoriteCapturedAtLift(true);
+}
+
+void localizedFolderDropMatchesItsPhysicalCell() {
+    checkDropKeepsTheFavoriteCapturedAtLift(true, true);
 }
 
 void unresolvedSourceIsNotReportedAsNoSpace() {
@@ -1354,7 +1505,9 @@ int main() {
     const std::pair<const char *, void (*)()> tests[] = {
         {"single-icon page builds a complete physical grid", singleIconPageBuildsPhysicalGrid},
         {"missing page bounds preserve the confirmed grid", missingPageBoundsKeepConfirmedGrid},
-        {"native page announcement selects the supported event record", pageAnnouncementUsesNativeRecordWhenAvailable},
+        {"incomplete node tree keeps database cells occupied", incompleteNodeTreeKeepsDatabaseCellsOccupied},
+        {"lifted source cell is available for drop", liftedSourceCellIsAvailableForDrop},
+        {"page announcement uses the TalkBack announcement record", pageAnnouncementUsesTalkBackAnnouncementRecord},
         {"sparse grid keeps physical coordinates", sparseGridKeepsEmptyColumnsAndRows},
         {"traversal order keeps physical empty cells", traversalAfterKeepsEmptyCellsInPhysicalOrder},
         {"touch empty cell reads coordinates", touchingEmptyCellReadsItsCoordinates},
@@ -1374,9 +1527,13 @@ int main() {
         {"page speech failure preserves native fallback", pageSpeechFailurePreservesNativeFallback},
         {"page indicator keeps its default description", pageNodeKeepsDefaultDescriptionAndTotalPages},
         {"page speech accepts actual workspace node sources", pageSpeechHandlesWorkspaceAnnouncementSources},
+        {"page speech survives a transient focus loss", pageSpeechInterceptsAnnouncementDuringFocusCallback},
         {"page speech survives native workspace source rebuild", pageSpeechSurvivesNativeWorkspaceSourceRebuild},
+        {"announced page rebuilds a reused grid host", announcedPageRebuildsAReusedGridHost},
         {"move reuses cached favorite after source resolution failure", moveUsesCachedFavoriteWhenSnapshotResolutionFails},
         {"move visibility requires the destination page", pendingPlacementRequiresTheDestinationPage},
+        {"placed icon regains accessibility focus once", placedIconReceivesFocusOnceAfterLiftCleanup},
+        {"Back restores source focus on the next live query", backCancellationRestoresTheSourceOnTheNextQuery},
         {"move refresh notifies reader before waiting for its nodes", placementRefreshNotifiesReaderBeforeVisibilityWait},
         {"move rechecks persisted coordinates after reload", placementRechecksDatabaseAfterReload},
         {"move retains nodes observed during native dispatch", placementKeepsNodesObservedDuringDispatch},
@@ -1402,6 +1559,7 @@ int main() {
         {"returning Home keeps actions during native focus callback", returningHomeKeepsActionsOnNodesBuiltDuringFocusCallback},
         {"single app drop preserves captured favorite across snapshot refresh", singleAppDropKeepsTheFavoriteCapturedAtLift},
         {"folder drop preserves captured favorite across pages", folderDropKeepsTheFavoriteAcrossPages},
+        {"localized folder favorite matches the physical cell", localizedFolderDropMatchesItsPhysicalCell},
         {"source lookup failure is not a full desktop", unresolvedSourceIsNotReportedAsNoSpace},
         {"absent node has no readable payload", absentNativeNodeNeverDereferencesPayload},
         {"diagnostics disable and epoch isolation", diagnosticsBufferRespectsEpochs},

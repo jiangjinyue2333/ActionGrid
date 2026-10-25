@@ -24,6 +24,8 @@ public final class NativeActionsProbe extends Instrumentation {
     private boolean placed;
     private boolean placementConfirmed;
     private String sourceLabel;
+    private String pageBefore = "";
+    private boolean pageChanged;
     private final Rect sourceBounds = new Rect();
     private final Rect targetBounds = new Rect();
 
@@ -55,6 +57,10 @@ public final class NativeActionsProbe extends Instrumentation {
             SystemClock.sleep(1500);
             if (arguments.containsKey("inspect")) {
                 inspect(ui.getRootInActiveWindow());
+                AccessibilityNodeInfo focused = ui.findFocus(AccessibilityNodeInfo.FOCUS_ACCESSIBILITY);
+                output.append("ACCESSIBILITY_FOCUS ").append(focused == null ? "null"
+                        : focused.getContentDescription()).append('\n');
+                if (focused != null) focused.recycle();
                 result.putString("stream", output.toString());
                 finish(code, result);
                 return;
@@ -81,7 +87,7 @@ public final class NativeActionsProbe extends Instrumentation {
             if (arguments.containsKey("action")) {
                 StringBuilder visible = new StringBuilder();
                 String expected = arguments.getString("expect", "");
-                for (int attempt = 0; attempt < 12; attempt++) {
+                for (int attempt = 0; attempt < 20; attempt++) {
                     visible.setLength(0);
                     visitRoot(ui);
                     boolean moveAction = isMoveAction();
@@ -92,12 +98,20 @@ public final class NativeActionsProbe extends Instrumentation {
                         placementConfirmed = findPlacedIcon(ui.getRootInActiveWindow());
                     }
                     collectText(ui.getRootInActiveWindow(), visible);
+                    if (isPageAction()) {
+                        String pageAfter = findPageIndicator(ui.getRootInActiveWindow());
+                        pageChanged = !pageAfter.isEmpty() && !pageAfter.equals(pageBefore);
+                    }
                     if ((expected.isEmpty() || visible.toString().contains(expected))
+                            && (!isPageAction() || pageChanged)
                             && (!arguments.containsKey("requireVirtual") || virtualNodes > 0)
                             && (!arguments.containsKey("place") || placementConfirmed)) break;
                     SystemClock.sleep(250);
                 }
                 output.append("AFTER ").append(visible).append('\n');
+                if (isPageAction() && !pageChanged) {
+                    throw new AssertionError("Page action returned without changing the page: " + pageBefore);
+                }
                 if (!expected.isEmpty() && !visible.toString().contains(expected)) {
                     throw new AssertionError("Action returned without expected UI: " + expected);
                 }
@@ -148,6 +162,7 @@ public final class NativeActionsProbe extends Instrumentation {
                     .append(" selected=").append(node.isSelected())
                     .append(" checked=").append(node.isChecked())
                     .append(" checkable=").append(node.isCheckable())
+                    .append(" accessibilityFocused=").append(node.isAccessibilityFocused())
                     .append(" bounds=").append(bounds.toShortString())
                     .append(" parentBounds=").append(parentBounds.toShortString())
                     .append(" actions=").append(node.getActionList()).append('\n');
@@ -168,7 +183,7 @@ public final class NativeActionsProbe extends Instrumentation {
 
     private void visit(AccessibilityNodeInfo node) {
         if (node == null) return;
-        if ("com.miui.home:id/icon_icon".equals(node.getViewIdResourceName())) {
+        if (isDesktopItem(node)) {
             icons++;
             int ordinal = visitIconIndex++;
             String description = String.valueOf(node.getContentDescription());
@@ -220,12 +235,11 @@ public final class NativeActionsProbe extends Instrumentation {
                 int action = "page-next".equals(requestedMode)
                         ? AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
                         : AccessibilityNodeInfo.ACTION_SCROLL_FORWARD;
+                pageBefore = description;
                 executed = node.performAction(action);
                 output.append("CALLBACK ").append(executed).append('\n');
             }
-            if (description.startsWith("放置到第")
-                    || description.startsWith("桌面，第")
-                    || description.startsWith("底栏，第")) {
+            if (isPositionDescription(description)) {
                 virtualNodes++;
                 String focusTarget = arguments.getString("focusTarget", "");
                 if (arguments.containsKey("focusVirtual") && !focusedVirtual
@@ -255,6 +269,33 @@ public final class NativeActionsProbe extends Instrumentation {
 
     private boolean isMoveAction() {
         return requestedMode.startsWith("move-") || requestedAction.startsWith("移到 ");
+    }
+
+    private boolean isPageAction() {
+        return "page-next".equals(requestedMode) || "page-previous".equals(requestedMode);
+    }
+
+    private static boolean isDesktopItem(AccessibilityNodeInfo node) {
+        return "com.miui.home:id/icon_icon".equals(node.getViewIdResourceName())
+                || "com.miui.home:id/folder".equals(node.getViewIdResourceName());
+    }
+
+    private static boolean isPositionDescription(String description) {
+        return description.startsWith("移至第 ") || description.startsWith("放置到第")
+                || description.startsWith("桌面，第") || description.startsWith("底栏，第");
+    }
+
+    private static String findPageIndicator(AccessibilityNodeInfo node) {
+        if (node == null) return "";
+        CharSequence description = node.getContentDescription();
+        if (description != null && description.toString().startsWith("第 ")) {
+            return description.toString();
+        }
+        for (int i = 0; i < node.getChildCount(); i++) {
+            String page = findPageIndicator(node.getChild(i));
+            if (!page.isEmpty()) return page;
+        }
+        return "";
     }
 
     private boolean ordinalMatches(String key, int ordinal) {
@@ -292,12 +333,19 @@ public final class NativeActionsProbe extends Instrumentation {
     private void placeFirstVirtual(AccessibilityNodeInfo node) {
         if (node == null || placed) return;
         CharSequence description = node.getContentDescription();
-        if (description != null && (description.toString().startsWith("放置到第")
-                || description.toString().startsWith("桌面，第"))) {
-            node.getBoundsInScreen(targetBounds);
-            placed = node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
-            output.append("PLACE ").append(placed).append('\n');
-            return;
+        if (description != null && isPositionDescription(description.toString())) {
+            Rect bounds = new Rect();
+            node.getBoundsInScreen(bounds);
+            String requested = arguments.containsKey("placeRow")
+                    ? "移至第 " + arguments.getString("placeRow") + " 行第 "
+                    + arguments.getString("placeColumn") + " 列" : "";
+            if (!sourceBounds.contains(bounds.centerX(), bounds.centerY())
+                    && (requested.isEmpty() || requested.contentEquals(description))) {
+                targetBounds.set(bounds);
+                placed = node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                output.append("PLACE ").append(placed).append(' ').append(description).append('\n');
+                return;
+            }
         }
         for (int i = 0; i < node.getChildCount() && !placed; i++) {
             placeFirstVirtual(node.getChild(i));
@@ -319,7 +367,7 @@ public final class NativeActionsProbe extends Instrumentation {
             return "move-before".equals(requestedMode) ? order < 0 : order > 0;
         }
         if (targetBounds.isEmpty()) return false;
-        if ("com.miui.home:id/icon_icon".equals(node.getViewIdResourceName())
+        if (isDesktopItem(node)
                 && sourceLabel.equals(String.valueOf(node.getContentDescription()))) {
             Rect bounds = new Rect();
             node.getBoundsInScreen(bounds);
@@ -334,7 +382,7 @@ public final class NativeActionsProbe extends Instrumentation {
 
     private boolean findIconBounds(AccessibilityNodeInfo node, String label, Rect result) {
         if (node == null || label.isEmpty()) return false;
-        if ("com.miui.home:id/icon_icon".equals(node.getViewIdResourceName())
+        if (isDesktopItem(node)
                 && String.valueOf(node.getContentDescription()).startsWith(label)) {
             node.getBoundsInScreen(result);
             return true;
