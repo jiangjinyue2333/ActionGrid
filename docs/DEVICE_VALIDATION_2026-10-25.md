@@ -1,6 +1,6 @@
 # 7748 图标拖动与翻页播报真机验证
 
-2026-10-25，当前工作区修复，未发布新版本。设备为 Android 17 / HyperOS 4，系统桌面 `8.01.02.7748`。保留手机现有 TalkBack 服务，通过 Debug 专用 `NativeActionsProbe` 执行真实无障碍动作；探针使用 `FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES`。
+2026-10-25，以下为 0.4.14 所含修复的发布前验证；测试时 Debug 包版本仍为 0.4.13。设备为 Android 17 / HyperOS 4，系统桌面 `8.01.02.7748`。保留手机现有 TalkBack 服务，通过 Debug 专用 `NativeActionsProbe` 执行真实无障碍动作；探针使用 `FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES`。
 
 ## 原因与修复
 
