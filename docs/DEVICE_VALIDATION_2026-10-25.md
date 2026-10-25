@@ -1,6 +1,27 @@
-# 7748 图标拖动与翻页播报真机验证
+# 0.4.15 任意桌面页、图标拖动与翻页播报真机验证
 
-2026-10-25，以下为 0.4.14 所含修复的发布前验证；测试时 Debug 包版本仍为 0.4.13。设备为 Android 17 / HyperOS 4，系统桌面 `8.01.02.7748`。保留手机现有 TalkBack 服务，通过 Debug 专用 `NativeActionsProbe` 执行真实无障碍动作；探针使用 `FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES`。
+2026-10-25，0.4.15 Debug 包已安装在 Android 17 / HyperOS 4、小米桌面 `8.01.02.7748` 真机上。保留手机现有 TalkBack 服务，使用 Debug 专用 `NativeActionsProbe`、真实 UHID 触摸/滑动和桌面无障碍树验证；探针使用 `FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES`。
+
+## 当前版本结果
+
+- 冷启动后 7 页桌面节点数量为 `13、24、19、15、14、11、18`；逐页前进、反向返回、回桌面和重启桌面后，真实图标节点均重新出现，焦点分别恢复到相册、手机管家、DeepSeek、晨光阅读、蚂蚁阿福、UU 跑腿和夸克网盘。
+- 页码公告按当前页项目数播报，例如“第 2 页共 24 项”“第 3 页共 19 项”“第 7 页共 18 项”；正向、反向和冷启动都没有回退为“第 X 页共 X 页”，底栏和文件夹成员不计入。
+- 第 4 页 24 个虚拟格已连续右滑、反向左滑，空格可触摸、获取无障碍焦点并双击放置；放置后焦点落回真实图标，取消、系统返回和全局返回都清除虚拟网格并恢复源焦点。
+- 已通过图标前移、后移、第四页文件夹移到第三页、创建文件夹并移入应用、文件夹内前移/后移、首成员/末成员移出和空文件夹自动消失；每次都检查桌面节点、数据库位置和重新打开后的内容。
+- 重新安装后运行 `scripts/verify-native-probe.ps1 -Serial 192.168.1.36:33043` 通过，输出 `PASS: lifted paging and live occupied placement were confirmed; Home process remained stable.`
+
+当前设备布局允许保留，用户不要求还原。设备保持唤醒用于后续正式签名构建，结束收尾时才恢复原来的屏幕超时和锁屏状态。
+
+## 离线与构建回归
+
+- `gradlew.bat clean test lint assembleDebug assembleRelease --console=plain`：通过，186 个 Gradle task 成功；Java/C++ 测试、Lint、Debug 和 Release 均通过。Lint 保留 6 条既有构建配置/资源/SharedPreferences 警告，零错误。
+- `scripts/test-native-grid.ps1 -Serial 192.168.1.36:33043`：77 项通过，直接执行生产 C++ 网格、触摸、移动和焦点回归。
+- `scripts/test-native-policy.ps1`、`scripts/test-apk-abi.ps1 -ApkPath app/build/outputs/apk/release/app-release-unsigned.apk`、`scripts/verify-project-structure.ps1`：全部通过。
+- `verify-launcher-contract.py`：7748 加 Flutter 语义 ABI、8565 独立 profile 均通过；把 7748 语义结构套到 8565 的负例按预期拒绝。
+
+## 0.4.14 历史记录
+
+以下内容保留 0.4.14 的发布前记录；它的历史边界不代表 0.4.15 当前验收范围。
 
 ## 原因与修复
 

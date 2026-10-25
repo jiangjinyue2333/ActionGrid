@@ -53,12 +53,13 @@ ActionGrid/
 - 0.4.11 恢复页码指示器默认描述，仅替换自动翻页公告为当前页项目数；修正事件窗口与字符串 ABI，使原生旧公告能被正确去重。桌面文件夹按自身类型解析并保留托起时的 favorite ID，成功反馈使用系统桌面的托起、放置原文。见 `docs/RELEASE_0.4.11.md`。
 - 0.4.13 在桌面节点重建或快照解析短暂失败时继续复用托起阶段确认的 favorite 位置；原生 workspace host 更换窗口/节点后仍重写页码项目数播报。见 `docs/RELEASE_0.4.13.md`。
 - 0.4.14 修复页码能力的冷启动初始化、TalkBack 公告事件类型、跨页复用节点的网格刷新、默认文件夹资源名匹配及放置/取消后的焦点恢复。7748 真机与回归验证见 `docs/RELEASE_0.4.14.md`。
+- 0.4.15 将语义节点和焦点恢复扩展到任意桌面页，并修复虚拟网格触摸、滑动、放置、跨页移动、图标前后移动、文件夹内移动、移入移出和创建文件夹。7748 真机逐项验收见 `docs/RELEASE_0.4.15.md` 与 `docs/DEVICE_VALIDATION_2026-10-25.md`。
 - `zip_directory.h` 为 APK 中直接加载的 Rust 库定位 ZIP 尾记录，检查截断和注释长度，避免兼容性探测读取末尾以外的内存；同一 native 回归包含空 ZIP、注释与缺失尾记录。
 - `scripts/verify-launcher-contract.py` 从指定桌面 ELF 的真实跳转表验证 FRB 操作号、刷新入口及 `Vec<ItemInfo>` 解码调用链，证据见 `docs/LAUNCHER_7748_ABI.md`；不用于运行时猜测新接口。
 - 应用最低支持 Android 14，目标版本为 Android 17。
 - 关于页显示作者，并通过明确按钮打开 GitHub 源码仓库。
 - `UpdateSource` / `UpdateClient` / `UpdateState` 管理 GitHub 与 GitCode 更新来源；关于页显示当前来源并以原生单选对话框切换。GitHub 正式工作流用 `scripts/create-update-manifest.ps1` 从已验证 APK 生成 `latest.json` 并作为 Release 资产上传。
-- `README.md` 记录当前支持范围、7748 的真机验证边界、仅澎湃 3 的页码开关和文件夹限制。当前工作区的翻页、图标/文件夹移动及焦点验证见 `docs/DEVICE_VALIDATION_2026-10-25.md`。
+- `README.md` 记录当前支持范围、7748 的真机验证边界、仅澎湃 3 的页码开关和其他桌面版本的能力降级。当前工作区的任意页翻页、图标/文件夹移动及焦点验证见 `docs/DEVICE_VALIDATION_2026-10-25.md`。
 
 ## 签名构建
 

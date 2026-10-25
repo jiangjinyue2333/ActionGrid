@@ -224,7 +224,8 @@ public final class ReleaseRegressionContractTest {
                 "io.github.jiangjinyue2333.actiongrid.WeChatShortcutActivity"));
         assertFalse(nativeSource.contains("openLauncherUninstall"));
         assertFalse(nativeSource.contains("kLauncherContextClickAction"));
-        assertFalse(nativeSource.contains("injectTouch(down, 0, x, y)"));
+        String uninstall = between(nativeSource, "bool startUninstall(", "// Layout is verified");
+        assertFalse(uninstall.contains("injectTouch("));
         assertFalse(manifest.contains("android:name=\".UninstallActivity\""));
     }
 
@@ -330,8 +331,8 @@ public final class ReleaseRegressionContractTest {
         assertTrue(nativeSource.contains("sendEvent(nodeId, 32768)"));
         assertTrue(nativeSource.contains("g_event_push_text(event"));
         assertTrue(nativeSource.contains("virtualNodeDescription(nodeId)"));
-        assertTrue(touch.contains("sendEvent(target, 32768)"));
-        assertTrue(touch.contains("sendEvent(focused, 65536)"));
+        assertTrue(nativeSource.contains("sendEvent(previous, 65536)"));
+        assertTrue(nativeSource.contains("sendEvent(focused, 65536)"));
     }
 
     @Test
@@ -389,7 +390,7 @@ public final class ReleaseRegressionContractTest {
 
         assertTrue(lift.contains("source placement is the reliable page"));
         assertTrue(lift.contains("pageIndicatorSeen = true"));
-        assertTrue(lift.contains("g_visible_screen.store(placement.placement.screen - 1"));
+        assertTrue(lift.contains("g_visible_screen.store(visiblePage - 1"));
     }
 
     @Test
@@ -595,8 +596,8 @@ public final class ReleaseRegressionContractTest {
 
         assertTrue(probe.contains("\"page-next\".equals(requestedMode)"));
         assertTrue(probe.contains("virtualNodes = 0;"));
-        assertTrue(probe.contains("findIconBounds"));
-        assertTrue(probe.contains("? order < 0 : order > 0"));
+        assertTrue(probe.contains("collectOrderedItems"));
+        assertTrue(probe.contains("sourceIndex - targetIndex"));
         assertTrue(script.contains("-e action page-next"));
         assertTrue(script.contains("-e action page-previous"));
         assertTrue(script.contains("-e action move-after"));

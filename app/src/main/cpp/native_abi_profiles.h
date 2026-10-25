@@ -42,6 +42,8 @@ constexpr KnownFingerprint kLegacy7722LauncherFingerprint{
         0x6aafec65d595b957ULL, 0xd78ecbfd33f5b7afULL};
 constexpr KnownFingerprint kLegacy7748LauncherFingerprint{
         0x6018f13c7a9d6274ULL, 0xd0b4054c1d248904ULL};
+constexpr KnownFingerprint kLegacy7748FlutterFingerprint{
+        0xbf47eb419843a27cULL, 0x13d458eb64bb5168ULL};
 constexpr KnownFingerprint kCurrent8565LauncherFingerprint{
         0xd43e8de27a633a7eULL, 0x770a572f4b6ddfc6ULL};
 

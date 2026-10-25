@@ -8,6 +8,10 @@ import android.os.Bundle;
 import android.os.SystemClock;
 import android.view.accessibility.AccessibilityNodeInfo;
 
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+
 /** Debug-only device check. Requires an explicit adb am instrument invocation. */
 public final class NativeActionsProbe extends Instrumentation {
     private Bundle arguments;
@@ -23,6 +27,7 @@ public final class NativeActionsProbe extends Instrumentation {
     private boolean focusedVirtual;
     private boolean placed;
     private boolean placementConfirmed;
+    private boolean placementOnly;
     private String sourceLabel;
     private String pageBefore = "";
     private boolean pageChanged;
@@ -32,12 +37,17 @@ public final class NativeActionsProbe extends Instrumentation {
     @Override public void onCreate(Bundle args) {
         arguments = args == null ? Bundle.EMPTY : args;
         requestedMode = arguments.getString("action", "");
+        placementOnly = "place".equals(requestedMode);
         requestedAction = "lift".equals(requestedMode) ? "托起" : requestedMode;
         if ("uninstall".equals(requestedMode)) requestedAction = "卸载";
         if ("move-before".equals(requestedMode)) {
             requestedAction = "移到 " + arguments.getString("target", "") + "前面";
         } else if ("move-after".equals(requestedMode)) {
             requestedAction = "移到 " + arguments.getString("target", "") + "后面";
+        } else if ("folder".equals(requestedMode)) {
+            requestedAction = "放进 " + arguments.getString("target", "");
+        } else if ("create-folder".equals(requestedMode)) {
+            requestedAction = "和 " + arguments.getString("target", "") + " 创建文件夹";
         }
         start();
     }
@@ -46,16 +56,39 @@ public final class NativeActionsProbe extends Instrumentation {
         Bundle result = new Bundle();
         int code = -1;
         try {
-            UiAutomation ui = getUiAutomation(UiAutomation.FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES);
+            UiAutomation ui = getUiAutomation(arguments.containsKey("quietServices") ? 0
+                    : UiAutomation.FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES);
             android.accessibilityservice.AccessibilityServiceInfo info = ui.getServiceInfo();
             info.flags |= android.accessibilityservice.AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS;
             ui.setServiceInfo(info);
+            if (arguments.containsKey("quietServices")) {
+                SystemClock.sleep(9000);
+                finish(code, result);
+                return;
+            }
             if (!arguments.containsKey("stay")) {
                 getTargetContext().startActivity(new Intent(Intent.ACTION_MAIN)
                         .addCategory(Intent.CATEGORY_HOME).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
             }
             SystemClock.sleep(1500);
+            if (arguments.containsKey("globalBack")) {
+                output.append("GLOBAL_BACK ").append(ui.performGlobalAction(
+                        android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK)).append('\n');
+                SystemClock.sleep(750);
+            }
             if (arguments.containsKey("inspect")) {
+                if (arguments.containsKey("expectDesktop")) {
+                    AccessibilityNodeInfo root = ui.getRootInActiveWindow();
+                    List<AccessibilityNodeInfo> items = new ArrayList<>();
+                    collectOrderedItems(root, items, false);
+                    int expected = Integer.parseInt(arguments.getString("expectDesktop"));
+                    int actual = items.size();
+                    for (AccessibilityNodeInfo item : items) item.recycle();
+                    if (root != null) root.recycle();
+                    output.append("DESKTOP_ITEMS ").append(actual).append('\n');
+                    if (actual != expected) throw new AssertionError(
+                            "Desktop items: expected " + expected + ", found " + actual);
+                }
                 inspect(ui.getRootInActiveWindow());
                 AccessibilityNodeInfo focused = ui.findFocus(AccessibilityNodeInfo.FOCUS_ACCESSIBILITY);
                 output.append("ACCESSIBILITY_FOCUS ").append(focused == null ? "null"
@@ -69,7 +102,7 @@ public final class NativeActionsProbe extends Instrumentation {
             if (nativeMenuVisible) {
                 throw new AssertionError("Native long-press menu action is still exposed");
             }
-            if (arguments.containsKey("action") && !executed) {
+            if (arguments.containsKey("action") && !executed && !placementOnly) {
                 for (int attempt = 0; attempt < 3 && !executed; attempt++) {
                     SystemClock.sleep(300);
                     visitRoot(ui);
@@ -87,13 +120,15 @@ public final class NativeActionsProbe extends Instrumentation {
             if (arguments.containsKey("action")) {
                 StringBuilder visible = new StringBuilder();
                 String expected = arguments.getString("expect", "");
-                for (int attempt = 0; attempt < 20; attempt++) {
+                for (int attempt = 0; attempt < (isFolderAction() ? 45 : 20); attempt++) {
+                    if (isFolderAction() || isMoveAction()) ui.clearCache();
                     visible.setLength(0);
                     visitRoot(ui);
                     boolean moveAction = isMoveAction();
                     if (arguments.containsKey("place") && !placed && !moveAction) {
                         placeFirstVirtual(ui.getRootInActiveWindow());
                     }
+                    if (placementOnly && placed) break;
                     if (placed || moveAction) {
                         placementConfirmed = findPlacedIcon(ui.getRootInActiveWindow());
                     }
@@ -104,11 +139,37 @@ public final class NativeActionsProbe extends Instrumentation {
                     }
                     if ((expected.isEmpty() || visible.toString().contains(expected))
                             && (!isPageAction() || pageChanged)
+                            && (!isFolderAction() || virtualNodes == 0)
                             && (!arguments.containsKey("requireVirtual") || virtualNodes > 0)
                             && (!arguments.containsKey("place") || placementConfirmed)) break;
                     SystemClock.sleep(250);
                 }
                 output.append("AFTER ").append(visible).append('\n');
+                if (isFolderAction()) {
+                    String source = arguments.getString("source", "");
+                    String folder = arguments.getString("folderName",
+                            arguments.getString("target", ""));
+                    if (source.isEmpty()) throw new AssertionError("Folder check requires source label");
+                    if (virtualNodes != 0 || !openNamedFolder(ui.getRootInActiveWindow(), folder)) {
+                        throw new AssertionError("Folder operation not completed or folder unavailable: " + folder);
+                    }
+                    StringBuilder contents = new StringBuilder();
+                    for (int attempt = 0; attempt < 20; attempt++) {
+                        SystemClock.sleep(350);
+                        ui.clearCache();
+                        AccessibilityNodeInfo grid = findResource(ui.getRootInActiveWindow(),
+                                "com.miui.home:id/folder_grid_view");
+                        contents.setLength(0);
+                        collectText(grid, contents);
+                        if (contents.toString().contains(source)) break;
+                        if (grid != null && attempt % 3 == 1) swipeFolder(ui, grid);
+                    }
+                    if (!contents.toString().contains(source)) {
+                        throw new AssertionError("Source missing in folder_grid_view: " + source);
+                    }
+                    output.append("FOLDER_CONTENTS ").append(contents).append('\n');
+                    placementConfirmed = true;
+                }
                 if (isPageAction() && !pageChanged) {
                     throw new AssertionError("Page action returned without changing the page: " + pageBefore);
                 }
@@ -134,8 +195,11 @@ public final class NativeActionsProbe extends Instrumentation {
                         if (focused != null) focused.recycle();
                     }
                 }
-                if (arguments.containsKey("place") && !placementConfirmed) {
+                if (arguments.containsKey("place") && !placementOnly && !placementConfirmed) {
                     throw new AssertionError("Placement was not confirmed in the accessibility tree");
+                }
+                if (placementOnly && !placed) {
+                    throw new AssertionError("Virtual placement action was not accepted");
                 }
             }
             output.append("PASS icons=").append(icons).append(" actions=").append(directActions)
@@ -167,12 +231,27 @@ public final class NativeActionsProbe extends Instrumentation {
                     .append(" parentBounds=").append(parentBounds.toShortString())
                     .append(" actions=").append(node.getActionList()).append('\n');
             String icon = arguments.getString("icon", "");
-            if (!executed && arguments.containsKey("builtin") && !icon.isEmpty()
-                    && (icon.contentEquals(String.valueOf(node.getContentDescription()))
-                    || icon.contentEquals(String.valueOf(node.getText())))) {
+            if (!executed && arguments.containsKey("builtin")
+                    && ((!icon.isEmpty() && (icon.contentEquals(String.valueOf(node.getContentDescription()))
+                    || icon.contentEquals(String.valueOf(node.getText()))))
+                    || (arguments.containsKey("resource") && arguments.getString("resource")
+                    .equals(node.getViewIdResourceName())))) {
                 executed = true;
-                output.append("BUILTIN ").append(node.performAction(
-                        Integer.parseInt(arguments.getString("builtin")))).append('\n');
+                int action = Integer.parseInt(arguments.getString("builtin"));
+                AccessibilityNodeInfo target = AccessibilityNodeInfo.obtain(node);
+                try {
+                    if (action == AccessibilityNodeInfo.ACTION_CLICK) {
+                        while (!target.isClickable()) {
+                            AccessibilityNodeInfo parent = target.getParent();
+                            if (parent == null) break;
+                            target.recycle();
+                            target = parent;
+                        }
+                    }
+                    output.append("BUILTIN ").append(target.performAction(action)).append('\n');
+                } finally {
+                    target.recycle();
+                }
                 if (arguments.containsKey("oneShot")) return;
             }
             for (int i = 0; i < node.getChildCount(); ++i) inspect(node.getChild(i));
@@ -271,6 +350,53 @@ public final class NativeActionsProbe extends Instrumentation {
         return requestedMode.startsWith("move-") || requestedAction.startsWith("移到 ");
     }
 
+    private boolean isFolderAction() {
+        return "folder".equals(requestedMode) || "create-folder".equals(requestedMode);
+    }
+
+    private boolean openNamedFolder(AccessibilityNodeInfo node, String label) {
+        if (node == null) return false;
+        if ("com.miui.home:id/folder".equals(node.getViewIdResourceName())
+                && label.contentEquals(String.valueOf(node.getContentDescription()))) {
+            return node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+        }
+        for (int i = 0; i < node.getChildCount(); i++) {
+            if (openNamedFolder(node.getChild(i), label)) return true;
+        }
+        return false;
+    }
+
+    private AccessibilityNodeInfo findResource(AccessibilityNodeInfo node, String resource) {
+        if (node == null) return null;
+        if (resource.equals(node.getViewIdResourceName())) return node;
+        for (int i = 0; i < node.getChildCount(); i++) {
+            AccessibilityNodeInfo found = findResource(node.getChild(i), resource);
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    private void swipeFolder(UiAutomation ui, AccessibilityNodeInfo grid) {
+        Rect bounds = new Rect();
+        grid.getBoundsInScreen(bounds);
+        long down = SystemClock.uptimeMillis();
+        for (int step = 0; step <= 21; step++) {
+            int action = step == 0 ? android.view.MotionEvent.ACTION_DOWN
+                    : step == 21 ? android.view.MotionEvent.ACTION_UP : android.view.MotionEvent.ACTION_MOVE;
+            float progress = Math.min(step, 20) / 20.0f;
+            float y = bounds.bottom - bounds.height() * (0.15f + 0.7f * progress);
+            android.view.MotionEvent event = android.view.MotionEvent.obtain(down,
+                    SystemClock.uptimeMillis(), action, bounds.centerX(), y, 0);
+            event.setSource(android.view.InputDevice.SOURCE_TOUCHSCREEN);
+            try {
+                if (!ui.injectInputEvent(event, true)) throw new AssertionError("Folder swipe injection failed");
+            } finally {
+                event.recycle();
+            }
+            SystemClock.sleep(20);
+        }
+    }
+
     private boolean isPageAction() {
         return "page-next".equals(requestedMode) || "page-previous".equals(requestedMode);
     }
@@ -355,16 +481,32 @@ public final class NativeActionsProbe extends Instrumentation {
     private boolean findPlacedIcon(AccessibilityNodeInfo node) {
         if (node == null || sourceLabel == null) return false;
         if (isMoveAction()) {
-            Rect source = new Rect();
-            Rect target = new Rect();
-            if (!findIconBounds(node, sourceLabel, source)
-                    || !findIconBounds(node, appLabel("icon", "iconAlias"), target)) {
-                return false;
+            if (virtualNodes != 0) return false;
+            AccessibilityNodeInfo folder = findResource(node, "com.miui.home:id/folder_grid_view");
+            List<AccessibilityNodeInfo> items = new ArrayList<>();
+            collectOrderedItems(folder == null ? node : folder, items, folder != null);
+            items.sort(Comparator.comparingInt((AccessibilityNodeInfo item) -> {
+                Rect bounds = new Rect();
+                item.getBoundsInScreen(bounds);
+                return bounds.centerY();
+            }).thenComparingInt(item -> {
+                Rect bounds = new Rect();
+                item.getBoundsInScreen(bounds);
+                return bounds.centerX();
+            }));
+            int sourceIndex = -1, targetIndex = -1;
+            for (int i = 0; i < items.size(); i++) {
+                String label = String.valueOf(items.get(i).getContentDescription());
+                if (sourceLabel.equals(label)) sourceIndex = sourceIndex == -1 ? i : -2;
+                String targetLabel = appLabel("icon", "iconAlias");
+                if (!targetLabel.isEmpty() && (targetLabel.equals(label)
+                        || label.startsWith(targetLabel))) {
+                    targetIndex = targetIndex == -1 ? i : -2;
+                }
+                items.get(i).recycle();
             }
-            int order = source.top != target.top
-                    ? Integer.compare(source.top, target.top)
-                    : Integer.compare(source.left, target.left);
-            return "move-before".equals(requestedMode) ? order < 0 : order > 0;
+            return sourceIndex >= 0 && targetIndex >= 0 && sourceIndex - targetIndex
+                    == ("move-before".equals(requestedMode) ? -1 : 1);
         }
         if (targetBounds.isEmpty()) return false;
         if (isDesktopItem(node)
@@ -380,16 +522,21 @@ public final class NativeActionsProbe extends Instrumentation {
         return false;
     }
 
-    private boolean findIconBounds(AccessibilityNodeInfo node, String label, Rect result) {
-        if (node == null || label.isEmpty()) return false;
-        if (isDesktopItem(node)
-                && String.valueOf(node.getContentDescription()).startsWith(label)) {
-            node.getBoundsInScreen(result);
-            return true;
+    private static void collectOrderedItems(AccessibilityNodeInfo node,
+            List<AccessibilityNodeInfo> items, boolean inGrid) {
+        if (node == null) return;
+        Rect bounds = new Rect();
+        node.getBoundsInScreen(bounds);
+        if ("com.miui.home:id/hotseat".equals(node.getViewIdResourceName()) || bounds.isEmpty()) return;
+        inGrid |= "com.miui.home:id/screen_content".equals(node.getViewIdResourceName());
+        if (inGrid && isDesktopItem(node) && node.isVisibleToUser()) {
+            items.add(AccessibilityNodeInfo.obtain(node));
+            return;
         }
         for (int i = 0; i < node.getChildCount(); i++) {
-            if (findIconBounds(node.getChild(i), label, result)) return true;
+            AccessibilityNodeInfo child = node.getChild(i);
+            collectOrderedItems(child, items, inGrid);
+            if (child != null) child.recycle();
         }
-        return false;
     }
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the offline 7748/8565 ARM64 FRB contract from an actual launcher ELF.
+"""Verify offline 7748/8565 ARM64 launcher contracts and optional 7748 semantics ABI.
 
 Uses only Python's standard library and a caller-selected llvm-nm executable.
 This never loads the shared library, talks to a device, or infers a new runtime profile.
@@ -94,6 +94,27 @@ class Elf64:
                 "Oversized, incomplete, or trailing XZ debug data")
         Elf64(data)
         return data
+
+    def exported_object(self, name):
+        require(".dynsym" in self.sections and ".dynstr" in self.sections,
+                "Missing dynamic export tables")
+        offset, size, kind = self.sections[".dynsym"]
+        string_offset, string_size, string_kind = self.sections[".dynstr"]
+        require(kind == 11 and string_kind == 3 and size % 24 == 0,
+                "Invalid dynamic export tables")
+        strings = self.read(string_offset, string_size)
+        matches = []
+        for cursor in range(offset, offset + size, 24):
+            start, info, visibility, section, address, length = self.unpack("<IBBHQQ", cursor)
+            require(start < len(strings), "Invalid dynamic export name offset")
+            end = strings.find(b"\x00", start)
+            require(end >= 0, "Unterminated dynamic export name")
+            if strings[start:end] == name.encode("ascii"):
+                require(info == 0x11 and visibility & 3 == 0 and section != 0,
+                        "Expected a global, defined, default-visible object: " + name)
+                matches.append((address, length))
+        require(len(matches) == 1, "No unique exported object: " + name)
+        return matches[0]
 
     def plt_imports(self):
         require(all(name in self.sections for name in (".dynsym", ".dynstr", ".rela.plt")),
@@ -243,6 +264,7 @@ KEY_BACK_PROLOGUE = (0xd10483ff, 0xa90c7bfd, 0xa90d6ffc, 0xa90e67fa,
 BASELINES = {
     "7748": {"export": 0x9b750c, "dispatcher": 0x7ee954, "move": 831, "batch": 855,
              "reload": 0x7a35a4, "move_target": 0x87bb20, "batch_target": 0x89bca8,
+             "insert": 827, "insert_target": 0x876608, "delete": 818, "delete_target": 0x875bf8,
              "grid_x": 0x6c5a74, "grid_y": 0x6c5b20,
              "grid_x_load": 0xb9458920, "grid_y_load": 0xb9458d20,
              "motion": 0xd37904, "motion_caller": 0x743a80, "motion_caller_v2": 0x743e40,
@@ -418,7 +440,107 @@ def verify_motion_contract(elf, symbols, baseline):
             "imports": import_evidence}
 
 
-def verify(sample, llvm_nm, profile, batch_op=None, move_op=None):
+def verify_semantics_contract(launcher, symbols, engine):
+    table, size = engine.exported_object("HYPER_FLUTTER_INTERFACE")
+    require((table, size) == (0x10c1b40, 0x268)
+            and engine.virtual_bytes(table, 8) == struct.pack("<Q", size),
+            "7748 Flutter interface must be the 0x268-byte structure, not a pointer export")
+    entries = {"destroy": (0x48, 0x66a5d0), "features": (0x90, 0x66ba80),
+               "enabled": (0xf0, 0x66db90), "disabled": (0xf8, 0x66dc58),
+               "high_contrast": (0x158, 0x66e548)}
+    for name, (slot, address) in entries.items():
+        require(engine.virtual_bytes(table + slot, 8) == struct.pack("<Q", address),
+                "7748 Flutter interface slot changed: " + name)
+        engine.virtual_bytes(address, 4, executable=True)
+    prologue = (0xd10543ff, 0xf9009bfd, 0xa9144ffe, 0xb00055e8, 0xaa0003f3)
+    for name, bool_word, text in (("enabled", 0x52800021, 0xf25bb),
+                                  ("disabled", 0x2a1f03e1, 0xf24fa)):
+        address = entries[name][1]
+        require(engine.words(address, 5) == prologue,
+                "7748 semantics prologue changed: " + name)
+        require(engine.words(address + 0x58, 5) == (
+            0xf9433e61, 0x3dc19e60, 0x3d8003e0, 0xb4000061, 0x52800020)
+                and branch_target(address + 0x6c, engine.words(address + 0x6c, 1)[0], True) == 0x639980,
+            "7748 semantics must retain holder +0x670/+0x678: " + name)
+        require(engine.words(address + 0x70, 7) == (
+            0x3dc003e0, bool_word, 0x9e660008, 0xf9400500,
+            0xf9400008, 0xf9403108, 0xd63f0100),
+            "7748 semantics must pass bool and live delegate to vtable +0x60: " + name)
+        label = ("shell_holder_on_accessibility_" + name).encode("ascii") + b"\x00"
+        require(engine.virtual_bytes(text, len(label)) == label,
+                "7748 semantics log identity changed: " + name)
+        log_address = engine.words(address + 0x3c, 2)
+        require(log_address[1] & 0xffc003ff == 0x91000021
+                and relative_address(address + 0x3c, log_address[0], 1, True)
+                + ((log_address[1] >> 10) & 0xfff) == text,
+                "7748 semantics entry no longer references its log identity: " + name)
+    require(engine.words(entries["destroy"][1], 5) == (
+        0xd10583ff, 0xa9137bfd, 0xa91457f6, 0xa9154ff4, 0xd53bd055),
+        "7748 holder destroy prologue changed")
+
+    require(engine.virtual_bytes(0x10fbbe8 + 0x60, 8) == struct.pack("<Q", 0xdaf54c)
+            and engine.words(0xdaf570, 1) == (0xf9404c13,),
+            "7748 Shell semantics target must use its runner at +0x98")
+    require(engine.words(0xdaf564, 1) == (0x12000036,)
+            and engine.words(0xdaf584, 4) == (0xf943c288, 0x911f2109, 0xf943e901, 0x3dc00120)
+            and engine.words(0xdaf5ac, 7) == (
+                0x3dc003e0, 0xb0001a68, 0x9135a108, 0xf9000008,
+                0xaa0003f4, 0x3c808000, 0x39008016)
+            and engine.virtual_bytes(0x10fcd68 + 0x30, 8) == struct.pack("<Q", 0xdbc4a4),
+            "7748 semantics task must capture the Engine weak reference and bool")
+    require(engine.words(0xdaf5d8, 8) == (
+        0xf9400268, 0xf9401508, 0xd63f0100, 0x360002a0,
+        0xf9400288, 0xaa1403e0, 0xf9401908, 0xd63f0100)
+            and engine.words(0xdaf638, 6) == (
+                0xf9400268, 0x910043e1, 0xaa1303e0, 0x910043f6, 0xf9400108, 0xd63f0100),
+            "7748 semantics runner must retain immediate and posted task paths")
+    require(engine.words(0xdbc4b0, 5) == (
+        0xf9400808, 0xb40006e8, 0x39402108, 0x7100051f, 0x54000681)
+            and engine.words(0xdbc4c4, 5) == (
+                0xf9400408, 0xf9434515, 0x39408008, 0xf940aeb3, 0x3904c2a8)
+            and engine.words(0xdbc578, 2) == (0x3944c2a1, 0xaa1403e0)
+            and branch_target(0xdbc58c, engine.words(0xdbc58c, 1)[0]) == 0xe26b38,
+            "7748 semantics task must check weak lifetime before setting RuntimeController bool")
+    require(engine.virtual_bytes(0xf26b2, 24) == b"_updateSemanticsEnabled\x00"
+            and engine.words(0xe95474, 2) == (0xb0ff92e0, 0x911ac800)
+            and engine.words(0xe95494, 1) == (0x9103e360,)
+            and branch_target(0xe95498, engine.words(0xe95498, 1)[0], True) == 0xdd11d0
+            and engine.words(0xdd12d0, 1) == (0xf9000a60,)
+            and engine.words(0xe26c4c, 1) == (0xf9408700,),
+            "7748 Dart dispatch must resolve the _updateSemanticsEnabled persistent handle")
+
+    adapters = [name for name in symbols
+                if name.startswith("<hyper_os_accessibility::accessibility_manager::AccessibilityNodeProvider_trait::AccessibilityNodeProvider_MV<")
+                and "AccessibilityNodeProviderImpl" in name
+                and name.endswith(">::create_accessibility_node_info")]
+    require(len(adapters) == 1 and symbol(symbols, adapters[0]) == (0xa3c3d8, 0x1c),
+            "No exact 7748 provider adapter baseline")
+    require(launcher.words(0xa3c3d8, 3) == (0xa9bf7bfd, 0x910003fd, 0xf9400000)
+            and branch_target(0xa3c3e4, launcher.words(0xa3c3e4, 1)[0], True) == 0xa3d70c,
+            "7748 provider adapter must dereference its argument to a live bridge Arc")
+    require(launcher.words(0xa4078c, 4) == (0xf94016a8, 0xf94046b7, 0xa9415bf5, 0xf9400918)
+            and launcher.words(0xa407b8, 1) == (0xf9401f00,),
+            "7748 bridge/GroupedEngine/inner/holder pointer chain changed")
+    require(launcher.words(0xa3bcd4, 8) == (
+        0xf9401e68, 0xc85f7d09, 0xf1000529, 0xc80afd09,
+        0x35ffffaa, 0x54000081, 0xd50339bf, 0xf9401e60)
+            and branch_target(0xa3bcf4, launcher.words(0xa3bcf4, 1)[0], True) == 0xb8e4a0,
+            "7748 bridge must own the GroupedEngine strong Arc at allocation +0x38")
+    require(launcher.words(0xb8e6f0, 3) == (0xf9401e60, 0xf9438908, 0xd63f0100),
+            "7748 GroupedEngineInner must destroy its holder from +0x38")
+    return {"sha256": hashlib.sha256(engine.data).hexdigest(),
+            "interface": hex(table), "interface_size": hex(size),
+            "entries": {name: {"slot": hex(slot), "address": hex(address)}
+                        for name, (slot, address) in entries.items()},
+            "setter_abi": "void (holder*)", "provider_adapter": "0xa3c3d8",
+            "bridge_arc_offsets": ["0x38", "0x10", "0x38"],
+            "delegate_vtable": "0x10fbbe8", "delegate_target": "0xdaf54c",
+            "weak_task": "0xdbc4a4", "dart_callback": "_updateSemanticsEnabled",
+            "scope": "7748 static structure only; runtime fingerprints, live callback, holder lifetime and device outcome must also be checked"}
+
+
+def verify(sample, llvm_nm, profile, batch_op=None, move_op=None, flutter=None):
+    require(flutter is None or profile == "7748", "--flutter semantics contract is verified only for profile 7748")
     data = sample.read_bytes()
     elf = Elf64(data)
     debug = elf.debug_data()
@@ -434,8 +556,12 @@ def verify(sample, llvm_nm, profile, batch_op=None, move_op=None):
             "Dispatcher export does not branch to its exact implementation symbol")
     table = dispatcher_table(elf, dispatcher)
     operations = {}
-    for kind, suffix, override in (("batch", "update_item_database_batch_impl", batch_op),
-                                   ("move", "move_item_in_database_impl", move_op)):
+    operation_specs = [("batch", "update_item_database_batch_impl", batch_op),
+                       ("move", "move_item_in_database_impl", move_op)]
+    for kind in ("insert", "delete"):
+        if kind in baseline:
+            operation_specs.append((kind, kind + "_item_database_impl", None))
+    for kind, suffix, override in operation_specs:
         operation = baseline[kind] if override is None else override
         expected_name = WIRE_PREFIX + suffix
         expected_address = symbol(symbols, expected_name)[0]
@@ -471,6 +597,23 @@ def verify(sample, llvm_nm, profile, batch_op=None, move_op=None):
     require(vector_calls and vector_calls[0][1] == symbol(symbols, "<i32" + DECODE)[0],
             "ItemInfo vector no longer starts with an i32 count")
     require(item[0] in [target for _, target in vector_calls], "Vector no longer calls the ItemInfo decoder")
+    single_item_database = {}
+    decoder_addresses = {address for name, values in symbols.items() if name.endswith(DECODE)
+                         for address, _ in values}
+    for kind in ("insert", "delete"):
+        if kind not in operations:
+            continue
+        calls = direct_calls(elf, symbol(symbols, operations[kind]["symbol"]))
+        item_calls = [(call, target) for call, target in calls if target in decoder_addresses]
+        require(len(item_calls) == 1 and item_calls[0][1] == item[0],
+                f"{kind} wire must decode exactly one ItemInfo and no other arguments")
+        item_call = item_calls[0][0]
+        item_index = calls.index(item_calls[0])
+        next_calls = calls[item_index + 1:item_index + 2]
+        require(next_calls == [(item_call + 8, symbol(symbols, DESERIALIZER_END)[0])],
+                f"{kind} wire must call end immediately after ItemInfo decoding")
+        single_item_database[kind] = {"type": "ItemInfo", "call": hex(item_call),
+                                      "decoder": hex(item[0]), "end_call": hex(item_call + 8)}
     grid_getters = {}
     for axis in ("x", "y"):
         name = GRID_GETTER_PREFIX + axis
@@ -487,7 +630,7 @@ def verify(sample, llvm_nm, profile, batch_op=None, move_op=None):
                               "abi": "i32 ()", "prologue": [f"{word:08x}" for word in GRID_GETTER_PROLOGUE]}
     motion = verify_motion_contract(elf, symbols, baseline)
     lifecycle = verify_lifecycle_contract(elf, symbols, baseline)
-    return {"profile": profile, "sample": str(sample.resolve()),
+    evidence = {"profile": profile, "sample": str(sample.resolve()),
             "sha256": hashlib.sha256(data).hexdigest(),
             "debug_sha256": hashlib.sha256(debug).hexdigest(),
             "dispatcher": hex(dispatcher), "table": hex(table[2]), "stub_base": hex(table[3]),
@@ -495,11 +638,16 @@ def verify(sample, llvm_nm, profile, batch_op=None, move_op=None):
             "prologue": [f"{word:08x}" for word in PROLOGUE]},
             "decoder": {"vector": hex(vector[0]), "item": hex(item[0]), "count_type": "i32",
                         "move_arguments": move_arguments, "move_tail_bytes": 20,
-                        "move_end_call": hex(decode_calls[-1][0])},
+                        "move_end_call": hex(decode_calls[-1][0]),
+                        "single_item_database": single_item_database},
             "grid_getters": grid_getters,
             "motion": motion,
             "lifecycle": lifecycle,
             "scope": "offline ELF contract only; no target execution or runtime compatibility claim"}
+    if flutter is not None:
+        evidence["semantics"] = verify_semantics_contract(elf, symbols, Elf64(flutter.read_bytes()))
+        evidence["semantics"]["sample"] = str(flutter.resolve())
+    return evidence
 
 
 def main():
@@ -509,10 +657,11 @@ def main():
     parser.add_argument("--profile", required=True, choices=BASELINES)
     parser.add_argument("--batch-op", type=int, help="Override expected batch opcode (also useful as a negative check)")
     parser.add_argument("--move-op", type=int, help="Override expected single-item move opcode")
+    parser.add_argument("--flutter", type=Path, help="Optional 7748 libhyper_os_flutter.so semantics contract")
     parser.add_argument("--json", action="store_true", help="Print the evidence as JSON")
     args = parser.parse_args()
     try:
-        evidence = verify(args.sample, args.llvm_nm, args.profile, args.batch_op, args.move_op)
+        evidence = verify(args.sample, args.llvm_nm, args.profile, args.batch_op, args.move_op, args.flutter)
     except (ContractError, OSError, UnicodeError, lzma.LZMAError, subprocess.TimeoutExpired) as error:
         print("FAIL: " + str(error), file=sys.stderr)
         return 1
@@ -525,11 +674,15 @@ def main():
         print(f"  reload: {evidence['reload']['address']}; prologue verified")
         print(f"  decoder: Vec<ItemInfo> {evidence['decoder']['vector']} -> ItemInfo {evidence['decoder']['item']}")
         print("  move wire: ItemInfo + i64 container + i32 screen + i32 cellX + i32 cellY (20-byte tail)")
+        if evidence["decoder"]["single_item_database"]:
+            print("  insert/delete wire: exactly one ItemInfo, then end; no vector count or tail")
         print(f"  grid getters: x {evidence['grid_getters']['x']['address']}, y {evidence['grid_getters']['y']['address']}; i32 () verified")
         print(f"  motion: {evidence['motion']['address']}; void (scene*, event*) with event x1; LauncherUi callers and clone/setAction/drop imports verified")
         print(f"  focus: {evidence['lifecycle']['focus']['address']}; void (window*, bool) with focus w1 verified")
         print(f"  key: {evidence['lifecycle']['key']['address']}; bool (scene*, event*) with event x1 and key getter imports verified")
         print(f"  back gesture: {evidence['lifecycle']['back']['address']}; void (helper*) with committed gesture caller and callback cleanup verified")
+        if "semantics" in evidence:
+            print("  7748 semantics: exported interface, holder ownership, bool dispatch and weak task lifetime verified")
         print("  Offline evidence only; the launcher was not executed.")
     return 0
 

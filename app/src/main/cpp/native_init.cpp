@@ -273,6 +273,11 @@ std::atomic<bool> g_create_hook_attempted{false};
 std::atomic<bool> g_find_focus_hook_attempted{false};
 using MotionNewFn = void *(*)(int64_t, int64_t, int32_t, float, float, int32_t);
 MotionNewFn g_motion_new = nullptr;
+// Match the constructor used by Home's motion_event_injector::inject_one.
+using MotionNewWithDisplayFn = void *(*)(
+        int64_t, int64_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t,
+        float, float, float, float, float, float);
+MotionNewWithDisplayFn g_motion_new_with_display = nullptr;
 using MotionActionFn = int32_t (*)(void *);
 using MotionSetActionFn = void (*)(void *, int32_t);
 using MotionCloneFn = void *(*)(void *);
@@ -283,6 +288,7 @@ MotionCloneFn g_motion_clone = nullptr;
 DropFn g_motion_drop = nullptr;
 MotionFloatFn g_motion_raw_x = nullptr;
 MotionFloatFn g_motion_raw_y = nullptr;
+
 using LauncherMotionFn = void (*)(void *, void *);
 LauncherMotionFn g_original_launcher_motion = nullptr;
 using LauncherFocusFn = void (*)(void *, bool);
@@ -302,6 +308,16 @@ std::atomic<bool> g_focus_callback_node_observed{false};
 std::atomic<bool> g_home_announcement_pending{false};
 std::atomic<uint64_t> g_focus_generation{0};
 std::atomic<bool> g_launcher_motion_hook_attempted{false};
+
+// A scene input callback is stronger foreground evidence than a stale window
+// focus notification: TalkBack can return to Home while that notification is
+// still reporting the old overlay window.
+void markLauncherInputForeground() {
+    if (g_launcher_window_focused.exchange(1, std::memory_order_acq_rel) != 1) {
+        g_focus_callback_active.store(false, std::memory_order_release);
+    }
+}
+
 using InputEventFn = void *(*)(void *);
 InputEventFn g_input_event = nullptr;
 DropFn g_input_drop = nullptr;
@@ -362,6 +378,7 @@ constexpr int32_t kCreateFolderAction = 0x6A000005;
 constexpr int32_t kAppInfoAction = 0x6A000006;
 constexpr int32_t kUninstallAction = 0x6A000007;
 constexpr int32_t kEditFolderAction = 0x6A000009;
+constexpr int32_t kMoveOutOfFolderAction = 0x6A00000A;
 constexpr int32_t kRecentAppFlowAction = 0x6A000300;
 constexpr int32_t kRecentLockAction = 0x6A000301;
 constexpr int32_t kRecentSplitAction = 0x6A000302;
@@ -424,10 +441,23 @@ struct ObservedNode {
 bool nodeBounds(void *provider, int32_t nodeId, Bounds &bounds, std::string *label);
 bool isIconNode(void *node);
 void readTree(void *provider, int32_t id, std::vector<ObservedNode> &nodes, int depth = 0);
+void recoverWorkspaceSemantics(void *provider, const std::vector<ObservedNode> &nodes);
+void resolveSemanticsRefresh();
 std::mutex g_session_mutex;
 ObservedNode g_source{};
 std::vector<ObservedNode> g_sources;
 std::vector<ObservedNode> g_workspace;
+std::atomic<int64_t> g_lifted_folder_container{0};
+std::mutex g_folder_refresh_mutex;
+std::atomic<bool> g_folder_refresh_active{false};
+std::atomic<bool> g_folder_refresh_querying{false};
+std::atomic<uint64_t> g_folder_refresh_focus_generation{0};
+std::string g_folder_refresh_title, g_folder_refresh_source, g_folder_refresh_target;
+Bounds g_folder_refresh_scroll_bounds{};
+std::atomic<bool> g_folder_refresh_scroll_requested{false};
+bool g_folder_refresh_after = false;
+int g_folder_refresh_stage = 0;
+std::atomic<int> g_folder_refresh_result{0};
 struct Slot {
     Bounds bounds;
     int32_t row;
@@ -508,6 +538,7 @@ struct FavoritePlacement {
 };
 
 std::vector<FavoritePlacement> g_source_placements;
+FavoritePlacement g_folder_refresh_item;
 
 struct PendingPlacement {
     FavoritePlacement item;
@@ -526,6 +557,7 @@ std::mutex g_placement_mutex;
 std::condition_variable g_placement_cv;
 std::vector<PendingPlacement> g_pending_placements;
 std::chrono::steady_clock::time_point g_pending_focus_deadline{};
+std::chrono::steady_clock::time_point g_pending_focus_not_before{};
 int g_pending_observation_budget = 0;
 
 struct AppTarget {
@@ -555,12 +587,68 @@ struct SnapshotFavorite {
 struct LauncherSnapshot {
     std::vector<SnapshotFavorite> favorites;
     std::unordered_map<int32_t, int32_t> pageCounts;
+    int32_t totalPages = 0;
     uint64_t generation = 0;
     bool ready = false;
 };
 
+std::vector<int32_t> desktopScreens(const LauncherSnapshot &snapshot) {
+    std::vector<int32_t> screens;
+    screens.reserve(snapshot.pageCounts.size());
+    for (const auto &entry : snapshot.pageCounts) screens.push_back(entry.first);
+    std::sort(screens.begin(), screens.end());
+    return screens;
+}
+
+bool launcherScreensAreCompact(const LauncherSnapshot &snapshot,
+        const std::vector<int32_t> &screens) {
+    if (screens.empty()) return false;
+    const int32_t totalPages = snapshot.totalPages > 0
+            ? snapshot.totalPages : g_total_pages.load(std::memory_order_acquire);
+    if (totalPages > 0) return screens.back() > totalPages;
+    // Before the first page indicator arrives, a screen number beyond the
+    // number of populated pages is the only evidence available that Home has
+    // retained a deleted page's database number.
+    return screens.back() > static_cast<int32_t>(screens.size());
+}
+
+int32_t databaseScreenForVisiblePage(const LauncherSnapshot &snapshot, int32_t page) {
+    if (page <= 0) return -1;
+    const std::vector<int32_t> screens = desktopScreens(snapshot);
+    if (!launcherScreensAreCompact(snapshot, screens)) return page;
+    const size_t index = static_cast<size_t>(page - 1);
+    return index < screens.size() ? screens[index] : -1;
+}
+
+int32_t visiblePageForDatabaseScreen(const LauncherSnapshot &snapshot, int32_t screen) {
+    if (screen <= 0) return -1;
+    const std::vector<int32_t> screens = desktopScreens(snapshot);
+    if (!launcherScreensAreCompact(snapshot, screens)) return screen;
+    auto found = std::find(screens.begin(), screens.end(), screen);
+    return found == screens.end()
+            ? -1 : static_cast<int32_t>(std::distance(screens.begin(), found)) + 1;
+}
+
 std::mutex g_snapshot_mutex;
 LauncherSnapshot g_snapshot;
+
+int32_t databaseScreenForVisiblePage(int32_t page) {
+    LauncherSnapshot snapshot;
+    {
+        std::lock_guard lock(g_snapshot_mutex);
+        snapshot = g_snapshot;
+    }
+    return databaseScreenForVisiblePage(snapshot, page);
+}
+
+int32_t visiblePageForDatabaseScreen(int32_t screen) {
+    LauncherSnapshot snapshot;
+    {
+        std::lock_guard lock(g_snapshot_mutex);
+        snapshot = g_snapshot;
+    }
+    return visiblePageForDatabaseScreen(snapshot, screen);
+}
 
 bool liftedSourceFavoriteLocked(const SnapshotFavorite &favorite) {
     return std::any_of(g_source_placements.begin(), g_source_placements.end(),
@@ -1325,7 +1413,8 @@ void observePendingPlacement(const ObservedNode &node, int32_t page = -1) {
     for (auto &pending : g_pending_placements) {
         ++pending.observations;
         const bool labelOk = labelMatches(node.label, pending.label);
-        const bool pageOk = page == pending.item.screen;
+        const int32_t expectedPage = visiblePageForDatabaseScreen(pending.item.screen);
+        const bool pageOk = page == (expectedPage > 0 ? expectedPage : pending.item.screen);
         const bool boundsOk = pending.bounds.width() > 0 && pending.bounds.height() > 0
                 && node.bounds.centerX() >= pending.bounds.left
                 && node.bounds.centerX() < pending.bounds.right
@@ -1373,13 +1462,16 @@ void focusPendingPlacement(void *provider, const ObservedNode &current) {
     {
         std::lock_guard lock(g_placement_mutex);
         if (g_pending_placements.empty()) return;
+        if (std::chrono::steady_clock::now() < g_pending_focus_not_before) return;
         if (std::chrono::steady_clock::now() > g_pending_focus_deadline) {
             if (!g_model_move_running.load()) g_pending_placements.clear();
             return;
         }
         auto &first = g_pending_placements.front();
         if (!first.visible || first.focusAttempted
-                || first.item.screen != g_visible_screen.load() + 1
+                || (visiblePageForDatabaseScreen(first.item.screen) > 0
+                        ? visiblePageForDatabaseScreen(first.item.screen)
+                        : first.item.screen) != g_visible_screen.load() + 1
                 || first.visibleNode.host != current.host
                 || first.visibleNode.window != current.window) return;
         first.focusAttempted = true;
@@ -1401,6 +1493,7 @@ void focusPendingPlacement(void *provider, const ObservedNode &current) {
 void beginPendingPlacement(const std::vector<PendingPlacement> &expected) {
     std::lock_guard lock(g_placement_mutex);
     g_pending_placements = expected;
+    g_pending_focus_not_before = {};
     g_pending_focus_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(4'500);
     g_pending_observation_budget = 12;
     if (g_diagnostics.session() == 0) return;
@@ -1415,6 +1508,17 @@ void beginPendingPlacement(const std::vector<PendingPlacement> &expected) {
 
 bool waitForPendingPlacementVisibility() {
     std::unique_lock lock(g_placement_mutex);
+    if (std::chrono::steady_clock::now() < g_pending_focus_not_before) {
+        g_placement_cv.wait_until(lock, g_pending_focus_not_before,
+                [] { return g_pending_placements.empty(); });
+        if (!g_pending_placements.empty() && g_pending_placements.front().visible
+                && g_launcher_window_focused.load() == 1) {
+            const auto target = g_pending_placements.front().visibleNode;
+            lock.unlock();
+            sendEvent({target.host, target.window, target.id}, kTypeWindowContentChanged);
+            lock.lock();
+        }
+    }
     g_placement_cv.wait_for(lock, std::chrono::milliseconds(4'500), [] {
         return g_pending_placements.empty() || ((g_original_perform_action == nullptr
                     || g_pending_placements.front().focusAttempted) && std::all_of(
@@ -1834,6 +1938,7 @@ bool loadLauncherSnapshot() {
     if (query != nullptr) g_sqlite_finalize(query);
     g_sqlite_close_v2(db);
     if (prepareResult != 0) return false;
+    loaded.totalPages = g_total_pages.load(std::memory_order_acquire);
     uint64_t generation = 0;
     size_t favoriteCount = 0;
     size_t pageCount = 0;
@@ -1915,11 +2020,14 @@ void requestSnapshotRefresh(bool force) {
 
 bool desktopItemCountForPage(int32_t page, int32_t &count) {
     if (page <= 0) return false;
+    LauncherSnapshot snapshot;
     {
         std::lock_guard lock(g_snapshot_mutex);
-        auto found = g_snapshot.pageCounts.find(page);
         if (g_snapshot.ready) {
-            count = found == g_snapshot.pageCounts.end() ? 0 : found->second;
+            snapshot = g_snapshot;
+            const int32_t screen = databaseScreenForVisiblePage(snapshot, page);
+            auto found = snapshot.pageCounts.find(screen);
+            count = found == snapshot.pageCounts.end() ? 0 : found->second;
             return true;
         }
     }
@@ -1958,16 +2066,17 @@ bool sameApp(const AppTarget &a, const AppTarget &b) {
     return a.package == b.package && a.activity == b.activity && a.user == b.user;
 }
 
-bool folderResourceMatchesCell(const SnapshotFavorite &favorite, int32_t screen,
-        const Bounds *bounds) {
+bool folderResourceMatchesCell(const SnapshotFavorite &favorite, int32_t page,
+        const LauncherSnapshot &snapshot, const Bounds *bounds) {
     const auto &item = favorite.placement;
+    const int32_t screen = databaseScreenForVisiblePage(snapshot, page);
     if (bounds == nullptr || bounds->width() <= 0 || bounds->height() <= 0
             || item.itemType != 2 || item.container != kDesktopContainer
-            || item.screen != screen
+            || screen <= 0 || item.screen != screen
             || (favorite.title.rfind("com.miui.home:string/", 0) != 0
                     && favorite.label.rfind("com.miui.home:string/", 0) != 0)) return false;
     std::lock_guard lock(g_session_mutex);
-    if (g_grid_screen + 1 != screen) return false;
+    if (g_grid_screen + 1 != page) return false;
     for (const auto &cell : g_grid_cells) {
         if (cell.row == item.cellY && cell.column == item.cellX
                 && bounds->centerX() >= cell.bounds.left && bounds->centerX() < cell.bounds.right
@@ -1997,12 +2106,13 @@ bool resolveAppTarget(int32_t nodeId, const std::string &spoken, AppTarget &out,
     bool fallbackResolved = false;
     bool ambiguous = false;
     size_t matches = 0, preferredMatches = 0;
+    const int32_t preferredScreen = databaseScreenForVisiblePage(snapshot, screenHint);
     for (const SnapshotFavorite &favorite : snapshot.favorites) {
         if (favorite.placement.itemType != itemType) continue;
         if (!labelMatches(spoken, favorite.title)
                 && !labelMatches(spoken, favorite.label)
                 // Default folders store a resource name instead of the displayed title.
-                && !folderResourceMatchesCell(favorite, screenHint, bounds)) continue;
+                && !folderResourceMatchesCell(favorite, screenHint, snapshot, bounds)) continue;
         ++matches;
         AppTarget candidate;
         // Placement only needs the favorite row. Some launcher rows (notably
@@ -2014,7 +2124,7 @@ bool resolveAppTarget(int32_t nodeId, const std::string &spoken, AppTarget &out,
         candidate.spoken = spoken;
         candidate.resolved = true;
         candidate.snapshotGeneration = snapshot.generation;
-        if (candidate.placement.screen == screenHint) {
+        if (preferredScreen > 0 && candidate.placement.screen == preferredScreen) {
             preferred = candidate;
             preferredResolved = true;
             ++preferredMatches;
@@ -2083,6 +2193,7 @@ bool snapshotPlacementForLabel(const std::string &spoken, int32_t screenHint,
     }
     std::vector<const SnapshotFavorite *> matches;
     std::vector<const SnapshotFavorite *> preferred;
+    const int32_t preferredScreen = databaseScreenForVisiblePage(snapshot, screenHint);
     for (const SnapshotFavorite &favorite : snapshot.favorites) {
         if (favorite.placement.itemType != itemType
                 || !workspaceContainer(favorite.placement.container)) continue;
@@ -2090,7 +2201,7 @@ bool snapshotPlacementForLabel(const std::string &spoken, int32_t screenHint,
         if (!exact && !labelMatches(spoken, favorite.title)
                 && !labelMatches(spoken, favorite.label)) continue;
         matches.push_back(&favorite);
-        if (screenHint > 0 && favorite.placement.screen == screenHint) {
+        if (preferredScreen > 0 && favorite.placement.screen == preferredScreen) {
             preferred.push_back(&favorite);
         }
     }
@@ -2115,6 +2226,54 @@ bool resolveSourcePlacement(int32_t nodeId, const std::string &spoken,
     // session instead of asking the new node ID to resolve again at drop time.
     if (cachedPlacementForNode(nodeId, spoken, itemType, out)) return true;
     return snapshotPlacementForLabel(spoken, screenHint, itemType, out);
+}
+
+bool nodeDescendsFrom(const std::vector<ObservedNode> &nodes, const ObservedNode &node,
+        int32_t gridId) {
+        int32_t parent = node.parent;
+        for (size_t depth = 0; depth < nodes.size() && parent >= 0; ++depth) {
+            if (parent == gridId) return true;
+            const auto ancestor = std::find_if(nodes.begin(), nodes.end(), [&](const auto &candidate) {
+                return candidate.id == parent && candidate.host == node.host;
+            });
+            if (ancestor == nodes.end() || ancestor->parent == parent) return false;
+            parent = ancestor->parent;
+        }
+        return false;
+}
+
+bool resolveFolderItem(const std::vector<ObservedNode> &nodes, const std::string &label,
+        int64_t container, FavoritePlacement &out) {
+    const auto grid = std::find_if(nodes.begin(), nodes.end(), [](const auto &node) {
+            return node.resource == "com.miui.home:id/folder_grid_view";
+        });
+    if (grid == nodes.end()) return false;
+    auto memberNode = [&](const ObservedNode &node) {
+        return nodeDescendsFrom(nodes, node, grid->id);
+    };
+    if (std::none_of(nodes.begin(), nodes.end(), [&](const auto &node) {
+            return node.icon() && memberNode(node) && labelMatches(node.label, label);
+        })) return false;
+    std::lock_guard lock(g_snapshot_mutex);
+    std::vector<FavoritePlacement> matches;
+    for (const auto &favorite : g_snapshot.favorites) {
+        const auto &item = favorite.placement;
+        if (item.container <= 0 || item.itemType != 0
+                || (container > 0 && item.container != container)
+                || (!labelMatches(label, favorite.title) && !labelMatches(label, favorite.label))) continue;
+        bool sameContents = true;
+        for (const auto &node : nodes) {
+            if (!node.icon() || !memberNode(node)) continue;
+            if (std::none_of(g_snapshot.favorites.begin(), g_snapshot.favorites.end(), [&](const auto &member) {
+                    return member.placement.container == item.container
+                            && (labelMatches(node.label, member.title) || labelMatches(node.label, member.label));
+                })) { sameContents = false; break; }
+        }
+        if (sameContents) matches.push_back(item);
+    }
+    if (matches.size() != 1) return false;
+    out = matches.front();
+    return true;
 }
 
 LauncherAbiProfile launcherAbiProfileForBuildId(const char *buildId) {
@@ -2274,8 +2433,44 @@ bool loadFavoritePlacements(const std::vector<int64_t> &ids,
     return true;
 }
 
+// A real HyperOS 4 folder gesture is confirmed by the database relationship
+// that Home writes for both supported cases: dragging onto another shortcut
+// creates a new positive folder container shared by both rows; dragging onto
+// an existing folder moves the source row into that folder while the folder
+// row remains on the desktop.  Keep this check independent of node labels so
+// localized and resource-name folders are handled the same way.
+bool folderPlacementConfirmed(const std::vector<FavoritePlacement> &actual,
+        int64_t sourceId, int64_t targetId, bool targetIsFolder) {
+    const auto source = std::find_if(actual.begin(), actual.end(),
+            [sourceId](const auto &item) { return item.id == sourceId; });
+    const auto target = std::find_if(actual.begin(), actual.end(),
+            [targetId](const auto &item) { return item.id == targetId; });
+    if (source == actual.end() || target == actual.end() || source->id == target->id) {
+        return false;
+    }
+    if (targetIsFolder) {
+        return source->container == targetId && source->container > 0
+                && source->screen < 0;
+    }
+    return source->container > 0 && source->container == target->container
+            && source->screen < 0 && target->screen < 0;
+}
+
+bool waitForFolderPlacement(int64_t sourceId, int64_t targetId, bool targetIsFolder) {
+    const std::vector<int64_t> ids{sourceId, targetId};
+    for (int attempt = 0; attempt < 50; ++attempt) {
+        std::vector<FavoritePlacement> actual;
+        if (loadFavoritePlacements(ids, actual)
+                && folderPlacementConfirmed(actual, sourceId, targetId, targetIsFolder)) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return false;
+}
+
 bool loadPagePlacements(int64_t container, int32_t screen,
-        std::vector<FavoritePlacement> &out) {
+        std::vector<FavoritePlacement> &out, bool anyScreen = false) {
     if (g_sqlite_open_v2 == nullptr || g_sqlite_prepare_v2 == nullptr
             || g_sqlite_step == nullptr || g_sqlite_finalize == nullptr
             || g_sqlite_column_int == nullptr || g_sqlite_column_int64 == nullptr
@@ -2289,8 +2484,8 @@ bool loadPagePlacements(int64_t container, int32_t screen,
     }
     if (g_sqlite_busy_timeout != nullptr) g_sqlite_busy_timeout(db, 80);
     std::string sql = "SELECT _id,container,screen,cellX,cellY,spanX,spanY,itemType "
-            "FROM favorites WHERE container=" + std::to_string(container)
-            + " AND screen=" + std::to_string(screen);
+            "FROM favorites WHERE container=" + std::to_string(container);
+    if (!anyScreen) sql += " AND screen=" + std::to_string(screen);
     Sqlite3Stmt *query = nullptr;
     bool ok = g_sqlite_prepare_v2(db, sql.c_str(), -1, &query, nullptr) == 0;
     int stepResult = kSqliteDone;
@@ -2369,6 +2564,11 @@ struct WireWriter {
     void none() { put8(0); }
     void someI32(int32_t value) { put8(1); put32(value); }
     void someI64(int64_t value) { put8(1); put64(value); }
+    void someString(const std::string &value) {
+        put8(1);
+        put32(static_cast<int32_t>(value.size()));
+        bytes.insert(bytes.end(), value.begin(), value.end());
+    }
 };
 
 void dispatchWire(uint32_t operation, const std::vector<uint8_t> &bytes) {
@@ -2383,7 +2583,7 @@ void dispatchWire(uint32_t operation, const std::vector<uint8_t> &bytes) {
 }
 
 void appendSparseItemInfo(WireWriter &wire, const FavoritePlacement &source,
-        const FavoritePlacement &target) {
+        const FavoritePlacement &target, const std::string *title = nullptr) {
     // This is the generated ItemInfo SSE field order from the paired launcher.
     wire.someI64(source.id);             // id
     wire.none();                         // intent
@@ -2398,8 +2598,8 @@ void appendSparseItemInfo(WireWriter &wire, const FavoritePlacement &source,
     wire.none();                         // rank/order
     wire.none();                         // additional position
     wire.none();                         // additional position
-    wire.none();                         // title
-    wire.none();                         // label
+    if (title == nullptr) wire.none(); else wire.someString(*title); // title
+    if (title == nullptr) wire.none(); else wire.someString(*title); // label
     // The generated decoder has 35 fields; keep the sparse tail exact.
     wire.none();                         // field 16
     wire.none();                         // field 17
@@ -2424,6 +2624,7 @@ void appendSparseItemInfo(WireWriter &wire, const FavoritePlacement &source,
 }
 
 void clearLiftSession() {
+    g_lifted_folder_container.store(0);
     const int32_t hovered = g_virtual_hovered_id.exchange(-1, std::memory_order_acq_rel);
     const int32_t focused = g_virtual_focused_id.exchange(-1, std::memory_order_acq_rel);
     const AccessibilityEventSource hoveredSource = captureEventSource(hovered);
@@ -2972,6 +3173,11 @@ bool isLiftedSourceId(int32_t id) {
 }
 
 int32_t findCurrentDropParentNode() {
+    if (g_lifted_folder_container.load() > 0) {
+        for (const auto &node : g_workspace) {
+            if (node.resource == "com.miui.home:id/folder_grid_view") return node.id;
+        }
+    }
     for (const char *resource : {"com.miui.home:id/screen_content",
             "com.miui.home:id/workspace", "com.miui.home:id/hotseat"}) {
         for (const auto &node : g_workspace) {
@@ -3003,6 +3209,11 @@ int32_t findDropParentNode() {
 }
 
 void rebuildSlots() {
+    if (g_lifted_folder_container.load() > 0) {
+        g_slots.clear();
+        g_grid_cells.clear();
+        return;
+    }
     const int32_t screen = g_visible_screen.load(std::memory_order_acquire);
     const int32_t previousScreen = g_grid_screen;
     const bool previousGridUsable = previousScreen == screen && !g_grid_cells.empty();
@@ -3088,9 +3299,10 @@ void rebuildSlots() {
     std::vector<SnapshotFavorite> favorites;
     {
         std::lock_guard lock(g_snapshot_mutex);
+        const int32_t databaseScreen = databaseScreenForVisiblePage(g_snapshot, screen + 1);
         for (const auto &favorite : g_snapshot.favorites) {
             if (favorite.placement.container == kDesktopContainer
-                    && favorite.placement.screen == screen + 1) {
+                    && favorite.placement.screen == databaseScreen) {
                 favorites.push_back(favorite);
             }
         }
@@ -3613,20 +3825,16 @@ bool updateTouchExplorationTarget(int32_t action, float x, float y) {
     const int32_t previous = g_virtual_hovered_id.exchange(target,
             std::memory_order_acq_rel);
     if (previous != target && isVirtualNode(previous)) sendEvent(previous, 256);
-    if (!isVirtualNode(target)) {
-        const int32_t focused = g_virtual_focused_id.exchange(-1);
-        if (isVirtualNode(focused)) sendEvent(focused, 65536);
-        return false;
-    }
+    if (!isVirtualNode(target)) return false;
     if (previous == target) return true;
-    const int32_t focused = g_virtual_focused_id.exchange(target);
-    if (focused != target && isVirtualNode(focused)) sendEvent(focused, 65536);
+    // The reader requests accessibility focus after hover; doing both here
+    // makes TalkBack announce each cell twice.
     sendEvent(target, 128); // TYPE_VIEW_HOVER_ENTER
-    if (focused != target) sendEvent(target, 32768);
     return true;
 }
 
 void onLauncherMotion(void *scene, void *event) {
+    markLauncherInputForeground();
     if (event != nullptr && g_motion_action_masked != nullptr
             && g_motion_raw_x != nullptr && g_motion_raw_y != nullptr) {
         const int32_t action = g_motion_action_masked(event);
@@ -3799,6 +4007,13 @@ void setTraversalAfterForRealNode(void *node) {
     {
         std::lock_guard lock(g_session_mutex);
         if (hotseatNodeLocked(describeNode(node))) return;
+        if (!g_grid_cells.empty() && liftedSourceNodeLocked(describeNode(node))) {
+            // Its vacated cell already has a virtual drop target. Keeping both
+            // in traversal skips that target when swiping back from the next cell.
+            if (g_node_set_visible != nullptr) g_node_set_visible(node, false);
+            if (g_node_set_important != nullptr) g_node_set_important(node, false);
+            return;
+        }
         for (const auto &cell : g_grid_cells) {
             if (bounds.centerX() >= cell.bounds.left && bounds.centerX() < cell.bounds.right
                     && bounds.centerY() >= cell.bounds.top && bounds.centerY() < cell.bounds.bottom) {
@@ -3985,7 +4200,10 @@ void orderGridChildren(void *node) {
     };
     auto *end = std::remove_if(children, children + count, [&](int64_t child) {
         const int32_t id = static_cast<int32_t>(child >> 32U);
-        return isVirtualNode(id) && slotIndexForVirtualIdLocked(id) < 0;
+        if (isVirtualNode(id)) return slotIndexForVirtualIdLocked(id) < 0;
+        return std::any_of(g_workspace.begin(), g_workspace.end(), [&](const auto &item) {
+            return item.id == id && !hotseatNodeLocked(item) && liftedSourceNodeLocked(item);
+        });
     });
     std::stable_sort(children, end, [&](int64_t left, int64_t right) { return rank(left) < rank(right); });
     const size_t length = static_cast<size_t>(std::unique(children, end) - children);
@@ -4008,6 +4226,153 @@ void traceDiagnosticsNode(void *node, int32_t nodeId, uint32_t before) {
     }
 }
 
+bool folderRefreshPending() {
+    return g_folder_refresh_active.load() && g_folder_refresh_result.load() == 0
+            && g_launcher_window_focused.load() == 1
+            && g_folder_refresh_focus_generation.load() == g_focus_generation.load();
+}
+
+bool beginFolderRefresh() {
+    // Initialize before database waits; workers must not rearm a cancelled refresh.
+    std::lock_guard lock(g_folder_refresh_mutex);
+    g_folder_refresh_focus_generation.store(g_focus_generation.load());
+    g_folder_refresh_stage = 0;
+    g_folder_refresh_scroll_requested.store(false);
+    g_folder_refresh_result.store(0);
+    g_folder_refresh_active.store(true);
+    if (folderRefreshPending()) return true;
+    g_folder_refresh_active.store(false);
+    g_folder_refresh_result.store(-1);
+    return false;
+}
+
+int32_t refreshedDesktopItem(const std::vector<ObservedNode> &nodes,
+        const FavoritePlacement &item, const std::string &label) {
+    if (item.container != kDesktopContainer || item.cellX < 0 || item.cellY < 0) return -1;
+    const ObservedNode *workspace = nullptr;
+    for (const char *resource : {"com.miui.home:id/screen_content", "com.miui.home:id/workspace"}) {
+        const auto found = std::find_if(nodes.begin(), nodes.end(), [&](const auto &node) {
+            return node.resource == resource && node.bounds.width() > 0 && node.bounds.height() > 0;
+        });
+        if (found != nodes.end()) { workspace = &*found; break; }
+    }
+    if (workspace == nullptr) return -1;
+    int32_t page = -1;
+    for (const auto &node : nodes) {
+        if (node.host == workspace->host && node.window == workspace->window
+                && parsePageIndicator(node.label, page)) {
+            rememberVisibleScreen(node.label);
+            break;
+        }
+    }
+    if (page < 1 || databaseScreenForVisiblePage(page) != item.screen) return -1;
+    std::lock_guard lock(g_session_mutex);
+    g_workspace = nodes;
+    rebuildSlots();
+    if (g_grid_screen != page - 1) return -1;
+    const auto cell = std::find_if(g_grid_cells.begin(), g_grid_cells.end(), [&](const auto &slot) {
+        return slot.row == item.cellY && slot.column == item.cellX;
+    });
+    if (cell == g_grid_cells.end()) return -1;
+    int32_t matched = -1;
+    for (const auto &node : nodes) {
+        if (node.resource != (item.itemType == 2 ? "com.miui.home:id/folder" : "com.miui.home:id/icon_icon")
+                || !labelMatches(node.label, label) || node.host != workspace->host
+                || node.window != workspace->window || hotseatNodeLocked(node)
+                || !descendsFromLocked(node, workspace->id)
+                || node.bounds.centerX() < cell->bounds.left || node.bounds.centerX() >= cell->bounds.right
+                || node.bounds.centerY() < cell->bounds.top || node.bounds.centerY() >= cell->bounds.bottom) continue;
+        if (matched >= 0) return -1;
+        matched = node.id;
+    }
+    return matched;
+}
+
+int32_t adjacentFolderSource(const std::vector<ObservedNode> &nodes, const ObservedNode &grid,
+        const std::string &source, const std::string &target, bool after) {
+    std::vector<const ObservedNode *> members;
+    for (const auto &node : nodes) {
+        if (node.icon() && node.host == grid.host && node.window == grid.window
+                && nodeDescendsFrom(nodes, node, grid.id)
+                && node.bounds.width() > 0 && node.bounds.height() > 0
+                && node.bounds.centerX() >= grid.bounds.left && node.bounds.centerX() < grid.bounds.right
+                && node.bounds.centerY() >= grid.bounds.top && node.bounds.centerY() < grid.bounds.bottom) {
+            members.push_back(&node);
+        }
+    }
+    std::sort(members.begin(), members.end(), [](const auto *left, const auto *right) {
+        return left->bounds.top != right->bounds.top ? left->bounds.top < right->bounds.top
+                : left->bounds.left < right->bounds.left;
+    });
+    int32_t sourceIndex = -1, targetIndex = -1;
+    for (size_t index = 0; index < members.size(); ++index) {
+        if (labelMatches(members[index]->label, source)) {
+            if (sourceIndex >= 0) return -1;
+            sourceIndex = static_cast<int32_t>(index);
+        }
+        if (labelMatches(members[index]->label, target)) {
+            if (targetIndex >= 0) return -1;
+            targetIndex = static_cast<int32_t>(index);
+        }
+    }
+    if (sourceIndex < 0 || targetIndex < 0
+            || sourceIndex != targetIndex + (after ? 1 : -1)) return -1;
+    return members[sourceIndex]->id;
+}
+
+void advanceFolderRefresh(void *provider) {
+    if (!folderRefreshPending() || g_folder_refresh_querying.exchange(true)) return;
+    {
+        std::lock_guard lock(g_folder_refresh_mutex);
+        if (g_folder_refresh_stage == 0) { g_folder_refresh_querying.store(false); return; }
+    }
+    std::vector<ObservedNode> nodes;
+    readTree(provider, -1, nodes);
+    int32_t actionNode = -1, action = 0, nextStage = 0;
+    {
+        std::lock_guard lock(g_folder_refresh_mutex);
+        if (!folderRefreshPending()) { g_folder_refresh_querying.store(false); return; }
+        const auto grid = std::find_if(nodes.begin(), nodes.end(), [](const auto &node) {
+            return node.resource == "com.miui.home:id/folder_grid_view";
+        });
+        if ((g_folder_refresh_stage == 1 || g_folder_refresh_stage == 4 || g_folder_refresh_stage == 5)
+                && grid == nodes.end()) {
+            actionNode = refreshedDesktopItem(nodes, g_folder_refresh_item,
+                    g_folder_refresh_stage == 4 ? g_folder_refresh_source : g_folder_refresh_title);
+            action = g_folder_refresh_stage == 1 ? 16 : kAccessibilityFocusAction;
+            nextStage = g_folder_refresh_stage == 1 ? 2 : 3;
+        } else if (g_folder_refresh_stage == 2 && grid != nodes.end()) {
+            actionNode = adjacentFolderSource(nodes, *grid, g_folder_refresh_source,
+                    g_folder_refresh_target, g_folder_refresh_after);
+            action = kAccessibilityFocusAction;
+            nextStage = 3;
+            if (actionNode < 0) {
+                g_folder_refresh_scroll_bounds = grid->bounds;
+                g_folder_refresh_scroll_requested.store(true);
+            }
+        }
+    }
+    if (actionNode >= 0 && g_original_perform_action != nullptr && folderRefreshPending()) {
+        uintptr_t args[2]{1, 0};
+        const bool handled = g_original_perform_action(provider, actionNode, action, args);
+        {
+            std::lock_guard lock(g_folder_refresh_mutex);
+            if (handled && folderRefreshPending()) {
+                g_folder_refresh_stage = nextStage;
+                if (nextStage == 3) {
+                    int pending = 0;
+                    if (g_folder_refresh_result.compare_exchange_strong(pending, 1)) {
+                        g_folder_refresh_active.store(false);
+                    }
+                }
+            }
+        }
+        nativeLog(ANDROID_LOG_INFO, "ActionGridNative", "folder refresh action=%d node=%d handled=%d",
+                action, actionNode, handled ? 1 : 0);
+    }
+    g_folder_refresh_querying.store(false);
+}
+
 NodeResult onCreateNode(void *provider, int32_t nodeId) {
     if (isVirtualNode(nodeId)) {
         return g_lifted.load(std::memory_order_acquire) && moveActionsReady()
@@ -4016,11 +4381,13 @@ NodeResult onCreateNode(void *provider, int32_t nodeId) {
     NodeResult result = g_original_create_node == nullptr
             ? NodeResult{1U, nullptr} : g_original_create_node(provider, nodeId);
     if ((result.absent & 1U) != 0 || result.node == nullptr) return result;
+    advanceFolderRefresh(provider);
     if (g_focus_callback_active.load(std::memory_order_acquire)) {
         g_focus_callback_node_observed.store(true, std::memory_order_release);
     }
     const uint32_t actionsBefore = g_custom_action_calls.load();
-    if (g_launcher_window_focused.load(std::memory_order_acquire) == 0) {
+    if (g_launcher_window_focused.load(std::memory_order_acquire) == 0
+            && !g_lifted.load(std::memory_order_acquire)) {
         // Home can build/cache these nodes inside its focus callback, before
         // our foreground state changes. Their actions must already be present.
         injectIconActions(result.node);
@@ -4034,7 +4401,9 @@ NodeResult onCreateNode(void *provider, int32_t nodeId) {
         g_window_id.store(nodeField<int32_t>(result.node, 0x418));
         observeSurfaceNode(provider, nodeId, result.node);
         observePendingPlacement(describeNode(result.node));
-        if (nodeId == -1) {
+        const bool visiblePageQuery = nodeString(result.node, 0x1b8) == "com.miui.home:id/screen_content"
+                && describeNode(result.node).bounds.width() > 0;
+        if (nodeId == -1 || visiblePageQuery) {
             // A root query is a safe provider lifetime boundary.  Build the
             // surface snapshot here instead of handing this raw provider to a
             // background poller after the accessibility call has returned.
@@ -4042,6 +4411,7 @@ NodeResult onCreateNode(void *provider, int32_t nodeId) {
             readTree(provider, -1, nodes);
             observePendingPlacements(nodes);
             if (!nodes.empty()) observeSurfaceTree(provider, nodes);
+            recoverWorkspaceSemantics(provider, nodes);
         }
         const std::string pageDescription = nodeString(result.node, 0x138);
         const bool lifted = g_lifted.load(std::memory_order_acquire);
@@ -4197,15 +4567,219 @@ int64_t uptimeMillis() {
 }
 
 bool injectTouch(int64_t down, int32_t action, float x, float y) {
-    void *motion = g_motion_new(down, uptimeMillis(), action, x, y, 0x1002);
-    if (motion == nullptr) return false;
+    const int64_t eventTime = uptimeMillis();
+    void *motion = g_motion_new_with_display != nullptr
+            ? g_motion_new_with_display(down, eventTime, action, 0, -1, 0,
+                    0x1002, 0, x, y, 1.0f, 1.0f, 1.0f, 1.0f)
+            : g_motion_new(down, eventTime, action, x, y, 0);
+    if (motion == nullptr) {
+        nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
+                "input motion-null action=%d down=%lld event=%lld x=%.1f y=%.1f",
+                action, static_cast<long long>(down), static_cast<long long>(eventTime), x, y);
+        return false;
+    }
     // newWithMotionEvent consumes the MotionEvent allocation.
     void *event = g_input_event(motion);
-    if (event == nullptr) return false;
+    if (event == nullptr) {
+        nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
+                "input input-event-null action=%d x=%.1f y=%.1f",
+                action, x, y);
+        return false;
+    }
     uint64_t result = g_inject_input(event, 0, -1);
     g_input_drop(event);
-    return (result & 1U) != 0;
+    // The native Result<bool> has its error tag in bit 0 and Ok payload in bit 8.
+    const bool accepted = (result & 1U) == 0 && (result & 0x100U) != 0;
+    nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
+            "input action=%d x=%.1f y=%.1f result=0x%016llx accepted=%d",
+            action, x, y, static_cast<unsigned long long>(result), accepted ? 1 : 0);
+    return accepted;
 }
+
+bool closeRefreshingFolder(const Bounds &bounds) {
+    if (!folderRefreshPending()) return false;
+    const int64_t down = uptimeMillis();
+    const float x = static_cast<float>(std::max(1, bounds.left / 2));
+    const float y = static_cast<float>(bounds.centerY());
+    if (!injectTouch(down, 0, x, y)) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    if (folderRefreshPending() && injectTouch(down, 1, x, y)) return true;
+    // Finish an existing pointer stream without clicking the newly focused window.
+    injectTouch(down, 3, x, y);
+    return false;
+}
+
+bool scrollRefreshingFolder() {
+    if (!g_folder_refresh_scroll_requested.exchange(false)) return false;
+    if (!folderRefreshPending()) return false;
+    Bounds bounds;
+    {
+        std::lock_guard lock(g_folder_refresh_mutex);
+        bounds = g_folder_refresh_scroll_bounds;
+    }
+    const int64_t down = uptimeMillis();
+    bool accepted = true, started = false;
+    for (int step = 0; step <= 21 && accepted; ++step) {
+        if (!folderRefreshPending()) { accepted = false; break; }
+        const int action = step == 0 ? 0 : step == 21 ? 1 : 2;
+        const float progress = static_cast<float>(std::min(step, 20)) / 20.0f;
+        const float y = bounds.bottom - bounds.height() * (0.15f + 0.7f * progress);
+        accepted = injectTouch(down, action, bounds.centerX(), y);
+        if (step == 0 && accepted) started = true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if (!accepted && started) injectTouch(down, 3, bounds.centerX(), bounds.centerY());
+    return accepted;
+}
+
+bool nodeBounds(void *provider, int32_t nodeId, Bounds &bounds, std::string *label);
+bool isFolderNode(void *provider, int32_t nodeId);
+
+bool removeEmptyFolder7748(const FavoritePlacement &folder) {
+    if (g_launcher_profile.load() != LauncherAbiProfile::kLegacy7748
+            || folder.id <= 0 || folder.itemType != 2 || !workspaceContainer(folder.container)) return false;
+    std::vector<FavoritePlacement> children;
+    if (!loadPagePlacements(folder.id, -1, children, true) || !children.empty()) return false;
+    WireWriter wire;
+    appendSparseItemInfo(wire, folder, folder);
+    // 7748 delete_item_database: one ItemInfo, WHERE _id=?, no recursive delete.
+    dispatchWire(818, wire.bytes);
+    for (int attempt = 0; attempt < 30; ++attempt) {
+        std::vector<FavoritePlacement> page;
+        if (loadPagePlacements(folder.container, folder.screen, page)
+                && std::none_of(page.begin(), page.end(), [&](const auto &item) { return item.id == folder.id; })) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return false;
+}
+
+bool performNativeFolderPlacement(void *provider, int32_t nodeId) {
+    if (provider == nullptr || !g_lifted.load() || !moveActionsReady()
+            || g_launcher_profile.load() != LauncherAbiProfile::kLegacy7748) return false;
+    ObservedNode sourceNode;
+    FavoritePlacement source;
+    {
+        std::lock_guard lock(g_session_mutex);
+        if (g_sources.size() != 1 || g_source_placements.size() != 1
+                || g_sources.front().resource != "com.miui.home:id/icon_icon") return false;
+        sourceNode = g_sources.front();
+        source = g_source_placements.front();
+    }
+    if (source.id < 0 || !workspaceContainer(source.container)) return false;
+    Bounds targetBounds{};
+    std::string targetLabel;
+    if (!nodeBounds(provider, nodeId, targetBounds, &targetLabel)) return false;
+    const bool targetIsFolder = isFolderNode(provider, nodeId);
+    AppTarget target;
+    if (!resolveAppTarget(nodeId, targetLabel, target, g_visible_screen.load() + 1,
+                targetIsFolder ? 2 : 0, &targetBounds)
+            || target.placement.id == source.id
+            || target.placement.container != kDesktopContainer) return false;
+    if (g_model_move_running.exchange(true)) return false;
+    if (!beginFolderRefresh()) { g_model_move_running.store(false); return false; }
+    const auto eventSource = captureDropParentEventSource(nodeId);
+    std::thread([source, target = target.placement, targetIsFolder, targetLabel, eventSource] {
+        bool committed = false;
+        FavoritePlacement folder = target;
+        std::vector<FavoritePlacement> originals;
+        if (loadFavoritePlacements({source.id, target.id}, originals) && originals.size() == 2
+                && originals[0].container == source.container && originals[0].screen == source.screen
+                && originals[0].cellX == source.cellX && originals[0].cellY == source.cellY
+                && originals[1].container == target.container && originals[1].screen == target.screen
+                && originals[1].cellX == target.cellX && originals[1].cellY == target.cellY) {
+            bool ready = targetIsFolder;
+            if (!targetIsFolder) {
+                std::vector<FavoritePlacement> before;
+                if (loadPagePlacements(target.container, target.screen, before)) {
+                    folder = {-1, target.container, target.screen, target.cellX, target.cellY, 1, 1, 2};
+                    WireWriter create;
+                    const std::string title = "文件夹";
+                    appendSparseItemInfo(create, folder, folder, &title);
+                    // The verified insert allocates its own ID; confirm the persisted row.
+                    dispatchWire(827, create.bytes);
+                    for (int attempt = 0; attempt < 40 && !ready; ++attempt) {
+                        std::vector<FavoritePlacement> after, created;
+                        if (loadPagePlacements(target.container, target.screen, after)) {
+                            for (const auto &item : after) {
+                                if (item.itemType == 2 && item.cellX == target.cellX && item.cellY == target.cellY
+                                        && std::none_of(before.begin(), before.end(),
+                                                [&](const auto &old) { return old.id == item.id; })) created.push_back(item);
+                            }
+                            if (created.size() == 1) { folder = created.front(); ready = true; }
+                        }
+                        if (!ready) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    }
+                }
+            }
+            std::vector<FavoritePlacement> members;
+            if (ready && loadPagePlacements(folder.id, -1, members, true)
+                    && std::all_of(members.begin(), members.end(),
+                            [](const auto &item) { return item.screen == -1 && item.cellY == 0; })) {
+                int next = 0;
+                for (const auto &item : members) next = std::max(next, item.cellX + 1);
+                FavoritePlacement movedSource = source;
+                movedSource.container = folder.id;
+                movedSource.screen = -1;
+                movedSource.cellX = targetIsFolder ? next : 1;
+                movedSource.cellY = 0;
+                std::vector<FavoritePlacement> expected{movedSource};
+                if (!targetIsFolder) {
+                    auto movedTarget = target;
+                    movedTarget.container = folder.id;
+                    movedTarget.screen = -1;
+                    movedTarget.cellX = 0;
+                    movedTarget.cellY = 0;
+                    expected.push_back(movedTarget);
+                }
+                WireWriter move;
+                move.put32(static_cast<int32_t>(expected.size()));
+                for (const auto &item : expected) appendSparseItemInfo(move, item, item);
+                dispatchWire(batchMoveOperation(LauncherAbiProfile::kLegacy7748), move.bytes);
+                committed = waitForPlacements(expected)
+                        && waitForFolderPlacement(source.id, target.id, targetIsFolder);
+                if (!committed && !targetIsFolder) {
+                    WireWriter rollback;
+                    rollback.put32(static_cast<int32_t>(originals.size()));
+                    for (const auto &item : originals) appendSparseItemInfo(rollback, item, item);
+                    dispatchWire(batchMoveOperation(LauncherAbiProfile::kLegacy7748), rollback.bytes);
+                    if (waitForPlacements(originals)) removeEmptyFolder7748(folder);
+                }
+            }
+            if (!committed && !targetIsFolder && folder.id > 0) removeEmptyFolder7748(folder);
+        }
+        if (committed) {
+            requestSnapshotRefresh(true);
+            clearLiftSession();
+            {
+                std::lock_guard lock(g_folder_refresh_mutex);
+                if (folderRefreshPending()) {
+                    g_folder_refresh_title = targetIsFolder ? targetLabel : "文件夹";
+                    g_folder_refresh_item = folder;
+                    g_folder_refresh_stage = 5;
+                }
+            }
+            invokeWorkspaceReload();
+            for (int attempt = 0; attempt < 50 && folderRefreshPending(); ++attempt) {
+                if (attempt % 5 == 0) sendEvent({eventSource.host, eventSource.window, -1}, kTypeWindowContentChanged);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            g_folder_refresh_active.store(false);
+            committed = g_folder_refresh_result.load() == 1
+                    && waitForFolderPlacement(source.id, target.id, targetIsFolder);
+        }
+        g_folder_refresh_active.store(false);
+        announceReliably(eventSource.host, eventSource.window, -1,
+                committed ? (targetIsFolder ? "已放入文件夹" : "已创建文件夹")
+                          : "未能确认文件夹操作，请检查图标位置后重试");
+        nativeLog(committed ? ANDROID_LOG_INFO : ANDROID_LOG_WARN, "ActionGridNative",
+                "HyperOS4 folder placement source=%lld target=%lld folder=%lld create=%d confirmed=%d",
+                static_cast<long long>(source.id), static_cast<long long>(target.id),
+                static_cast<long long>(folder.id), targetIsFolder ? 0 : 1, committed ? 1 : 0);
+        g_model_move_running.store(false);
+    }).detach();
+    return true;
+}
+
 
 bool nodeBounds(void *provider, int32_t nodeId, Bounds &bounds, std::string *label = nullptr) {
     if (g_create_node == nullptr || g_node_drop == nullptr) return false;
@@ -4374,6 +4948,10 @@ void setSurfaceState(SurfaceState next, void *provider) {
 }
 
 void onLauncherWindowFocus(void *window, bool focused) {
+    if (!focused) {
+        g_folder_refresh_active.store(false);
+        g_folder_refresh_result.store(-1);
+    }
     if (focused && g_diagnostics.session() != 0) g_diagnostics_node_budget.store(8);
     if (!focused) g_focus_generation.fetch_add(1, std::memory_order_acq_rel);
     // Mark Home focused before its callback rebuilds cached nodes.  Those
@@ -4450,6 +5028,7 @@ void onLauncherWindowFocus(void *window, bool focused) {
 }
 
 bool onLauncherKey(void *scene, void *event) {
+    markLauncherInputForeground();
     if (event != nullptr && g_key_code != nullptr && g_key_action != nullptr
             && g_key_code(event) == 4) {
         const int32_t action = g_key_action(event);
@@ -4465,6 +5044,7 @@ bool onLauncherKey(void *scene, void *event) {
 }
 
 void onLauncherBack(void *helper) {
+    markLauncherInputForeground();
     cancelLiftSession(-1);
     // The launcher owns the gesture callback and must finish its native cleanup.
     if (g_original_launcher_back != nullptr) g_original_launcher_back(helper);
@@ -4855,7 +5435,8 @@ bool closeRecentTask(void *provider, int32_t nodeId) {
     Bounds bounds{};
     std::string label;
     if (!nodeBounds(provider, nodeId, bounds, &label) || !isRecentTaskLabel(label)
-            || g_motion_new == nullptr || g_input_event == nullptr
+            || (g_motion_new_with_display == nullptr && g_motion_new == nullptr)
+            || g_input_event == nullptr
             || g_input_drop == nullptr || g_inject_input == nullptr) {
         return false;
     }
@@ -4883,7 +5464,9 @@ bool closeRecentTask(void *provider, int32_t nodeId) {
 }
 
 bool lockRecentTask(void *provider, int32_t nodeId, const Bounds &bounds) {
-    if (provider == nullptr || g_motion_new == nullptr || g_input_event == nullptr
+    if (provider == nullptr
+            || (g_motion_new_with_display == nullptr && g_motion_new == nullptr)
+            || g_input_event == nullptr
             || g_input_drop == nullptr || g_inject_input == nullptr) {
         return false;
     }
@@ -5008,9 +5591,17 @@ bool buildModelMove(void *provider, int32_t nodeId, int32_t actionId,
             return false;
         }
         base.container = kDesktopContainer;
-        // Accessibility page indexes are zero-based; launcher favorites.screen
-        // is one-based (the first desktop page is screen=1).
-        base.screen = g_visible_screen.load(std::memory_order_acquire) + 1;
+        // Accessibility page indexes are compact visual ordinals.  Home can
+        // retain a deleted page's database number, so resolve the current
+        // visual page back to the persisted favorites.screen value.
+        base.screen = databaseScreenForVisiblePage(
+                g_visible_screen.load(std::memory_order_acquire) + 1);
+        if (base.screen <= 0) {
+            nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
+                    "HyperOS4 move could not map visual page=%d to database screen",
+                    g_visible_screen.load(std::memory_order_acquire) + 1);
+            return false;
+        }
     } else {
         if (provider == nullptr) {
             nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
@@ -5238,10 +5829,13 @@ bool findVisiblePlacements(const std::vector<ObservedNode> &nodes,
     for (const auto &node : nodes) {
         if (parsePageIndicator(node.label, page)) break;
     }
-    if (page != expected.front().item.screen) return false;
+    const int32_t expectedPage = visiblePageForDatabaseScreen(expected.front().item.screen);
+    if (page != (expectedPage > 0 ? expectedPage : expected.front().item.screen)) return false;
     std::unordered_set<int32_t> matched;
     for (const auto &target : expected) {
-        if (target.item.screen != page || target.bounds.width() <= 0
+        const int32_t targetPage = visiblePageForDatabaseScreen(target.item.screen);
+        if ((targetPage > 0 ? targetPage : target.item.screen) != page
+                || target.bounds.width() <= 0
                 || target.bounds.height() <= 0) return false;
         auto found = std::find_if(nodes.begin(), nodes.end(), [&](const auto &node) {
             return node.icon() && matched.count(node.id) == 0
@@ -5261,13 +5855,216 @@ bool findVisiblePlacements(const std::vector<ObservedNode> &nodes,
 std::string placementAnnouncement(const std::vector<VisiblePlacement> &placed) {
     if (placed.empty()) return {};
     const auto &first = placed.front();
+    const int32_t page = visiblePageForDatabaseScreen(first.item.screen);
     // System Home's zh-CN announce_to_drop_workspace resource.
-    return "已放置在第" + std::to_string(first.item.screen)
+    return "已放置在第" + std::to_string(page > 0 ? page : first.item.screen)
             + "页，第" + std::to_string(first.item.cellY + 1)
             + "行，第" + std::to_string(first.item.cellX + 1) + "列";
 }
 
+bool performFolderMoveOut(void *provider, int32_t nodeId) {
+    if (!moveActionsReady() || g_launcher_profile.load() != LauncherAbiProfile::kLegacy7748
+            || g_model_move_running.load() || g_motion_new_with_display == nullptr
+            || g_input_event == nullptr || g_input_drop == nullptr || g_inject_input == nullptr) return false;
+    std::vector<ObservedNode> nodes;
+    readTree(provider, -1, nodes);
+    auto sourceNode = std::find_if(nodes.begin(), nodes.end(), [nodeId](const auto &node) {
+        return node.id == nodeId && node.icon();
+    });
+    auto grid = std::find_if(nodes.begin(), nodes.end(), [](const auto &node) {
+        return node.resource == "com.miui.home:id/folder_grid_view";
+    });
+    FavoritePlacement source;
+    if (sourceNode == nodes.end() || grid == nodes.end()
+            || !resolveFolderItem(nodes, sourceNode->label, 0, source)) return false;
+    std::vector<FavoritePlacement> parents, siblings, desktop;
+    if (!loadFavoritePlacements({source.container}, parents) || parents.size() != 1
+            || parents.front().container != kDesktopContainer
+            || !loadPagePlacements(source.container, source.screen, siblings, true)
+            || std::none_of(siblings.begin(), siblings.end(), [&](const auto &item) { return item.id == source.id; })
+            || !loadPagePlacements(kDesktopContainer, parents.front().screen, desktop)) return false;
+    const int columns = g_cell_count_x == nullptr ? g_grid_columns.load() : g_cell_count_x();
+    const int rows = g_cell_count_y == nullptr ? g_grid_rows.load() : g_cell_count_y();
+    if (columns <= 0 || rows <= 0) return false;
+    FavoritePlacement placed = source;
+    placed.container = kDesktopContainer;
+    placed.screen = parents.front().screen;
+    bool found = false;
+    for (int row = 0; row < rows && !found; ++row) {
+        for (int column = 0; column < columns && !found; ++column) {
+            const bool occupied = std::any_of(desktop.begin(), desktop.end(), [&](const auto &item) {
+                return column >= item.cellX && column < item.cellX + item.spanX
+                        && row >= item.cellY && row < item.cellY + item.spanY;
+            });
+            if (!occupied) { placed.cellX = column; placed.cellY = row; found = true; }
+        }
+    }
+    if (!found) { sendAnnouncement(nodeId, "当前桌面页没有空位"); return false; }
+    siblings.erase(std::remove_if(siblings.begin(), siblings.end(),
+            [&](const auto &item) { return item.id == source.id; }), siblings.end());
+    std::sort(siblings.begin(), siblings.end(), [](const auto &a, const auto &b) { return a.cellX < b.cellX; });
+    std::vector<FavoritePlacement> expected{placed};
+    for (size_t index = 0; index < siblings.size(); ++index) {
+        siblings[index].cellX = static_cast<int32_t>(index);
+        siblings[index].cellY = 0;
+        expected.push_back(siblings[index]);
+    }
+    WireWriter wire;
+    wire.put32(static_cast<int32_t>(expected.size()));
+    for (const auto &item : expected) appendSparseItemInfo(wire, item, item);
+    if (g_model_move_running.exchange(true)) return false;
+    if (!beginFolderRefresh()) { g_model_move_running.store(false); return false; }
+    const AccessibilityEventSource eventSource{grid->host, grid->window, grid->id};
+    const Bounds gridBounds = grid->bounds;
+    const std::string sourceLabel = sourceNode->label;
+    dispatchWire(batchMoveOperation(g_launcher_profile.load()), wire.bytes);
+    const FavoritePlacement parent = parents.front();
+    const bool emptyFolder = siblings.empty();
+    std::thread([expected, eventSource, gridBounds, sourceLabel, parent, emptyFolder] {
+        bool committed = waitForPlacements(expected);
+        if (committed && emptyFolder) committed = removeEmptyFolder7748(parent);
+        if (committed) {
+            requestSnapshotRefresh(true);
+            invokeWorkspaceReload();
+            {
+                std::lock_guard lock(g_placement_mutex);
+                // Let TalkBack finish recovery from the removed virtual node
+                // before restoring the confirmed destination in a live query.
+                g_pending_focus_not_before = std::chrono::steady_clock::now()
+                        + std::chrono::milliseconds(250);
+            }
+            clearLiftSession();
+            if (!closeRefreshingFolder(gridBounds)) g_folder_refresh_active.store(false);
+            {
+                std::lock_guard lock(g_folder_refresh_mutex);
+                if (folderRefreshPending()) {
+                    g_folder_refresh_source = sourceLabel;
+                    g_folder_refresh_item = expected.front();
+                    g_folder_refresh_stage = 4;
+                }
+            }
+            for (int attempt = 0; attempt < 50 && folderRefreshPending(); ++attempt) {
+                if (attempt % 5 == 0) sendEvent({eventSource.host, eventSource.window, -1}, kTypeWindowContentChanged);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            g_folder_refresh_active.store(false);
+            committed = placementsMatch(expected, "folder_move_out_reload")
+                    && g_folder_refresh_result.load() == 1;
+        }
+        g_folder_refresh_active.store(false);
+        announceReliably(eventSource.host, eventSource.window, -1,
+                committed ? "已移出文件夹" : "未能确认移出文件夹，请检查图标位置");
+        nativeLog(ANDROID_LOG_INFO, "ActionGridNative", "folder move out committed=%d id=%lld",
+                committed ? 1 : 0, static_cast<long long>(expected.front().id));
+        g_model_move_running.store(false);
+    }).detach();
+    return true;
+}
+
+bool performFolderReorder(void *provider, int32_t nodeId, int32_t actionId) {
+    if (!moveActionsReady() || g_launcher_profile.load() != LauncherAbiProfile::kLegacy7748
+            || (actionId != kMoveBeforeAction && actionId != kMoveAfterAction)) return false;
+    std::vector<ObservedNode> nodes;
+    readTree(provider, -1, nodes);
+    const auto targetNode = std::find_if(nodes.begin(), nodes.end(),
+            [nodeId](const auto &node) { return node.id == nodeId && node.icon(); });
+    if (targetNode == nodes.end()) return false;
+    const int64_t container = g_lifted_folder_container.load();
+    const auto grid = std::find_if(nodes.begin(), nodes.end(), [](const auto &node) {
+        return node.resource == "com.miui.home:id/folder_grid_view";
+    });
+    if (grid == nodes.end()) return false;
+    std::string title;
+    for (const auto &node : nodes) {
+        if (!node.icon() && !node.label.empty() && node.bounds.bottom <= grid->bounds.top) {
+            title = node.label;
+        }
+    }
+    if (title.empty()) return false;
+    std::vector<FavoritePlacement> parent;
+    if (!loadFavoritePlacements({container}, parent) || parent.size() != 1) return false;
+    FavoritePlacement source, target;
+    std::string sourceLabel;
+    {
+        std::lock_guard lock(g_session_mutex);
+        if (g_source_placements.size() != 1) return false;
+        source = g_source_placements.front();
+        sourceLabel = g_sources.front().label;
+    }
+    if (!resolveFolderItem(nodes, targetNode->label, container, target)
+            || source.container != container || source.id == target.id) return false;
+    std::vector<FavoritePlacement> expected;
+    if (!loadPagePlacements(container, source.screen, expected)) return false;
+    std::sort(expected.begin(), expected.end(), [](const auto &left, const auto &right) {
+        return left.cellX < right.cellX;
+    });
+    auto original = std::find_if(expected.begin(), expected.end(),
+            [&](const auto &item) { return item.id == source.id; });
+    if (original == expected.end()) return false;
+    source = *original;
+    expected.erase(original);
+    auto destination = std::find_if(expected.begin(), expected.end(),
+            [&](const auto &item) { return item.id == target.id; });
+    if (destination == expected.end()) return false;
+    if (actionId == kMoveAfterAction) ++destination;
+    expected.insert(destination, source);
+    WireWriter wire;
+    wire.put32(static_cast<int32_t>(expected.size()));
+    for (size_t index = 0; index < expected.size(); ++index) {
+        expected[index].cellX = static_cast<int32_t>(index);
+        expected[index].cellY = 0;
+        appendSparseItemInfo(wire, expected[index], expected[index]);
+    }
+    if (g_model_move_running.exchange(true)) return false;
+    if (!beginFolderRefresh()) { g_model_move_running.store(false); return false; }
+    const auto eventSource = captureDropParentEventSource(nodeId);
+    dispatchWire(batchMoveOperation(g_launcher_profile.load()), wire.bytes);
+    const Bounds gridBounds = grid->bounds;
+    std::thread([expected, eventSource, title, sourceLabel, targetLabel = targetNode->label,
+                 after = actionId == kMoveAfterAction, gridBounds, parent = parent.front()] {
+        bool committed = waitForPlacements(expected);
+        if (committed) {
+            requestSnapshotRefresh(true);
+            invokeWorkspaceReload();
+            clearLiftSession();
+            if (!closeRefreshingFolder(gridBounds)) g_folder_refresh_active.store(false);
+            std::this_thread::sleep_for(std::chrono::milliseconds(350));
+            {
+                std::lock_guard lock(g_folder_refresh_mutex);
+                if (folderRefreshPending()) {
+                    g_folder_refresh_title = title;
+                    g_folder_refresh_item = parent;
+                    g_folder_refresh_source = sourceLabel;
+                    g_folder_refresh_target = targetLabel;
+                    g_folder_refresh_after = after;
+                    g_folder_refresh_stage = 1;
+                }
+            }
+            sendEvent(eventSource, kTypeWindowContentChanged);
+            for (int attempt = 0; attempt < 50 && folderRefreshPending(); ++attempt) {
+                scrollRefreshingFolder();
+                if (attempt % 5 == 0) sendEvent({eventSource.host, eventSource.window, -1}, kTypeWindowContentChanged);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            g_folder_refresh_active.store(false);
+            committed = placementsMatch(expected, "folder_reorder_reload")
+                    && g_folder_refresh_result.load() == 1;
+        }
+        g_folder_refresh_active.store(false);
+        announceReliably(eventSource.host, eventSource.window, eventSource.nodeId,
+                committed ? "已调整文件夹内顺序" : "未能确认文件夹内移动，请重试");
+        nativeLog(ANDROID_LOG_INFO, "ActionGridNative", "folder reorder committed=%d count=%zu",
+                committed ? 1 : 0, expected.size());
+        g_model_move_running.store(false);
+    }).detach();
+    return true;
+}
+
 bool performNativePlacement(void *provider, int32_t nodeId, int32_t actionId) {
+    if (g_lifted_folder_container.load() > 0) return performFolderReorder(provider, nodeId, actionId);
+    if (actionId == kCreateFolderAction) {
+        return performNativeFolderPlacement(provider, nodeId);
+    }
     uint32_t capabilities = g_capabilities.load(std::memory_order_acquire);
     bool alreadyRunning = g_model_move_running.load(std::memory_order_acquire);
     const bool frbModelReady = g_frb_dispatcher != nullptr
@@ -5276,8 +6073,7 @@ bool performNativePlacement(void *provider, int32_t nodeId, int32_t actionId) {
     const bool privateAbiReady = g_launcher_system_compatible.load(std::memory_order_acquire)
             && (capabilities & (CAP_PRIVATE_BUILD_MATCH
             | CAP_PRIVATE_SYMBOLS)) == (CAP_PRIVATE_BUILD_MATCH | CAP_PRIVATE_SYMBOLS);
-    if (actionId == kCreateFolderAction || !moveProfileReady || !frbModelReady
-            || !privateAbiReady
+    if (!moveProfileReady || !frbModelReady || !privateAbiReady
             || alreadyRunning) {
         nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
                 "HyperOS4 placement rejected node=%d action=%d dispatcher=%p move=%d frb=%d private=%d running=%d",
@@ -5285,8 +6081,7 @@ bool performNativePlacement(void *provider, int32_t nodeId, int32_t actionId) {
                 moveProfileReady ? 1 : 0, frbModelReady ? 1 : 0,
                 privateAbiReady ? 1 : 0,
                 alreadyRunning ? 1 : 0);
-        if ((!moveProfileReady || !frbModelReady || !privateAbiReady)
-                && actionId != kCreateFolderAction) {
+        if (!moveProfileReady || !frbModelReady || !privateAbiReady) {
             sendAnnouncement(nodeId, "当前系统移动路径不可用");
         }
         return false;
@@ -5428,6 +6223,7 @@ bool performNativePlacement(void *provider, int32_t nodeId, int32_t actionId) {
 }
 
 bool performActionImpl(void *provider, int32_t nodeId, int32_t actionId, void *arguments) {
+    if (actionId == kMoveOutOfFolderAction) return performFolderMoveOut(provider, nodeId);
     if (isVirtualNode(nodeId) && (!g_lifted.load(std::memory_order_acquire)
             || virtualNodeDescription(nodeId).empty())) return false;
     if (actionId == kMoveBeforeAction || actionId == kMoveAfterAction
@@ -5507,6 +6303,37 @@ bool performActionImpl(void *provider, int32_t nodeId, int32_t actionId, void *a
         }
         auto source = std::find_if(nodes.begin(), nodes.end(),
                 [nodeId](const auto &node) { return node.id == nodeId && node.icon(); });
+        const auto folderGrid = std::find_if(nodes.begin(), nodes.end(), [](const auto &node) {
+            return node.resource == "com.miui.home:id/folder_grid_view";
+        });
+        if (folderGrid != nodes.end()) {
+            if (g_launcher_profile.load() != LauncherAbiProfile::kLegacy7748) {
+                sendAnnouncement(nodeId, "当前桌面版本暂不支持文件夹内移动");
+                return false;
+            }
+            FavoritePlacement placement;
+            if (source == nodes.end() || !resolveFolderItem(nodes, source->label, 0, placement)) {
+                sendAnnouncement(nodeId, "无法确认文件夹项目，请重新打开文件夹后重试");
+                return false;
+            }
+            clearLiftSession();
+            g_lifted_folder_container.store(placement.container);
+            {
+                std::lock_guard lock(g_session_mutex);
+                g_source = *source;
+                g_sources = {*source};
+                g_source_placements = {placement};
+                g_workspace = nodes;
+            }
+            g_lifted_node_id.store(nodeId);
+            g_lifted.store(true);
+            g_drop_parent_node_id.store(folderGrid->id);
+            g_drop_parent_host_id.store(folderGrid->host);
+            g_drop_parent_window_id.store(folderGrid->window);
+            sendEvent(folderGrid->id, kTypeWindowContentChanged);
+            sendAnnouncement(nodeId, "已拖起");
+            return true;
+        }
         if (source != nodes.end()) {
             AppTarget placement;
             FavoritePlacement sourcePlacement;
@@ -5523,8 +6350,11 @@ bool performActionImpl(void *provider, int32_t nodeId, int32_t actionId, void *a
                         && placement.placement.screen > 0) {
                     // The source placement is the reliable page when the
                     // accessibility page indicator is stale during a swipe.
-                    g_visible_screen.store(placement.placement.screen - 1,
-                            std::memory_order_release);
+                    const int32_t visiblePage = visiblePageForDatabaseScreen(
+                            placement.placement.screen);
+                    if (visiblePage > 0) {
+                        g_visible_screen.store(visiblePage - 1, std::memory_order_release);
+                    }
                     pageIndicatorSeen = true;
                 }
             }
@@ -5696,8 +6526,12 @@ bool performActionImpl(void *provider, int32_t nodeId, int32_t actionId, void *a
 }
 
 bool onPerformAction(void *provider, int32_t nodeId, int32_t actionId, void *arguments) {
+    if (actionId == kLiftAction || actionId == kCancelAction || isVirtualNode(nodeId)) {
+        markLauncherInputForeground();
+    }
     const bool trace = g_diagnostics.session() != 0
-            && (actionId == 16 || actionId >= kLiftAction || isVirtualNode(nodeId));
+            && (actionId == 16 || actionId == 64 || actionId == 128 || actionId == 131072
+                    || actionId >= kLiftAction || isVirtualNode(nodeId));
     if (trace) nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
             "action begin node=%d action=0x%x focus=%d lifted=%d page=%d hovered=%d focused=%d",
             nodeId, actionId, g_launcher_window_focused.load(), g_lifted.load() ? 1 : 0,
@@ -5733,6 +6567,8 @@ void resolveLauncherApis(void *handle) {
 #define RESOLVE_NATIVE(field, type, symbol) field = reinterpret_cast<type>(resolve(symbol))
     RESOLVE_NATIVE(g_frb_dispatcher, FrbDispatcherFn, "frb_pde_ffi_dispatcher_primary");
     RESOLVE_NATIVE(g_motion_new, MotionNewFn, "input_MotionEvent_new");
+    RESOLVE_NATIVE(g_motion_new_with_display, MotionNewWithDisplayFn,
+            "input_MotionEvent_newWithDisplayId");
     RESOLVE_NATIVE(g_motion_action_masked, MotionActionFn, "input_MotionEvent_getActionMasked");
     RESOLVE_NATIVE(g_motion_set_action, MotionSetActionFn, "input_MotionEvent_setAction");
     RESOLVE_NATIVE(g_motion_clone, MotionCloneFn, "input_MotionEvent_clone");
@@ -5900,6 +6736,7 @@ void resolveLauncherApis(void *handle) {
                     result, target, backup, dartBuildId);
         }
     }
+    resolveSemanticsRefresh();
     g_trigger_workspace_reload = resolveWorkspaceReloadForProfile(profile, dartBuildId);
     resolveGridCounts(profile);
     installLauncherLifecycleHooks(profile);
@@ -6249,6 +7086,9 @@ void injectIconActions(void *node) {
     }
     if (lifted) {
         injectDirectAction(node, kCancelAction, kCancelLabel);
+        if (g_lifted_folder_container.load() > 0 && liftedSource) {
+            injectDirectAction(node, kMoveOutOfFolderAction, u"移出文件夹");
+        }
         const Bounds bounds = nodeField<Bounds>(node, kNodeBoundsOffset);
         std::string location;
         {
@@ -6279,8 +7119,25 @@ void injectIconActions(void *node) {
         after += u"后面";
         injectDirectActionText(node, kMoveBeforeAction, before);
         injectDirectActionText(node, kMoveAfterAction, after);
+        bool canCreateFolder = false;
+        {
+            std::lock_guard lock(g_session_mutex);
+            canCreateFolder = g_sources.size() == 1
+                    && g_sources.front().resource == "com.miui.home:id/icon_icon";
+        }
+        if (canCreateFolder && g_lifted_folder_container.load() == 0
+                && g_launcher_profile.load() == LauncherAbiProfile::kLegacy7748) {
+            std::u16string folderAction = folder
+                    ? std::u16string(u"放进 ") + utf16FromUtf8(iconLabel)
+                    : std::u16string(u"和 ") + utf16FromUtf8(iconLabel) + u" 创建文件夹";
+            injectDirectActionText(node, kCreateFolderAction, folderAction);
+        }
     } else if (!lifted) {
         AppTarget target = targetForNode(sourceId, node);
+        if (target.placement.container > 0 && !folder
+                && g_launcher_profile.load() == LauncherAbiProfile::kLegacy7748) {
+            injectDirectAction(node, kMoveOutOfFolderAction, u"移出文件夹");
+        }
         if (!target.package.empty() && !target.activity.empty()) {
             injectDirectAction(node, kAppInfoAction, kAppInfoLabel);
             if (target.user == 0 && uninstallLaunchReady()) {
@@ -6346,6 +7203,199 @@ void logDiagnosticsSnapshot(const char *reason) {
                 g_snapshot.ready ? 1 : 0, static_cast<unsigned long long>(g_snapshot.generation),
                 g_snapshot.favorites.size(), g_snapshot.pageCounts.size());
     }
+}
+
+using FlutterAccessibilityFn = void (*)(void *);
+FlutterAccessibilityFn g_flutter_accessibility_enabled = nullptr;
+FlutterAccessibilityFn g_flutter_accessibility_disabled = nullptr;
+void *g_flutter_base = nullptr;
+std::atomic<bool> g_semantics_refresh_ready{false};
+std::atomic<bool> g_semantics_refresh_resolved{false};
+
+void *nativePointerField(void *object, size_t offset) {
+    if (object == nullptr) return nullptr;
+    // Android heap pointers can carry a top-byte tag; /proc/self/maps does not.
+    const uintptr_t address = (reinterpret_cast<uintptr_t>(object) & 0x00ffffffffffffffULL) + offset;
+    return readableAddress(reinterpret_cast<void *>(address), sizeof(void *))
+            ? nodeField<void *>(object, offset) : nullptr;
+}
+
+void resolveSemanticsRefresh() {
+    if (g_launcher_profile.load() != LauncherAbiProfile::kLegacy7748
+            || !g_launcher_fingerprint_ready.load() || g_semantics_refresh_resolved.exchange(true)) return;
+    void *table = nativePointerField(launcherLibraryBase(), 0xf0bb48);
+    if (!readableAddress(table, 0x268) || nodeField<uint64_t>(table, 0) != 0x268) return;
+    Dl_info engine{};
+    ElfFingerprint fingerprint{};
+    if (dladdr(table, &engine) == 0 || !readElfFingerprint(engine.dli_fname, fingerprint)
+            || !fingerprintMatches(fingerprint, kLegacy7748FlutterFingerprint)) return;
+    auto *base = static_cast<uint8_t *>(engine.dli_fbase);
+    void *enabled = nodeField<void *>(table, 0xf0);
+    void *disabled = nodeField<void *>(table, 0xf8);
+    if (enabled != base + 0x66db90 || disabled != base + 0x66dc58) return;
+    g_flutter_base = base;
+    g_flutter_accessibility_enabled = reinterpret_cast<FlutterAccessibilityFn>(enabled);
+    g_flutter_accessibility_disabled = reinterpret_cast<FlutterAccessibilityFn>(disabled);
+    g_semantics_refresh_ready.store(true, std::memory_order_release);
+    nativeLog(ANDROID_LOG_INFO, "ActionGridNative", "7748 workspace semantics recovery enabled");
+}
+
+struct WorkspaceIconCoverage {
+    int32_t page = -1, host = -1, window = -1, expected = 0, observed = 0;
+    int32_t nodeId = -1;
+};
+
+bool workspaceIconCoverage(const std::vector<ObservedNode> &nodes,
+        const LauncherSnapshot &snapshot, WorkspaceIconCoverage &coverage) {
+    if (!snapshot.ready || std::any_of(nodes.begin(), nodes.end(), [](const auto &node) {
+        return node.resource == "com.miui.home:id/folder_grid_view";
+    })) return false;
+    const auto workspace = std::find_if(nodes.begin(), nodes.end(), [](const auto &node) {
+        return node.resource == "com.miui.home:id/workspace" && node.bounds.width() > 0;
+    });
+    if (workspace == nodes.end()) return false;
+    const auto page = std::find_if(nodes.begin(), nodes.end(), [&](const auto &node) {
+        return node.resource == "com.miui.home:id/screen_content"
+                && node.host == workspace->host && node.window == workspace->window
+                && std::abs(node.bounds.left - workspace->bounds.left) <= 2
+                && std::abs(node.bounds.right - workspace->bounds.right) <= 2 && node.bounds.height() > 0;
+    });
+    if (page == nodes.end()) return false; // Allow only pixel rounding, not an animating partial page.
+    coverage = {};
+    coverage.host = page->host;
+    coverage.window = page->window;
+    coverage.nodeId = page->id;
+    for (const auto &node : nodes) {
+        if (node.host == page->host && node.window == page->window
+                && parsePageIndicator(node.label, coverage.page)) break;
+    }
+    if (coverage.page < 1) return false;
+    const int32_t screen = databaseScreenForVisiblePage(snapshot, coverage.page);
+    for (const auto &favorite : snapshot.favorites) {
+        const auto &item = favorite.placement;
+        if (item.container == kDesktopContainer && item.screen == screen
+                && (item.itemType == 0 || item.itemType == 2)) ++coverage.expected;
+    }
+    for (const auto &node : nodes) {
+        if (node.icon() && node.host == page->host && node.window == page->window
+                && node.bounds.width() > 0 && node.bounds.height() > 0
+                && nodeDescendsFrom(nodes, node, page->id)
+                && node.bounds.centerX() >= page->bounds.left && node.bounds.centerX() < page->bounds.right
+                && node.bounds.centerY() >= page->bounds.top && node.bounds.centerY() < page->bounds.bottom) {
+            ++coverage.observed;
+        }
+    }
+    return true;
+}
+
+struct WorkspaceRecoveryAttempt {
+    int32_t page = -1, host = -1, window = -1;
+    uint64_t generation = 0;
+    bool attempted = false;
+    bool focusPending = false;
+
+    bool take(const WorkspaceIconCoverage &coverage, uint64_t focusGeneration) {
+        if (page != coverage.page || host != coverage.host || window != coverage.window
+                || generation != focusGeneration) {
+            *this = {coverage.page, coverage.host, coverage.window, focusGeneration, false, true};
+        }
+        if (coverage.observed >= coverage.expected) { attempted = false; return false; }
+        if (attempted) return false;
+        attempted = true;
+        focusPending = true;
+        return true;
+    }
+};
+std::mutex g_semantics_recovery_mutex;
+WorkspaceRecoveryAttempt g_semantics_recovery_attempt;
+
+int32_t workspaceFocusTarget(const std::vector<ObservedNode> &nodes,
+        const WorkspaceIconCoverage &coverage, int32_t focusedId) {
+    const ObservedNode *first = nullptr;
+    const ObservedNode *currentPage = nullptr;
+    for (const auto &node : nodes) {
+        if (node.id == coverage.nodeId && node.host == coverage.host && node.window == coverage.window) {
+            currentPage = &node;
+            break;
+        }
+    }
+    if (currentPage == nullptr) return -1;
+    int32_t indicator = -1;
+    for (const auto &node : nodes) {
+        if (node.host != coverage.host || node.window != coverage.window
+                || node.bounds.width() <= 0 || node.bounds.height() <= 0) continue;
+        int32_t page = -1;
+        if (parsePageIndicator(node.label, page) && page == coverage.page) indicator = node.id;
+        const bool onPage = nodeDescendsFrom(nodes, node, currentPage->id);
+        const bool dock = std::any_of(nodes.begin(), nodes.end(), [&](const auto &parent) {
+            return parent.resource == "com.miui.home:id/hotseat" && nodeDescendsFrom(nodes, node, parent.id);
+        });
+        if (node.id == focusedId && (onPage || dock || indicator == node.id)) return -1;
+        if (!node.icon()) continue;
+        if (onPage && (first == nullptr || node.bounds.top < first->bounds.top
+                || (node.bounds.top == first->bounds.top && node.bounds.left < first->bounds.left))) first = &node;
+    }
+    return first == nullptr ? indicator : first->id;
+}
+
+void repairWorkspaceFocus(void *provider, const std::vector<ObservedNode> &nodes,
+        const WorkspaceIconCoverage &coverage) {
+    if (g_original_find_focus == nullptr || g_original_perform_action == nullptr || g_node_drop == nullptr) return;
+    {
+        std::lock_guard lock(g_session_mutex);
+        if (g_lifted.load() && g_grid_screen == coverage.page - 1
+                && slotIndexForVirtualIdLocked(g_virtual_focused_id.load()) >= 0) return;
+    }
+    NodeResult focused = g_original_find_focus(provider, 2);
+    int32_t focusedId = -1;
+    if ((focused.absent & 1U) == 0 && focused.node != nullptr) {
+        focusedId = describeNode(focused.node).id;
+        g_node_drop(focused.node);
+    }
+    const int32_t target = workspaceFocusTarget(nodes, coverage, focusedId);
+    if (target < 0) return;
+    uintptr_t arguments[2]{1, 0};
+    if (focusedId >= 0) g_original_perform_action(provider, focusedId, 128, arguments);
+    const bool handled = g_original_perform_action(provider, target, kAccessibilityFocusAction, arguments);
+    nativeLog(ANDROID_LOG_INFO, "ActionGridNative", "workspace focus page=%d from=%d to=%d handled=%d",
+            coverage.page, focusedId, target, handled ? 1 : 0);
+}
+
+void recoverWorkspaceSemantics(void *provider, const std::vector<ObservedNode> &nodes) {
+    if (!g_semantics_refresh_ready.load(std::memory_order_acquire)
+            || !g_launcher_system_compatible.load() || g_launcher_window_focused.load() != 1) return;
+    LauncherSnapshot snapshot;
+    { std::lock_guard lock(g_snapshot_mutex); snapshot = g_snapshot; }
+    WorkspaceIconCoverage coverage;
+    if (!workspaceIconCoverage(nodes, snapshot, coverage)) return;
+    bool reset = false, focus = false;
+    {
+        std::lock_guard lock(g_semantics_recovery_mutex);
+        reset = g_semantics_recovery_attempt.take(coverage, g_focus_generation.load());
+        if (coverage.observed >= coverage.expected && g_semantics_recovery_attempt.focusPending) {
+            focus = true;
+            g_semantics_recovery_attempt.focusPending = false;
+        }
+    }
+    if (focus) repairWorkspaceFocus(provider, nodes, coverage);
+    if (!reset) return;
+    // The verified private adapter owns the bridge and its strong engine Arc
+    // throughout this query. Never retain the provider or holder after return.
+    void *callback = nativePointerField(nativePointerField(provider, 0), 0x20);
+    if (callback != static_cast<uint8_t *>(launcherLibraryBase()) + 0xa3c3d8) return;
+    void *bridge = nativePointerField(nativePointerField(provider, 8), 0);
+    void *grouped = nativePointerField(bridge, 0x38);
+    void *inner = nativePointerField(grouped, 0x10);
+    void *holder = nativePointerField(inner, 0x38);
+    void *delegate = nativePointerField(nativePointerField(holder, 0x670), 8);
+    void *target = nativePointerField(nativePointerField(delegate, 0), 0x60);
+    if (target != static_cast<uint8_t *>(g_flutter_base) + 0xdaf54c) return;
+    // This verified engine entry runs or posts to its task runner, capturing
+    // an Engine weak pointer. Rebuild hidden semantics without changing layout.
+    g_flutter_accessibility_disabled(holder);
+    g_flutter_accessibility_enabled(holder);
+    nativeLog(ANDROID_LOG_INFO, "ActionGridNative", "workspace semantics recovery page=%d icons=%d/%d",
+            coverage.page, coverage.observed, coverage.expected);
 }
 
 void onLibraryLoaded(const char *name, void *handle) {
