@@ -54,6 +54,7 @@ ActionGrid/
 - 0.4.13 在桌面节点重建或快照解析短暂失败时继续复用托起阶段确认的 favorite 位置；原生 workspace host 更换窗口/节点后仍重写页码项目数播报。见 `docs/RELEASE_0.4.13.md`。
 - 0.4.14 修复页码能力的冷启动初始化、TalkBack 公告事件类型、跨页复用节点的网格刷新、默认文件夹资源名匹配及放置/取消后的焦点恢复。7748 真机与回归验证见 `docs/RELEASE_0.4.14.md`。
 - 0.4.15 将语义节点和焦点恢复扩展到任意桌面页，并修复虚拟网格触摸、滑动、放置、跨页移动、图标前后移动、文件夹内移动、移入移出和创建文件夹。7748 真机逐项验收见 `docs/RELEASE_0.4.15.md` 与 `docs/DEVICE_VALIDATION_2026-10-25.md`。
+- 0.4.16 修复文件夹内托起返回桌面时的虚拟网格即时恢复、两步返回取消托起和底栏具体位置播报；8584 真机、原生网格回归和 Home 崩溃检查记录见 `docs/RELEASE_0.4.16.md`。
 - `zip_directory.h` 为 APK 中直接加载的 Rust 库定位 ZIP 尾记录，检查截断和注释长度，避免兼容性探测读取末尾以外的内存；同一 native 回归包含空 ZIP、注释与缺失尾记录。
 - `scripts/verify-launcher-contract.py` 从指定桌面 ELF 的真实跳转表验证 FRB 操作号、刷新入口及 `Vec<ItemInfo>` 解码调用链，证据见 `docs/LAUNCHER_7748_ABI.md`；不用于运行时猜测新接口。
 - 应用最低支持 Android 14，目标版本为 Android 17。
