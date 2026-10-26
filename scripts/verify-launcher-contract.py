@@ -277,6 +277,14 @@ BASELINES = {
              "motion": 0xd40fd8, "motion_caller": 0x75df1c, "motion_caller_v2": 0x75e2dc,
              "focus": 0x772360, "key": 0x97a484, "key_caller": 0x75d5d4,
              "key_caller_v2": 0x75df10, "back": 0x725c54, "back_call": 0x7050c8},
+    "8584": {"export": 0x9c4738, "dispatcher": 0x7f9e10, "move": 834, "batch": 858,
+             "reload": 0x7ae2a8, "move_target": 0x8874cc, "batch_target": 0x8a75ec,
+             "insert": 830, "insert_target": 0x881bc0, "delete": 821, "delete_target": 0x8811b0,
+             "grid_x": 0x6cd5d0, "grid_y": 0x6cd67c,
+             "grid_x_load": 0xb9479920, "grid_y_load": 0xb9479d20,
+             "motion": 0xd47844, "motion_caller": 0x761fdc, "motion_caller_v2": 0x76239c,
+             "focus": 0x776420, "key": 0x98058c, "key_caller": 0x761694,
+             "key_caller_v2": 0x761fd0, "back": 0x729d14, "back_call": 0x70910c},
 }
 
 

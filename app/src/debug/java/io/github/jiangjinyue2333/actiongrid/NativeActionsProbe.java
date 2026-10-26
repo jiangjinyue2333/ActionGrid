@@ -462,7 +462,9 @@ public final class NativeActionsProbe extends Instrumentation {
         if (description != null && isPositionDescription(description.toString())) {
             Rect bounds = new Rect();
             node.getBoundsInScreen(bounds);
-            String requested = arguments.containsKey("placeRow")
+            String requested = arguments.containsKey("placeDescription")
+                    ? arguments.getString("placeDescription")
+                    : arguments.containsKey("placeRow")
                     ? "移至第 " + arguments.getString("placeRow") + " 行第 "
                     + arguments.getString("placeColumn") + " 列" : "";
             if (!sourceBounds.contains(bounds.centerX(), bounds.centerY())
@@ -484,7 +486,7 @@ public final class NativeActionsProbe extends Instrumentation {
             if (virtualNodes != 0) return false;
             AccessibilityNodeInfo folder = findResource(node, "com.miui.home:id/folder_grid_view");
             List<AccessibilityNodeInfo> items = new ArrayList<>();
-            collectOrderedItems(folder == null ? node : folder, items, folder != null);
+            collectOrderedItems(folder == null ? node : folder, items, folder != null, true);
             items.sort(Comparator.comparingInt((AccessibilityNodeInfo item) -> {
                 Rect bounds = new Rect();
                 item.getBoundsInScreen(bounds);
@@ -524,18 +526,25 @@ public final class NativeActionsProbe extends Instrumentation {
 
     private static void collectOrderedItems(AccessibilityNodeInfo node,
             List<AccessibilityNodeInfo> items, boolean inGrid) {
+        collectOrderedItems(node, items, inGrid, false);
+    }
+
+    private static void collectOrderedItems(AccessibilityNodeInfo node,
+            List<AccessibilityNodeInfo> items, boolean inGrid, boolean includeHotseat) {
         if (node == null) return;
         Rect bounds = new Rect();
         node.getBoundsInScreen(bounds);
-        if ("com.miui.home:id/hotseat".equals(node.getViewIdResourceName()) || bounds.isEmpty()) return;
-        inGrid |= "com.miui.home:id/screen_content".equals(node.getViewIdResourceName());
+        boolean hotseat = "com.miui.home:id/hotseat".equals(node.getViewIdResourceName());
+        if ((hotseat && !includeHotseat) || bounds.isEmpty()) return;
+        inGrid |= "com.miui.home:id/screen_content".equals(node.getViewIdResourceName())
+                || hotseat;
         if (inGrid && isDesktopItem(node) && node.isVisibleToUser()) {
             items.add(AccessibilityNodeInfo.obtain(node));
             return;
         }
         for (int i = 0; i < node.getChildCount(); i++) {
             AccessibilityNodeInfo child = node.getChild(i);
-            collectOrderedItems(child, items, inGrid);
+            collectOrderedItems(child, items, inGrid, includeHotseat);
             if (child != null) child.recycle();
         }
     }

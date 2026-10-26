@@ -59,7 +59,7 @@ ActionGrid/
 - 应用最低支持 Android 14，目标版本为 Android 17。
 - 关于页显示作者，并通过明确按钮打开 GitHub 源码仓库。
 - `UpdateSource` / `UpdateClient` / `UpdateState` 管理 GitHub 与 GitCode 更新来源；关于页显示当前来源并以原生单选对话框切换。GitHub 正式工作流用 `scripts/create-update-manifest.ps1` 从已验证 APK 生成 `latest.json` 并作为 Release 资产上传。
-- `README.md` 记录当前支持范围、7748 的真机验证边界、仅澎湃 3 的页码开关和其他桌面版本的能力降级。当前工作区的任意页翻页、图标/文件夹移动及焦点验证见 `docs/DEVICE_VALIDATION_2026-10-25.md`。
+- `README.md` 记录当前支持范围、7748/8584 的真机验证边界、仅澎湃 3 的页码开关和其他桌面版本的能力降级。当前工作区的任意页翻页、图标/文件夹移动及焦点验证见 `docs/DEVICE_VALIDATION_2026-10-25.md`。
 
 ## 签名构建
 

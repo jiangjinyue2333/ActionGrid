@@ -126,8 +126,6 @@ constexpr uint64_t kFlutterPageAnnouncementSource = 0xffffffff0000000aULL;
 
 constexpr uint32_t kFrbUpdateItemDatabaseBatch = 854U;
 constexpr uint32_t kFrbStartLoad = 851U;
-// HyperOS 4.01.02.8565 primary dispatcher: single ItemInfo move operation.
-constexpr uint32_t kFrbMoveItemInDatabase = 833U;
 
 constexpr char kExpectedLegacyPrivateBuildId[] =
         "401af21eddb88554a568b61ef29fc138";
@@ -302,6 +300,10 @@ MotionActionFn g_key_action = nullptr;
 std::atomic<bool> g_launcher_lifecycle_hook_attempted{false};
 std::atomic<int32_t> g_launcher_window_focused{-1};
 std::atomic<bool> g_consume_back_up{false};
+// A normal Back cancellation consumes the matching key-up.  Folder return
+// uses g_consume_back_up instead because Home must receive that key-up to
+// finish dismissing the folder surface.
+std::atomic<bool> g_swallow_cancel_back_up{false};
 std::atomic<int32_t> g_resume_scans{0};
 std::atomic<bool> g_focus_callback_active{false};
 std::atomic<bool> g_focus_callback_node_observed{false};
@@ -332,13 +334,23 @@ std::atomic<int32_t> g_grid_rows{0};
 std::atomic<int32_t> g_visible_screen{0};
 std::atomic<int32_t> g_total_pages{0};
 std::atomic<bool> g_page_state_known{false};
+// Scroll events update the page before Home rebuilds its accessibility tree.
+// Keep that page pending until a live tree can receive the native focus action.
+std::atomic<int32_t> g_native_focus_page_pending{-1};
+std::atomic<int32_t> g_native_focus_refresh_page{-1};
 std::mutex g_page_announcement_mutex;
 int32_t g_announced_page = -1;
 std::unordered_map<int32_t, int32_t> g_page_item_counts;
 std::atomic<int32_t> g_lifted_screen{-1};
+// A folder lift starts inside folder_grid_view.  The first Back closes that
+// surface while retaining the source; the next Back on the desktop cancels it.
+std::atomic<bool> g_folder_lift_in_folder{false};
 std::atomic<int32_t> g_drop_parent_node_id{-1};
 std::atomic<int32_t> g_drop_parent_host_id{0};
 std::atomic<int32_t> g_drop_parent_window_id{-1};
+std::atomic<int32_t> g_hotseat_parent_node_id{-1};
+std::atomic<int32_t> g_hotseat_parent_host_id{0};
+std::atomic<int32_t> g_hotseat_parent_window_id{-1};
 char g_private_build_id[sizeof(kExpectedPrivateBuildId)] = {};
 
 enum class SurfaceState : int32_t {
@@ -414,7 +426,9 @@ constexpr char16_t kCreateFolderPrefix[] = u"和 ";
 constexpr size_t kNodeBoundsOffset = 0x380;
 constexpr int64_t kDesktopContainer = -100;
 constexpr int32_t kVirtualNodeBase = 0x6B000001;
-constexpr int32_t kVirtualNodeCount = 64;
+constexpr int32_t kDesktopVirtualNodeCount = 64;
+constexpr int32_t kHotseatVirtualNodeBase = kVirtualNodeBase + kDesktopVirtualNodeCount;
+constexpr int32_t kVirtualNodeCount = kDesktopVirtualNodeCount * 2;
 struct Bounds {
     int32_t left, top, right, bottom;
     int32_t width() const { return right - left; }
@@ -427,6 +441,9 @@ struct AccessibilityEventSource {
     int32_t window = -1;
     int32_t nodeId = -1;
 };
+std::mutex g_lift_refresh_mutex;
+AccessibilityEventSource g_lift_refresh_source{};
+std::atomic<bool> g_lift_refresh_pending{false};
 struct ObservedNode {
     int32_t id, parent, host, window;
     Bounds bounds;
@@ -447,7 +464,22 @@ std::mutex g_session_mutex;
 ObservedNode g_source{};
 std::vector<ObservedNode> g_sources;
 std::vector<ObservedNode> g_workspace;
+// Keep the last complete desktop tree while a folder is open. HyperOS can
+// expose only the folder overlay for the lift callback, so this snapshot is
+// the only synchronous source for rebuilding the desktop grid on the first
+// Back that closes the folder.
+std::vector<ObservedNode> g_last_desktop_workspace;
+int32_t g_last_desktop_screen = -1;
 std::atomic<int64_t> g_lifted_folder_container{0};
+// A focus-loss callback may arrive after the folder flag is cleared while
+// Home dismisses the folder. Keep this one-shot marker for that transition.
+std::atomic<bool> g_folder_lift_returned_to_desktop{false};
+std::atomic<int64_t> g_folder_lift_returned_at_ms{0};
+
+int64_t monotonicMillis() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 std::mutex g_folder_refresh_mutex;
 std::atomic<bool> g_folder_refresh_active{false};
 std::atomic<bool> g_folder_refresh_querying{false};
@@ -462,15 +494,24 @@ struct Slot {
     Bounds bounds;
     int32_t row;
     int32_t column;
+    bool hotseat = false;
 };
 std::vector<Slot> g_slots;
 std::vector<Slot> g_grid_cells;
+std::vector<Slot> g_hotseat_cells;
 int32_t g_grid_screen = -1; // Protected by g_session_mutex.
 std::string g_diagnostics_last_grid; // Same session lock as rebuildSlots().
 int64_t g_diagnostics_grid_session = 0;
 
 int32_t virtualIdForSlot(const Slot &slot) {
-    return kVirtualNodeBase + slot.row * g_grid_columns.load() + slot.column;
+    return slot.hotseat
+            ? kHotseatVirtualNodeBase + slot.column
+            : kVirtualNodeBase + slot.row * g_grid_columns.load() + slot.column;
+}
+
+bool hotseatVirtualNode(int32_t nodeId) {
+    return nodeId >= kHotseatVirtualNodeBase
+            && nodeId < kHotseatVirtualNodeBase + kDesktopVirtualNodeCount;
 }
 
 int32_t slotIndexForVirtualIdLocked(int32_t nodeId) {
@@ -499,8 +540,25 @@ bool hotseatNodeLocked(const ObservedNode &node) {
     return false;
 }
 
+bool hotseatCellForNodeLocked(const ObservedNode &node, Slot &cell) {
+    if (!hotseatNodeLocked(node)) return false;
+    for (const auto &candidate : g_hotseat_cells) {
+        if (node.bounds.centerX() >= candidate.bounds.left
+                && node.bounds.centerX() < candidate.bounds.right
+                && node.bounds.centerY() >= candidate.bounds.top
+                && node.bounds.centerY() < candidate.bounds.bottom) {
+            cell = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
 bool liftedSourceNodeLocked(const ObservedNode &node) {
-    if (g_lifted_screen.load() != g_visible_screen.load()) return false;
+    // Hotseat is shared by every desktop page; its lifted source remains
+    // available in the separate bottom-bar grid after a page change.
+    if (!hotseatNodeLocked(node)
+            && g_lifted_screen.load() != g_visible_screen.load()) return false;
     return std::any_of(g_sources.begin(), g_sources.end(), [&](const auto &source) {
         return source.id == node.id && source.host == node.host
                 && source.window == node.window;
@@ -950,6 +1008,9 @@ LauncherWorkspaceReloadFn resolveWorkspaceReloadForProfile(
         case LauncherAbiProfile::kCurrent8565:
             offset = 0x7aa050;
             break;
+        case LauncherAbiProfile::kCurrent8584:
+            offset = 0x7ae2a8;
+            break;
         case LauncherAbiProfile::kUnknown:
             return nullptr;
     }
@@ -991,6 +1052,9 @@ void resolveGridCounts(LauncherAbiProfile profile) {
     if (profile == LauncherAbiProfile::kCurrent8565) {
         offsetX = 0x6c9588;
         offsetY = 0x6c9634;
+    } else if (profile == LauncherAbiProfile::kCurrent8584) {
+        offsetX = 0x6cd5d0;
+        offsetY = 0x6cd67c;
     } else if (profile == LauncherAbiProfile::kLegacy7748) {
         offsetX = 0x6c5a74;
         offsetY = 0x6c5b20;
@@ -1369,6 +1433,8 @@ std::string virtualNodeDescription(int32_t nodeId);
 void onSendEvent(void *controller, void *event);
 void sendEvent(int32_t nodeId, int32_t type);
 void sendEvent(const AccessibilityEventSource &source, int32_t type);
+void queueLiftRefresh(const AccessibilityEventSource &source);
+void flushLiftRefresh();
 AccessibilityEventSource captureEventSource(int32_t nodeId);
 AccessibilityEventSource captureDropParentEventSource(int32_t fallbackNodeId);
 bool sendAnnouncement(int32_t nodeId, const std::string &text);
@@ -1385,7 +1451,11 @@ void observeSurfaceSample(void *provider, SurfaceState observed,
         const std::vector<ObservedNode> &nodes);
 void observeSurfaceTree(void *provider, const std::vector<ObservedNode> &nodes);
 void refreshLiftSessionForPage(void *provider);
+int32_t findCurrentDropParentNode();
+void rebuildSlots();
 void handleRecentSwipeMotion(int32_t action, float x, float y);
+bool repairNativeWorkspaceFocus(void *provider, const std::vector<ObservedNode> &nodes,
+        int32_t page);
 
 
 template<typename T> T nodeField(const void *node, size_t offset) {
@@ -1736,7 +1806,9 @@ void ensureDiagnosticsWorker() {
             || !g_launcher_fingerprint_ready.load(std::memory_order_acquire)
             || !g_launcher_system_compatible.load(std::memory_order_acquire)) return;
     const auto profile = g_launcher_profile.load();
-    if (profile != LauncherAbiProfile::kLegacy7748 && profile != LauncherAbiProfile::kCurrent8565) return;
+    if (profile != LauncherAbiProfile::kLegacy7748
+            && profile != LauncherAbiProfile::kCurrent8565
+            && profile != LauncherAbiProfile::kCurrent8584) return;
     void *runtime = g_runtime_shared_address.load(std::memory_order_acquire);
     if (runtime == nullptr || g_original_content_resolver_new == nullptr
             || g_content_resolver_delete == nullptr || g_content_resolver_call == nullptr
@@ -2296,6 +2368,7 @@ const char *launcherAbiProfileName(LauncherAbiProfile profile) {
         case LauncherAbiProfile::kLegacy7722: return "8.01.02.7722";
         case LauncherAbiProfile::kLegacy7748: return "8.01.02.7748";
         case LauncherAbiProfile::kCurrent8565: return "8.01.02.8565";
+        case LauncherAbiProfile::kCurrent8584: return "8.01.02.8584";
         case LauncherAbiProfile::kUnknown: return "unknown";
     }
     return "unknown";
@@ -2315,7 +2388,7 @@ bool matchesLauncherMotionBuildId(const char *buildId) {
 }
 
 bool matchesFrbModelBuildId(const char *buildId) {
-    // 8565 uses op 833 for one ItemInfo move; legacy profiles use op 854.
+    // Operation numbers are selected from the fingerprinted profile below.
     return matchesLauncherDartBuildId(buildId);
 }
 
@@ -2340,7 +2413,7 @@ LauncherAbiProfile refreshLauncherAbiProfile(char *buildId, size_t buildIdSize) 
     g_launcher_profile.store(profile, std::memory_order_release);
     g_launcher_fingerprint_ready.store(profile != LauncherAbiProfile::kUnknown,
             std::memory_order_release);
-    g_current_frb_move_profile.store(profile == LauncherAbiProfile::kCurrent8565,
+    g_current_frb_move_profile.store(singleMoveOperation(profile) != 0U,
             std::memory_order_release);
     g_trigger_workspace_reload = nullptr;
     g_capabilities.fetch_and(~(CAP_FRB_MODEL | CAP_MOVE_PROFILE),
@@ -2625,6 +2698,9 @@ void appendSparseItemInfo(WireWriter &wire, const FavoritePlacement &source,
 
 void clearLiftSession() {
     g_lifted_folder_container.store(0);
+    g_folder_lift_in_folder.store(false, std::memory_order_release);
+    g_folder_lift_returned_to_desktop.store(false, std::memory_order_release);
+    g_folder_lift_returned_at_ms.store(0, std::memory_order_release);
     const int32_t hovered = g_virtual_hovered_id.exchange(-1, std::memory_order_acq_rel);
     const int32_t focused = g_virtual_focused_id.exchange(-1, std::memory_order_acq_rel);
     const AccessibilityEventSource hoveredSource = captureEventSource(hovered);
@@ -2637,16 +2713,106 @@ void clearLiftSession() {
     g_drop_parent_node_id.store(-1, std::memory_order_release);
     g_drop_parent_host_id.store(0, std::memory_order_release);
     g_drop_parent_window_id.store(-1, std::memory_order_release);
+    g_hotseat_parent_node_id.store(-1, std::memory_order_release);
+    g_hotseat_parent_host_id.store(0, std::memory_order_release);
+    g_hotseat_parent_window_id.store(-1, std::memory_order_release);
     std::lock_guard lock(g_session_mutex);
     g_sources.clear();
     g_source_placements.clear();
     g_workspace.clear();
     g_slots.clear();
     g_grid_cells.clear();
+    g_hotseat_cells.clear();
     g_grid_screen = -1;
 }
 
+bool returnFolderLiftToDesktop() {
+    if (!g_lifted.load(std::memory_order_acquire)
+            || g_lifted_folder_container.load(std::memory_order_acquire) <= 0
+            || !g_folder_lift_in_folder.exchange(false, std::memory_order_acq_rel)) {
+        return false;
+    }
+    g_folder_lift_returned_to_desktop.store(true, std::memory_order_release);
+    g_folder_lift_returned_at_ms.store(monotonicMillis(), std::memory_order_release);
+    const AccessibilityEventSource oldParent = captureDropParentEventSource(-1);
+    g_virtual_hovered_id.store(-1, std::memory_order_release);
+    g_virtual_focused_id.store(-1, std::memory_order_release);
+    g_hotseat_parent_node_id.store(-1, std::memory_order_release);
+    g_hotseat_parent_host_id.store(0, std::memory_order_release);
+    g_hotseat_parent_window_id.store(-1, std::memory_order_release);
+    AccessibilityEventSource desktopParent{};
+    size_t retainedNodes = 0;
+    size_t retainedSlots = 0;
+    {
+        std::lock_guard lock(g_session_mutex);
+        // The folder tree contains the underlying desktop tree as well. Keep
+        // that verified desktop snapshot so the first query after closing the
+        // folder can expose the virtual grid immediately. A root query will
+        // replace it with the settled tree when Home finishes its transition.
+        const int32_t folderGrid = [&]() {
+            for (const auto &node : g_workspace) {
+                if (node.resource == "com.miui.home:id/folder_grid_view") return node.id;
+            }
+            return -1;
+        }();
+        std::vector<ObservedNode> desktop;
+        if (g_last_desktop_screen == g_visible_screen.load(std::memory_order_acquire)
+                && std::any_of(g_last_desktop_workspace.begin(),
+                        g_last_desktop_workspace.end(), [](const auto &node) {
+                    return node.resource == "com.miui.home:id/screen_content"
+                            || node.resource == "com.miui.home:id/workspace";
+                })) {
+            desktop = g_last_desktop_workspace;
+        } else {
+            desktop.reserve(g_workspace.size());
+            for (const auto &node : g_workspace) {
+                if (node.resource == "com.miui.home:id/folder_grid_view"
+                        || (folderGrid >= 0 && (node.id == folderGrid
+                        || descendsFromLocked(node, folderGrid)))) continue;
+                desktop.push_back(node);
+            }
+        }
+        g_workspace = std::move(desktop);
+        g_grid_screen = -1;
+        rebuildSlots();
+        const int32_t parent = findCurrentDropParentNode();
+        g_drop_parent_node_id.store(parent, std::memory_order_release);
+        for (const auto &node : g_workspace) {
+            if (node.id == parent) {
+                g_drop_parent_host_id.store(node.host, std::memory_order_release);
+                g_drop_parent_window_id.store(node.window, std::memory_order_release);
+                desktopParent = {node.host, node.window, node.id};
+                break;
+            }
+        }
+        retainedNodes = g_workspace.size();
+        retainedSlots = g_slots.size();
+    }
+    sendEvent(oldParent, kTypeWindowContentChanged);
+    if (desktopParent.nodeId >= 0) sendEvent(desktopParent, kTypeWindowContentChanged);
+    nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
+            "folder lift returned to desktop; source retained for placement nodes=%zu slots=%zu parent=%d",
+            retainedNodes, retainedSlots, desktopParent.nodeId);
+    return true;
+}
+
 bool cancelLiftSession(void *provider, int32_t nodeId) {
+    if (provider == nullptr && g_lifted.load(std::memory_order_acquire)
+            && g_lifted_folder_container.load(std::memory_order_acquire) > 0) {
+        if (g_folder_lift_in_folder.load(std::memory_order_acquire)) {
+            // A folder Back may reach the generic cancellation path before
+            // the launcher back callback. Preserve the source for the first
+            // Back and let Home dismiss the folder.
+            returnFolderLiftToDesktop();
+            return true;
+        }
+        const int64_t returnedAt = g_folder_lift_returned_at_ms.load(
+                std::memory_order_acquire);
+        if (g_folder_lift_returned_to_desktop.load(std::memory_order_acquire)
+                && returnedAt > 0 && monotonicMillis() - returnedAt < 600) {
+            return true;
+        }
+    }
     if (!g_lifted.exchange(false, std::memory_order_acq_rel)) return false;
     const auto parent = captureDropParentEventSource(nodeId);
     int32_t restoreId = -1;
@@ -2665,7 +2831,9 @@ bool cancelLiftSession(void *provider, int32_t nodeId) {
     clearLiftSession();
     // Back has no live provider; restore from the reader's next node query.
     if (!restoreTargets.empty()) beginPendingPlacement(restoreTargets);
+    const bool eventReady = g_event_controller.load(std::memory_order_acquire) != nullptr;
     sendEvent(parent, kTypeWindowContentChanged);
+    if (!eventReady) queueLiftRefresh(parent);
     if (restoreId >= 0 && provider != nullptr && g_original_perform_action != nullptr) {
         uintptr_t arguments[2]{1, 0}; // Native Option<Bundle>::None.
         g_original_perform_action(provider, restoreId, kAccessibilityFocusAction, arguments);
@@ -3131,6 +3299,14 @@ bool rememberVisibleScreen(const std::string &description) {
     return changed;
 }
 
+bool rememberVisibleScreenFromNodes(const std::vector<ObservedNode> &nodes) {
+    for (const auto &node : nodes) {
+        if (!looksLikePageIndicator(node.label)) continue;
+        return rememberVisibleScreen(node.label);
+    }
+    return false;
+}
+
 void rememberPageSource(void *node) {
     if (node == nullptr) return;
     std::string resource = nodeString(node, 0x1b8);
@@ -3173,7 +3349,8 @@ bool isLiftedSourceId(int32_t id) {
 }
 
 int32_t findCurrentDropParentNode() {
-    if (g_lifted_folder_container.load() > 0) {
+    if (g_lifted_folder_container.load() > 0
+            && g_folder_lift_in_folder.load(std::memory_order_acquire)) {
         for (const auto &node : g_workspace) {
             if (node.resource == "com.miui.home:id/folder_grid_view") return node.id;
         }
@@ -3208,10 +3385,99 @@ int32_t findDropParentNode() {
     return findCurrentDropParentNode();
 }
 
+void buildHotseatSlots(std::vector<Slot> &cells, std::vector<Slot> &empty) {
+    cells.clear();
+    empty.clear();
+    const auto hotseat = std::find_if(g_workspace.begin(), g_workspace.end(),
+            [](const auto &node) {
+                return node.resource == "com.miui.home:id/hotseat"
+                        && node.bounds.width() > 0 && node.bounds.height() > 0;
+            });
+    if (hotseat == g_workspace.end()) {
+        g_hotseat_parent_node_id.store(-1, std::memory_order_release);
+        g_hotseat_parent_host_id.store(0, std::memory_order_release);
+        g_hotseat_parent_window_id.store(-1, std::memory_order_release);
+        return;
+    }
+    g_hotseat_parent_node_id.store(hotseat->id, std::memory_order_release);
+    g_hotseat_parent_host_id.store(hotseat->host, std::memory_order_release);
+    g_hotseat_parent_window_id.store(hotseat->window, std::memory_order_release);
+
+    std::vector<const ObservedNode *> icons;
+    for (const auto &node : g_workspace) {
+        if (node.icon() && hotseatNodeLocked(node) && !liftedSourceNodeLocked(node)
+                && node.bounds.centerX() >= hotseat->bounds.left
+                && node.bounds.centerX() < hotseat->bounds.right
+                && node.bounds.centerY() >= hotseat->bounds.top
+                && node.bounds.centerY() < hotseat->bounds.bottom) {
+            icons.push_back(&node);
+        }
+    }
+    std::sort(icons.begin(), icons.end(), [](const auto *left, const auto *right) {
+        return left->bounds.centerX() < right->bounds.centerX();
+    });
+
+    int32_t databaseColumns = 0;
+    std::vector<FavoritePlacement> hotseatFavorites;
+    {
+        std::lock_guard lock(g_snapshot_mutex);
+        for (const auto &favorite : g_snapshot.favorites) {
+            if (favorite.placement.container != -101) continue;
+            if (liftedSourceFavoriteLocked(favorite)) continue;
+            hotseatFavorites.push_back(favorite.placement);
+            databaseColumns = std::max(databaseColumns,
+                    favorite.placement.cellX + favorite.placement.spanX);
+        }
+    }
+    int32_t columns = std::max(1, databaseColumns);
+    columns = std::max(columns, static_cast<int32_t>(icons.size()));
+    if (!icons.empty()) {
+        float step = 0.0f;
+        for (size_t index = 1; index < icons.size(); ++index) {
+            step += static_cast<float>(icons[index]->bounds.centerX()
+                    - icons[index - 1]->bounds.centerX());
+        }
+        if (icons.size() > 1) step /= static_cast<float>(icons.size() - 1);
+        if (step <= 0.0f) step = static_cast<float>(icons.front()->bounds.width()) * 0.9f;
+        if (step > 0.0f) {
+            columns = std::max(columns, static_cast<int32_t>(std::lround(
+                    static_cast<double>(hotseat->bounds.width()) / step)));
+        }
+    }
+    columns = std::clamp(columns, 1, kDesktopVirtualNodeCount);
+    const int32_t width = hotseat->bounds.width();
+    for (int32_t column = 0; column < columns; ++column) {
+        Bounds cell{
+                hotseat->bounds.left + width * column / columns,
+                hotseat->bounds.top,
+                hotseat->bounds.left + width * (column + 1) / columns,
+                hotseat->bounds.bottom};
+        Slot slot{cell, 0, column, true};
+        cells.push_back(slot);
+        bool occupied = false;
+        for (const auto &item : hotseatFavorites) {
+            if (column >= item.cellX && column < item.cellX + item.spanX) {
+                occupied = true;
+                break;
+            }
+        }
+        if (!occupied) {
+            occupied = std::any_of(icons.begin(), icons.end(), [&](const auto *icon) {
+                return icon->bounds.centerX() >= cell.left
+                        && icon->bounds.centerX() < cell.right;
+            });
+        }
+        if (!occupied) empty.push_back(slot);
+    }
+}
+
 void rebuildSlots() {
-    if (g_lifted_folder_container.load() > 0) {
+    if (g_lifted_folder_container.load() > 0
+            && g_folder_lift_in_folder.load(std::memory_order_acquire)) {
         g_slots.clear();
         g_grid_cells.clear();
+        g_hotseat_cells.clear();
+        g_hotseat_parent_node_id.store(-1, std::memory_order_release);
         return;
     }
     const int32_t screen = g_visible_screen.load(std::memory_order_acquire);
@@ -3389,14 +3655,23 @@ void rebuildSlots() {
     }
     g_grid_columns.store(columns, std::memory_order_release);
     g_grid_rows.store(rows, std::memory_order_release);
+    std::vector<Slot> newHotseatCells;
+    std::vector<Slot> newHotseatSlots;
+    buildHotseatSlots(newHotseatCells, newHotseatSlots);
+    newSlots.insert(newSlots.end(), newHotseatSlots.begin(), newHotseatSlots.end());
     g_grid_cells = std::move(newGridCells);
+    g_hotseat_cells = std::move(newHotseatCells);
     g_slots = std::move(newSlots);
     g_grid_screen = screen;
     const int64_t diagnosticSession = g_diagnostics.session();
     if (diagnosticSession != 0) {
         std::string occupancy(static_cast<size_t>(rows * (columns + 1)), 'x');
         for (int row = 0; row < rows; ++row) occupancy[row * (columns + 1) + columns] = '/';
-        for (const auto &slot : g_slots) occupancy[slot.row * (columns + 1) + slot.column] = '.';
+        for (const auto &slot : g_slots) {
+            if (slot.hotseat || slot.row < 0 || slot.row >= rows
+                    || slot.column < 0 || slot.column >= columns) continue;
+            occupancy[slot.row * (columns + 1) + slot.column] = '.';
+        }
         const std::string signature = std::to_string(g_grid_screen) + ":" + occupancy;
         if (g_diagnostics_grid_session != diagnosticSession || signature != g_diagnostics_last_grid) {
             g_diagnostics_grid_session = diagnosticSession;
@@ -3440,6 +3715,10 @@ void refreshLiftSessionForPage(void *provider) {
     AccessibilityEventSource oldParentSource;
     AccessibilityEventSource newParentSource;
     bool keepHover = false, keepFocus = false;
+    size_t rebuiltSlots = 0;
+    size_t rebuiltGridCells = 0;
+    size_t rebuiltHotseatCells = 0;
+    int32_t rebuiltScreen = -1;
     const int32_t oldHover = g_virtual_hovered_id.load();
     const int32_t oldFocus = g_virtual_focused_id.load();
     {
@@ -3452,6 +3731,10 @@ void refreshLiftSessionForPage(void *provider) {
                 g_drop_parent_window_id.load(std::memory_order_acquire), oldParent};
         g_workspace = std::move(nodes);
         rebuildSlots();
+        rebuiltSlots = g_slots.size();
+        rebuiltGridCells = g_grid_cells.size();
+        rebuiltHotseatCells = g_hotseat_cells.size();
+        rebuiltScreen = g_grid_screen;
         newParent = findCurrentDropParentNode();
         for (const auto &node : g_workspace) {
             if (node.id == newParent) {
@@ -3483,9 +3766,10 @@ void refreshLiftSessionForPage(void *provider) {
     if (oldParent != newParent) sendEvent(oldParentSource, kTypeWindowContentChanged);
     sendEvent(newParentSource, kTypeWindowContentChanged);
     nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
-            "lift page refreshed nodes=%zu old_parent=%d new_parent=%d page=%d",
+            "lift page refreshed nodes=%zu old_parent=%d new_parent=%d page=%d grid_screen=%d grid_cells=%zu slots=%zu hotseat_cells=%zu",
             nodeCount, oldParent, newParent,
-            g_visible_screen.load(std::memory_order_acquire) + 1);
+            g_visible_screen.load(std::memory_order_acquire) + 1,
+            rebuiltScreen, rebuiltGridCells, rebuiltSlots, rebuiltHotseatCells);
 }
 
 void scheduleLiftSessionRefresh(bool lifted) {
@@ -3559,9 +3843,15 @@ bool rewritePageScrollEvent(void *event, bool &suppressOriginal) {
                 g_workspace_host_id.store(sourceHost, std::memory_order_release);
             }
             const bool lifted = g_lifted.load(std::memory_order_acquire);
+            const bool hadPage = g_page_state_known.load(std::memory_order_acquire);
+            const int32_t previousPage = g_visible_screen.load(std::memory_order_acquire);
             g_visible_screen.store(page - 1, std::memory_order_release);
             g_total_pages.store(totalPages, std::memory_order_release);
             g_page_state_known.store(true, std::memory_order_release);
+            if (!lifted && hadPage && previousPage != page - 1) {
+                g_native_focus_page_pending.store(page, std::memory_order_release);
+                g_native_focus_refresh_page.store(-1, std::memory_order_release);
+            }
             const AccessibilityEventSource pageSource{
                     static_cast<int32_t>(source), window, static_cast<int32_t>(source >> 32U)};
             if (!announceConfirmedPage(page, pageSource)) return false;
@@ -3591,9 +3881,15 @@ bool rewritePageScrollEvent(void *event, bool &suppressOriginal) {
         return false;
     }
     const bool lifted = g_lifted.load(std::memory_order_acquire);
+    const bool hadPage = g_page_state_known.load(std::memory_order_acquire);
+    const int32_t previousPage = g_visible_screen.load(std::memory_order_acquire);
     int32_t page = fromIndex + 1;
     g_visible_screen.store(page - 1, std::memory_order_release);
     g_page_state_known.store(true, std::memory_order_release);
+    if (!lifted && hadPage && previousPage != page - 1) {
+        g_native_focus_page_pending.store(page, std::memory_order_release);
+        g_native_focus_refresh_page.store(-1, std::memory_order_release);
+    }
     if (!announceConfirmedPage(page, {static_cast<int32_t>(source), window,
             static_cast<int32_t>(source >> 32U)})) return false;
     suppressOriginal = true;
@@ -3603,6 +3899,7 @@ bool rewritePageScrollEvent(void *event, bool &suppressOriginal) {
 
 void onSendEvent(void *controller, void *event) {
     g_event_controller.store(controller, std::memory_order_release);
+    flushLiftRefresh();
     if (event != nullptr
             && nodeField<int32_t>(event, kEventTypeOffset) == kTypeWindowContentChanged
             && static_cast<SurfaceState>(g_surface_state.load(std::memory_order_acquire))
@@ -3652,6 +3949,26 @@ void sendEvent(const AccessibilityEventSource &source, int32_t type) {
     }
     g_original_send_event(controller, event);
     g_event_drop(event);
+}
+
+void queueLiftRefresh(const AccessibilityEventSource &source) {
+    {
+        std::lock_guard lock(g_lift_refresh_mutex);
+        g_lift_refresh_source = source;
+    }
+    g_lift_refresh_pending.store(true, std::memory_order_release);
+}
+
+void flushLiftRefresh() {
+    if (!g_lift_refresh_pending.load(std::memory_order_acquire)
+            || g_event_controller.load(std::memory_order_acquire) == nullptr) return;
+    AccessibilityEventSource source;
+    {
+        std::lock_guard lock(g_lift_refresh_mutex);
+        if (!g_lift_refresh_pending.exchange(false, std::memory_order_acq_rel)) return;
+        source = g_lift_refresh_source;
+    }
+    sendEvent(source, kTypeWindowContentChanged);
 }
 
 bool sendAnnouncementWithSource(int32_t host, int32_t window, int32_t virtualId,
@@ -3867,9 +4184,12 @@ bool isVirtualNode(int32_t nodeId) {
 
 AccessibilityEventSource captureEventSource(int32_t nodeId) {
     if (isVirtualNode(nodeId)) {
+        const bool hotseat = hotseatVirtualNode(nodeId);
         return {
-                g_drop_parent_host_id.load(std::memory_order_acquire),
-                g_drop_parent_window_id.load(std::memory_order_acquire), nodeId};
+                (hotseat ? g_hotseat_parent_host_id : g_drop_parent_host_id)
+                        .load(std::memory_order_acquire),
+                (hotseat ? g_hotseat_parent_window_id : g_drop_parent_window_id)
+                        .load(std::memory_order_acquire), nodeId};
     }
     return {
             g_host_view_id.load(std::memory_order_acquire),
@@ -3889,6 +4209,9 @@ std::string virtualNodeDescription(int32_t nodeId) {
     std::lock_guard lock(g_session_mutex);
     const int32_t slot = slotIndexForVirtualIdLocked(nodeId);
     if (slot < 0 || slot >= static_cast<int32_t>(g_slots.size())) return {};
+    if (g_slots[slot].hotseat) {
+        return "移至底栏第 " + std::to_string(g_slots[slot].column + 1) + " 个位置";
+    }
     return "移至第 " + std::to_string(g_slots[slot].row + 1)
             + " 行第 " + std::to_string(g_slots[slot].column + 1) + " 列";
 }
@@ -3898,10 +4221,11 @@ uint64_t packBounds(int32_t first, int32_t second) {
             | (static_cast<uint64_t>(static_cast<uint32_t>(second)) << 32U);
 }
 
-int32_t gridNodeAtCellLocked(int32_t row, int32_t column) {
+int32_t gridNodeAtCellLocked(int32_t row, int32_t column, bool hotseat = false) {
     for (const auto &node : g_workspace) {
-        if (!node.icon() || hotseatNodeLocked(node) || liftedSourceNodeLocked(node)) continue;
-        for (const auto &cell : g_grid_cells) {
+        if (!node.icon() || hotseatNodeLocked(node) != hotseat || liftedSourceNodeLocked(node)) continue;
+        const auto &cells = hotseat ? g_hotseat_cells : g_grid_cells;
+        for (const auto &cell : cells) {
             if (cell.row != row || cell.column != column) continue;
             const int32_t centerX = node.bounds.centerX();
             const int32_t centerY = node.bounds.centerY();
@@ -3912,27 +4236,29 @@ int32_t gridNodeAtCellLocked(int32_t row, int32_t column) {
         }
     }
     for (const auto &slot : g_slots) {
-        if (slot.row == row && slot.column == column) {
+        if (slot.hotseat == hotseat && slot.row == row && slot.column == column) {
             return virtualIdForSlot(slot);
         }
     }
     return -1;
 }
 
-int32_t previousGridNodeLocked(int32_t row, int32_t column) {
+int32_t previousGridNodeLocked(int32_t row, int32_t column, bool hotseat = false) {
     int32_t previous = -1;
-    for (const auto &cell : g_grid_cells) {
+    const auto &cells = hotseat ? g_hotseat_cells : g_grid_cells;
+    for (const auto &cell : cells) {
         if (cell.row > row || (cell.row == row && cell.column >= column)) break;
-        const int32_t candidate = gridNodeAtCellLocked(cell.row, cell.column);
+        const int32_t candidate = gridNodeAtCellLocked(cell.row, cell.column, hotseat);
         if (candidate >= 0) previous = candidate;
     }
     return previous;
 }
 
-int32_t nextGridNodeLocked(int32_t row, int32_t column) {
-    for (const auto &cell : g_grid_cells) {
+int32_t nextGridNodeLocked(int32_t row, int32_t column, bool hotseat = false) {
+    const auto &cells = hotseat ? g_hotseat_cells : g_grid_cells;
+    for (const auto &cell : cells) {
         if (cell.row < row || (cell.row == row && cell.column <= column)) continue;
-        const int32_t candidate = gridNodeAtCellLocked(cell.row, cell.column);
+        const int32_t candidate = gridNodeAtCellLocked(cell.row, cell.column, hotseat);
         if (candidate >= 0) return candidate;
     }
     return -1;
@@ -3960,7 +4286,7 @@ void rememberCurrentGridNode(void *node) {
 }
 
 void setTraversalAfterForCell(void *node, int32_t row, int32_t column,
-        int32_t fallbackHost) {
+        int32_t fallbackHost, bool hotseat = false) {
     if (node == nullptr || g_node_set_traversal_after == nullptr) return;
     int32_t previous = -1;
     int32_t next = -1;
@@ -3968,8 +4294,8 @@ void setTraversalAfterForCell(void *node, int32_t row, int32_t column,
     int32_t nextHost = fallbackHost;
     {
         std::lock_guard lock(g_session_mutex);
-        previous = previousGridNodeLocked(row, column);
-        next = nextGridNodeLocked(row, column);
+        previous = previousGridNodeLocked(row, column, hotseat);
+        next = nextGridNodeLocked(row, column, hotseat);
         for (const auto &candidate : g_workspace) {
             if (candidate.id == previous) {
                 host = candidate.host;
@@ -3988,15 +4314,19 @@ void setTraversalAfterForCell(void *node, int32_t row, int32_t column,
 void setTraversalAfterForVirtualNode(void *node, int32_t slot) {
     if (node == nullptr || g_node_set_traversal_after == nullptr) return;
     int32_t row = -1, column = -1;
+    bool hotseat = false;
     {
         std::lock_guard lock(g_session_mutex);
         if (slot < 0 || slot >= static_cast<int32_t>(g_slots.size())) return;
         const Slot &target = g_slots[static_cast<size_t>(slot)];
         row = target.row;
         column = target.column;
+        hotseat = target.hotseat;
     }
-    const int32_t host = g_drop_parent_host_id.load(std::memory_order_acquire);
-    setTraversalAfterForCell(node, row, column, host);
+    const int32_t host = hotseat
+            ? g_hotseat_parent_host_id.load(std::memory_order_acquire)
+            : g_drop_parent_host_id.load(std::memory_order_acquire);
+    setTraversalAfterForCell(node, row, column, host, hotseat);
 }
 
 void setTraversalAfterForRealNode(void *node) {
@@ -4004,17 +4334,20 @@ void setTraversalAfterForRealNode(void *node) {
     const Bounds bounds = nodeField<Bounds>(node, kNodeBoundsOffset);
     int32_t row = -1;
     int32_t column = -1;
+    bool hotseat = false;
     {
         std::lock_guard lock(g_session_mutex);
-        if (hotseatNodeLocked(describeNode(node))) return;
-        if (!g_grid_cells.empty() && liftedSourceNodeLocked(describeNode(node))) {
+        const ObservedNode described = describeNode(node);
+        hotseat = hotseatNodeLocked(described);
+        const auto &cells = hotseat ? g_hotseat_cells : g_grid_cells;
+        if (!hotseat && !g_grid_cells.empty() && liftedSourceNodeLocked(described)) {
             // Its vacated cell already has a virtual drop target. Keeping both
             // in traversal skips that target when swiping back from the next cell.
             if (g_node_set_visible != nullptr) g_node_set_visible(node, false);
             if (g_node_set_important != nullptr) g_node_set_important(node, false);
             return;
         }
-        for (const auto &cell : g_grid_cells) {
+        for (const auto &cell : cells) {
             if (bounds.centerX() >= cell.bounds.left && bounds.centerX() < cell.bounds.right
                     && bounds.centerY() >= cell.bounds.top && bounds.centerY() < cell.bounds.bottom) {
                 row = cell.row;
@@ -4025,7 +4358,7 @@ void setTraversalAfterForRealNode(void *node) {
     }
     if (row < 0 || column < 0) return;
     const int64_t source = nodeField<int64_t>(node, 0x338);
-    setTraversalAfterForCell(node, row, column, static_cast<int32_t>(source));
+    setTraversalAfterForCell(node, row, column, static_cast<int32_t>(source), hotseat);
 }
 
 void repairFolderBounds(void *node, int32_t sourceId) {
@@ -4082,6 +4415,7 @@ NodeResult makeVirtualNode(int32_t nodeId) {
     Bounds cell{};
     Bounds parentBounds{};
     int32_t parentNodeId = -1;
+    bool hotseat = false;
     {
         std::lock_guard lock(g_session_mutex);
         slot = slotIndexForVirtualIdLocked(nodeId);
@@ -4090,7 +4424,10 @@ NodeResult makeVirtualNode(int32_t nodeId) {
             return result;
         }
         cell = g_slots[slot].bounds;
-        parentNodeId = g_drop_parent_node_id.load(std::memory_order_acquire);
+        hotseat = g_slots[slot].hotseat;
+        parentNodeId = hotseat
+                ? g_hotseat_parent_node_id.load(std::memory_order_acquire)
+                : g_drop_parent_node_id.load(std::memory_order_acquire);
         for (const auto &workspaceNode : g_workspace) {
             if (workspaceNode.id == parentNodeId) {
                 parentBounds = workspaceNode.bounds;
@@ -4103,8 +4440,12 @@ NodeResult makeVirtualNode(int32_t nodeId) {
     const std::u16string description = utf16FromUtf8(virtualNodeDescription(nodeId));
     setNodeString(g_node_set_content_description, node, description.c_str());
     if (g_node_set_source != nullptr) {
-        const int32_t host = g_drop_parent_host_id.load(std::memory_order_acquire);
-        const int32_t window = g_drop_parent_window_id.load(std::memory_order_acquire);
+        const int32_t host = hotseat
+                ? g_hotseat_parent_host_id.load(std::memory_order_acquire)
+                : g_drop_parent_host_id.load(std::memory_order_acquire);
+        const int32_t window = hotseat
+                ? g_hotseat_parent_window_id.load(std::memory_order_acquire)
+                : g_drop_parent_window_id.load(std::memory_order_acquire);
         g_node_set_source(node, host, nodeId, window);
         if (g_node_set_parent != nullptr) g_node_set_parent(node, host, parentNodeId);
     }
@@ -4172,27 +4513,40 @@ void orderGridChildren(void *node) {
     if (children == nullptr || count == 0 || count > nodeField<size_t>(node, 0x30)
             || count > 512 + kVirtualNodeCount) return;
     std::lock_guard lock(g_session_mutex);
+    const bool parentHotseat = nodeString(node, 0x1b8) == "com.miui.home:id/hotseat";
     auto rank = [&](int64_t child) {
         const int32_t id = static_cast<int32_t>(child >> 32U);
-        if (isVirtualNode(id)) return id - kVirtualNodeBase;
+        if (isVirtualNode(id)) {
+            const int32_t slot = slotIndexForVirtualIdLocked(id);
+            if (slot >= 0 && g_slots[slot].hotseat == parentHotseat) {
+                return parentHotseat ? g_slots[slot].column
+                        : g_slots[slot].row * g_grid_columns.load() + g_slots[slot].column;
+            }
+            return kVirtualNodeCount;
+        }
         int32_t first = kVirtualNodeCount;
         for (const auto &item : g_workspace) {
-            if (!item.icon() || hotseatNodeLocked(item) || liftedSourceNodeLocked(item)
+            if (!item.icon() || hotseatNodeLocked(item) != parentHotseat || liftedSourceNodeLocked(item)
                     || (item.id != id && !descendsFromLocked(item, id))) continue;
-            for (const auto &cell : g_grid_cells) {
+            const auto &cells = parentHotseat ? g_hotseat_cells : g_grid_cells;
+            for (const auto &cell : cells) {
                 if (item.bounds.centerX() >= cell.bounds.left && item.bounds.centerX() < cell.bounds.right
                         && item.bounds.centerY() >= cell.bounds.top && item.bounds.centerY() < cell.bounds.bottom) {
-                    first = std::min(first, cell.row * g_grid_columns.load() + cell.column);
+                    first = std::min(first, parentHotseat ? cell.column
+                            : cell.row * g_grid_columns.load() + cell.column);
                 }
             }
         }
         if (first != kVirtualNodeCount) return first;
         for (const auto &item : g_workspace) {
-            if (item.id != id || hotseatNodeLocked(item) || liftedSourceNodeLocked(item)) continue;
-            for (const auto &cell : g_grid_cells) {
+            if (item.id != id || hotseatNodeLocked(item) != parentHotseat
+                    || liftedSourceNodeLocked(item)) continue;
+            const auto &cells = parentHotseat ? g_hotseat_cells : g_grid_cells;
+            for (const auto &cell : cells) {
                 if (item.bounds.left >= cell.bounds.left && item.bounds.left < cell.bounds.right
                         && item.bounds.top >= cell.bounds.top && item.bounds.top < cell.bounds.bottom) {
-                    return cell.row * g_grid_columns.load() + cell.column;
+                    return parentHotseat ? cell.column
+                            : cell.row * g_grid_columns.load() + cell.column;
                 }
             }
         }
@@ -4202,7 +4556,8 @@ void orderGridChildren(void *node) {
         const int32_t id = static_cast<int32_t>(child >> 32U);
         if (isVirtualNode(id)) return slotIndexForVirtualIdLocked(id) < 0;
         return std::any_of(g_workspace.begin(), g_workspace.end(), [&](const auto &item) {
-            return item.id == id && !hotseatNodeLocked(item) && liftedSourceNodeLocked(item);
+            return item.id == id && hotseatNodeLocked(item) == parentHotseat
+                    && liftedSourceNodeLocked(item);
         });
     });
     std::stable_sort(children, end, [&](int64_t left, int64_t right) { return rank(left) < rank(right); });
@@ -4381,6 +4736,7 @@ NodeResult onCreateNode(void *provider, int32_t nodeId) {
     NodeResult result = g_original_create_node == nullptr
             ? NodeResult{1U, nullptr} : g_original_create_node(provider, nodeId);
     if ((result.absent & 1U) != 0 || result.node == nullptr) return result;
+    flushLiftRefresh();
     advanceFolderRefresh(provider);
     if (g_focus_callback_active.load(std::memory_order_acquire)) {
         g_focus_callback_node_observed.store(true, std::memory_order_release);
@@ -4403,25 +4759,77 @@ NodeResult onCreateNode(void *provider, int32_t nodeId) {
         observePendingPlacement(describeNode(result.node));
         const bool visiblePageQuery = nodeString(result.node, 0x1b8) == "com.miui.home:id/screen_content"
                 && describeNode(result.node).bounds.width() > 0;
+        const std::string pageDescription = nodeString(result.node, 0x138);
+        const bool lifted = g_lifted.load(std::memory_order_acquire);
+        const bool hadPage = g_page_state_known.load(std::memory_order_acquire);
+        bool pageChanged = rememberVisibleScreen(pageDescription);
+        std::vector<ObservedNode> rootNodes;
         if (nodeId == -1 || visiblePageQuery) {
             // A root query is a safe provider lifetime boundary.  Build the
             // surface snapshot here instead of handing this raw provider to a
             // background poller after the accessibility call has returned.
-            std::vector<ObservedNode> nodes;
-            readTree(provider, -1, nodes);
-            observePendingPlacements(nodes);
-            if (!nodes.empty()) observeSurfaceTree(provider, nodes);
-            recoverWorkspaceSemantics(provider, nodes);
+            readTree(provider, -1, rootNodes);
+            observePendingPlacements(rootNodes);
+            if (!pageChanged) pageChanged = rememberVisibleScreenFromNodes(rootNodes);
         }
-        const std::string pageDescription = nodeString(result.node, 0x138);
-        const bool lifted = g_lifted.load(std::memory_order_acquire);
-        const bool hadPage = g_page_state_known.load(std::memory_order_acquire);
-        const bool pageChanged = rememberVisibleScreen(pageDescription);
+        // Home often reports the page indicator as a separate node after the
+        // screen_content callback. Refresh the live tree at that provider
+        // boundary so page focus repair sees the settled page rather than the
+        // previous cached tree.
+        if (pageChanged && rootNodes.empty() && !pageDescription.empty()) {
+            readTree(provider, -1, rootNodes);
+        }
+        const int32_t pendingFocusPage = g_native_focus_page_pending.load(
+                std::memory_order_acquire);
+        if (!lifted && pendingFocusPage == g_visible_screen.load(std::memory_order_acquire) + 1
+                && isIconNode(result.node)) {
+            if (rootNodes.empty()) readTree(provider, -1, rootNodes);
+            const ObservedNode observed = describeNode(result.node);
+            const bool alreadyObserved = std::any_of(rootNodes.begin(), rootNodes.end(),
+                    [&](const auto &node) {
+                return node.id == observed.id && node.host == observed.host
+                        && node.window == observed.window;
+            });
+            if (!alreadyObserved) rootNodes.push_back(observed);
+        }
+        if (!rootNodes.empty()) {
+            observeSurfaceTree(provider, rootNodes);
+            recoverWorkspaceSemantics(provider, rootNodes);
+            if (!lifted && std::any_of(rootNodes.begin(), rootNodes.end(),
+                    [](const auto &node) {
+                return node.resource == "com.miui.home:id/screen_content"
+                        || node.resource == "com.miui.home:id/workspace";
+            })) {
+                std::lock_guard lock(g_session_mutex);
+                g_last_desktop_workspace = rootNodes;
+                g_last_desktop_screen = g_visible_screen.load(std::memory_order_acquire);
+            }
+        }
         rememberPageSource(result.node);
+        const int32_t currentPage = g_visible_screen.load(std::memory_order_acquire) + 1;
+        if (pageChanged && hadPage && !lifted) {
+            g_native_focus_page_pending.store(currentPage, std::memory_order_release);
+            g_native_focus_refresh_page.store(-1, std::memory_order_release);
+        }
         if (pageChanged && hadPage) {
             announceConfirmedPage(g_visible_screen.load() + 1,
                     {static_cast<int32_t>(source), nodeField<int32_t>(result.node, 0x418),
                             static_cast<int32_t>(source >> 32U)});
+        }
+        if (!lifted && !rootNodes.empty()
+                && g_native_focus_page_pending.load(std::memory_order_acquire) == currentPage) {
+            int32_t treePage = -1;
+            for (const auto &node : rootNodes) {
+                if (parsePageIndicator(node.label, treePage)) break;
+            }
+            if (treePage == currentPage) {
+                const bool repaired = repairNativeWorkspaceFocus(provider, rootNodes, currentPage);
+                if (repaired) {
+                    g_native_focus_page_pending.compare_exchange_strong(
+                            treePage, -1, std::memory_order_acq_rel);
+                    g_native_focus_refresh_page.store(-1, std::memory_order_release);
+                }
+            }
         }
         if (pageChanged && g_lifted.load(std::memory_order_acquire)) {
             refreshLiftSessionForPage(provider);
@@ -4449,24 +4857,38 @@ NodeResult onCreateNode(void *provider, int32_t nodeId) {
     }
     if ((result.absent & 1U) == 0 && result.node != nullptr
             && g_lifted.load(std::memory_order_acquire)
-            && moveActionsReady()
-            && nodeId == g_drop_parent_node_id.load(std::memory_order_acquire)
-            && g_node_add_child != nullptr) {
+            && moveActionsReady() && g_node_add_child != nullptr) {
         // HyperOS 4 may allocate a fresh provider node id on every tree read.
-        // Bind the virtual children to the currently returned visible page.
-        g_drop_parent_host_id.store(static_cast<int32_t>(nodeField<int64_t>(result.node, 0x338)));
-        g_drop_parent_window_id.store(nodeField<int32_t>(result.node, 0x418));
-        std::vector<int32_t> slotIds;
-        {
-            std::lock_guard lock(g_session_mutex);
-            for (const auto &slot : g_slots) slotIds.push_back(virtualIdForSlot(slot));
+        // Desktop and hotseat are separate parents, so bind each virtual set
+        // to the matching real parent node.
+        const std::string resource = nodeString(result.node, 0x1b8);
+        const bool desktopParent = nodeId == g_drop_parent_node_id.load(std::memory_order_acquire)
+                && resource != "com.miui.home:id/hotseat"
+                && resource != "com.miui.home:id/folder_grid_view";
+        const bool hotseatParent = nodeId == g_hotseat_parent_node_id.load(std::memory_order_acquire)
+                && resource == "com.miui.home:id/hotseat";
+        if (desktopParent || hotseatParent) {
+            const int32_t host = static_cast<int32_t>(nodeField<int64_t>(result.node, 0x338));
+            const int32_t window = nodeField<int32_t>(result.node, 0x418);
+            if (hotseatParent) {
+                g_hotseat_parent_host_id.store(host, std::memory_order_release);
+                g_hotseat_parent_window_id.store(window, std::memory_order_release);
+            } else {
+                g_drop_parent_host_id.store(host, std::memory_order_release);
+                g_drop_parent_window_id.store(window, std::memory_order_release);
+            }
+            std::vector<int32_t> slotIds;
+            {
+                std::lock_guard lock(g_session_mutex);
+                for (const auto &slot : g_slots) {
+                    if (slot.hotseat == hotseatParent) slotIds.push_back(virtualIdForSlot(slot));
+                }
+            }
+            for (int32_t id : slotIds) {
+                g_node_add_child(result.node, host, id);
+            }
+            orderGridChildren(result.node);
         }
-        for (int32_t id : slotIds) {
-            g_node_add_child(result.node,
-                    g_drop_parent_host_id.load(std::memory_order_acquire),
-                    id);
-        }
-        orderGridChildren(result.node);
     }
     flushSurfaceAnnouncements();
     focusPendingPlacement(provider, describeNode(result.node));
@@ -4636,14 +5058,15 @@ bool nodeBounds(void *provider, int32_t nodeId, Bounds &bounds, std::string *lab
 bool isFolderNode(void *provider, int32_t nodeId);
 
 bool removeEmptyFolder7748(const FavoritePlacement &folder) {
-    if (g_launcher_profile.load() != LauncherAbiProfile::kLegacy7748
+    const auto profile = g_launcher_profile.load();
+    if (!supportsFolderTransactions(profile)
             || folder.id <= 0 || folder.itemType != 2 || !workspaceContainer(folder.container)) return false;
     std::vector<FavoritePlacement> children;
     if (!loadPagePlacements(folder.id, -1, children, true) || !children.empty()) return false;
     WireWriter wire;
     appendSparseItemInfo(wire, folder, folder);
-    // 7748 delete_item_database: one ItemInfo, WHERE _id=?, no recursive delete.
-    dispatchWire(818, wire.bytes);
+    // The selected profile's delete operation decodes one ItemInfo only.
+    dispatchWire(deleteItemOperation(profile), wire.bytes);
     for (int attempt = 0; attempt < 30; ++attempt) {
         std::vector<FavoritePlacement> page;
         if (loadPagePlacements(folder.container, folder.screen, page)
@@ -4654,8 +5077,9 @@ bool removeEmptyFolder7748(const FavoritePlacement &folder) {
 }
 
 bool performNativeFolderPlacement(void *provider, int32_t nodeId) {
+    const auto profile = g_launcher_profile.load();
     if (provider == nullptr || !g_lifted.load() || !moveActionsReady()
-            || g_launcher_profile.load() != LauncherAbiProfile::kLegacy7748) return false;
+            || !supportsFolderTransactions(profile)) return false;
     ObservedNode sourceNode;
     FavoritePlacement source;
     {
@@ -4678,7 +5102,7 @@ bool performNativeFolderPlacement(void *provider, int32_t nodeId) {
     if (g_model_move_running.exchange(true)) return false;
     if (!beginFolderRefresh()) { g_model_move_running.store(false); return false; }
     const auto eventSource = captureDropParentEventSource(nodeId);
-    std::thread([source, target = target.placement, targetIsFolder, targetLabel, eventSource] {
+    std::thread([source, target = target.placement, targetIsFolder, targetLabel, eventSource, profile] {
         bool committed = false;
         FavoritePlacement folder = target;
         std::vector<FavoritePlacement> originals;
@@ -4696,7 +5120,7 @@ bool performNativeFolderPlacement(void *provider, int32_t nodeId) {
                     const std::string title = "文件夹";
                     appendSparseItemInfo(create, folder, folder, &title);
                     // The verified insert allocates its own ID; confirm the persisted row.
-                    dispatchWire(827, create.bytes);
+                    dispatchWire(insertItemOperation(profile), create.bytes);
                     for (int attempt = 0; attempt < 40 && !ready; ++attempt) {
                         std::vector<FavoritePlacement> after, created;
                         if (loadPagePlacements(target.container, target.screen, after)) {
@@ -4734,14 +5158,14 @@ bool performNativeFolderPlacement(void *provider, int32_t nodeId) {
                 WireWriter move;
                 move.put32(static_cast<int32_t>(expected.size()));
                 for (const auto &item : expected) appendSparseItemInfo(move, item, item);
-                dispatchWire(batchMoveOperation(LauncherAbiProfile::kLegacy7748), move.bytes);
+                dispatchWire(batchMoveOperation(profile), move.bytes);
                 committed = waitForPlacements(expected)
                         && waitForFolderPlacement(source.id, target.id, targetIsFolder);
                 if (!committed && !targetIsFolder) {
                     WireWriter rollback;
                     rollback.put32(static_cast<int32_t>(originals.size()));
                     for (const auto &item : originals) appendSparseItemInfo(rollback, item, item);
-                    dispatchWire(batchMoveOperation(LauncherAbiProfile::kLegacy7748), rollback.bytes);
+                    dispatchWire(batchMoveOperation(profile), rollback.bytes);
                     if (waitForPlacements(originals)) removeEmptyFolder7748(folder);
                 }
             }
@@ -4870,6 +5294,8 @@ void clearWorkspacePageContext() {
     g_visible_screen.store(0, std::memory_order_release);
     g_total_pages.store(0, std::memory_order_release);
     g_page_state_known.store(false, std::memory_order_release);
+    g_native_focus_page_pending.store(-1, std::memory_order_release);
+    g_native_focus_refresh_page.store(-1, std::memory_order_release);
 }
 
 void resetRecentSnapshot() {
@@ -4973,13 +5399,25 @@ void onLauncherWindowFocus(void *window, bool focused) {
     if (!focused && previous != 0) {
         g_resume_scans.store(0);
         g_consume_back_up.store(false);
+        g_swallow_cancel_back_up.store(false);
         g_last_provider.store(nullptr, std::memory_order_release);
         g_event_controller.store(nullptr, std::memory_order_release);
         endPendingPlacement();
-        if (g_lifted.load(std::memory_order_acquire)) {
+        // A Back from a folder briefly drops Home's window focus while the
+        // folder surface is being dismissed.  Keep that source alive across
+        // this transition so the desktop can rebuild its virtual drop grid;
+        // ordinary app/recents transitions still cancel the lift session.
+        const bool folderBackTransition = g_lifted.load(std::memory_order_acquire)
+                && g_lifted_folder_container.load(std::memory_order_acquire) > 0
+                && (g_folder_lift_in_folder.load(std::memory_order_acquire)
+                        || g_folder_lift_returned_to_desktop.load(
+                                std::memory_order_acquire));
+        if (g_lifted.load(std::memory_order_acquire) && !folderBackTransition) {
             const auto parent = captureDropParentEventSource(-1);
+            const bool eventReady = g_event_controller.load(std::memory_order_acquire) != nullptr;
             clearLiftSession();
             sendEvent(parent, kTypeWindowContentChanged);
+            if (!eventReady) queueLiftRefresh(parent);
         }
         setSurfaceState(SurfaceState::kOther, g_last_provider.load());
         {
@@ -5032,12 +5470,74 @@ bool onLauncherKey(void *scene, void *event) {
     if (event != nullptr && g_key_code != nullptr && g_key_action != nullptr
             && g_key_code(event) == 4) {
         const int32_t action = g_key_action(event);
-        if (action == 0 && (g_consume_back_up.load() || cancelLiftSession(-1))) {
-            g_consume_back_up.store(true);
+        if (action == 0) {
+            const int64_t returnedAt = g_folder_lift_returned_at_ms.load(
+                    std::memory_order_acquire);
+            if (g_folder_lift_returned_to_desktop.load(std::memory_order_acquire)
+                    && returnedAt > 0 && monotonicMillis() - returnedAt < 600) {
+                // The same Back can arrive through both the key and gesture
+                // hooks. Let the duplicate reach Home without cancelling the
+                // source retained for the desktop surface.
+                if (g_original_launcher_key != nullptr) g_original_launcher_key(scene, event);
+                return true;
+            }
+            if (g_folder_lift_returned_to_desktop.load(std::memory_order_acquire)) {
+                g_folder_lift_returned_to_desktop.store(false, std::memory_order_release);
+                g_folder_lift_returned_at_ms.store(0, std::memory_order_release);
+            }
+            // A folder lift has two surfaces.  The first Back must be passed
+            // to Home so it closes the folder while the captured source stays
+            // available for the desktop virtual grid.  The second Back then
+            // cancels the still-active lift session.
+            if (returnFolderLiftToDesktop()) {
+                g_consume_back_up.store(true, std::memory_order_release);
+                if (g_original_launcher_key != nullptr) g_original_launcher_key(scene, event);
+                return true;
+            }
+            if (g_consume_back_up.load(std::memory_order_acquire)
+                    || cancelLiftSession(-1)) {
+                // The folder return path set g_consume_back_up and forwards
+                // the matching key-up below.  A normal desktop cancellation
+                // has no surface to dismiss, so swallow only that key-up.
+                if (!g_consume_back_up.load(std::memory_order_acquire)) {
+                    g_swallow_cancel_back_up.store(true, std::memory_order_release);
+                }
+                return true;
+            }
+        }
+        if (action == 1 && g_folder_lift_returned_to_desktop.load(
+                std::memory_order_acquire)) {
+            const int64_t returnedAt = g_folder_lift_returned_at_ms.load(
+                    std::memory_order_acquire);
+            if (returnedAt > 0 && monotonicMillis() - returnedAt < 600) {
+                // The first folder Back may arrive through the gesture hook
+                // before the matching key-up.  Forward that key-up so Home
+                // can finish dismissing the folder surface.
+                // It is the end of this same key cycle, so do not carry the
+                // consume marker into the user's next Back.
+                g_consume_back_up.store(false, std::memory_order_release);
+                if (g_original_launcher_key != nullptr) {
+                    g_original_launcher_key(scene, event);
+                }
+                return true;
+            }
+        }
+        if (action == 1 && g_swallow_cancel_back_up.exchange(false,
+                std::memory_order_acq_rel)) {
             return true;
         }
-        if (action == 1 && g_consume_back_up.exchange(false)) return true;
+        if (action == 1 && g_consume_back_up.exchange(false)) {
+            // Keep the original key-up event.  HyperOS commits the folder
+            // close from the complete down/up pair; swallowing this half
+            // leaves the folder open after the first Back.
+            if (g_original_launcher_key != nullptr) g_original_launcher_key(scene, event);
+            return true;
+        }
         // Some accessibility services deliver only the key-up event.
+        if (action == 1 && returnFolderLiftToDesktop()) {
+            return g_original_launcher_key != nullptr
+                    && g_original_launcher_key(scene, event);
+        }
         if (action == 1 && cancelLiftSession(-1)) return true;
     }
     return g_original_launcher_key != nullptr && g_original_launcher_key(scene, event);
@@ -5045,16 +5545,38 @@ bool onLauncherKey(void *scene, void *event) {
 
 void onLauncherBack(void *helper) {
     markLauncherInputForeground();
-    cancelLiftSession(-1);
+    // Keep the source lifted while the folder's own back callback closes the
+    // folder.  A later desktop Back reaches the normal cancellation path.
+    const bool returnedToDesktop = returnFolderLiftToDesktop();
+    // On HyperOS the key and back-gesture hooks can both observe one hardware
+    // Back.  The key-down path has already moved a folder source to the
+    // desktop surface; do not let this second callback cancel that session
+    // before the matching key-up reaches Home.
+    const int64_t returnedAt = g_folder_lift_returned_at_ms.load(
+            std::memory_order_acquire);
+    const bool duplicateBack = g_folder_lift_returned_to_desktop.load(
+            std::memory_order_acquire) && returnedAt > 0
+            && monotonicMillis() - returnedAt < 600;
+    if (!returnedToDesktop && !duplicateBack
+            && !g_consume_back_up.load(std::memory_order_acquire)) {
+        g_folder_lift_returned_to_desktop.store(false, std::memory_order_release);
+        g_folder_lift_returned_at_ms.store(0, std::memory_order_release);
+        cancelLiftSession(-1);
+    }
     // The launcher owns the gesture callback and must finish its native cleanup.
-    if (g_original_launcher_back != nullptr) g_original_launcher_back(helper);
+    if (g_original_launcher_back != nullptr) {
+        g_original_launcher_back(helper);
+    }
 }
 
 void installLauncherLifecycleHooks(LauncherAbiProfile profile) {
-    const bool current = profile == LauncherAbiProfile::kCurrent8565;
+    const bool current = profile == LauncherAbiProfile::kCurrent8565
+            || profile == LauncherAbiProfile::kCurrent8584;
     if ((!current && profile != LauncherAbiProfile::kLegacy7748)
             || !g_launcher_fingerprint_ready.load() || !g_launcher_system_compatible.load()
-            || g_api == nullptr || g_api->hook_func == nullptr) return;
+            || g_api == nullptr || g_api->hook_func == nullptr) {
+        return;
+    }
     auto *base = static_cast<uint8_t *>(launcherLibraryBase());
     if (base == nullptr) return;
     if (g_key_code == nullptr) g_key_code = reinterpret_cast<MotionActionFn>(
@@ -5062,31 +5584,44 @@ void installLauncherLifecycleHooks(LauncherAbiProfile profile) {
     if (g_key_action == nullptr) g_key_action = reinterpret_cast<MotionActionFn>(
             findLoadedSymbol("libhyper_os_ui_public.so", "input_KeyEvent_getAction"));
     if (g_key_code == nullptr || g_key_action == nullptr
-            || g_launcher_lifecycle_hook_attempted.exchange(true)) return;
+            || g_launcher_lifecycle_hook_attempted.exchange(true)) {
+        return;
+    }
     constexpr uint32_t focusPrologue[] = {0xd102c3ffU, 0xa9057bfdU, 0xf90033fbU,
             0xa90767faU, 0xa9085ff8U, 0xa90957f6U, 0xa90a4ff4U, 0x910143fdU};
     constexpr uint32_t inputPrologue[] = {0xd10483ffU, 0xa90c7bfdU, 0xa90d6ffcU,
             0xa90e67faU, 0xa90f5ff8U, 0xa91057f6U, 0xa9114ff4U, 0x910303fdU};
+    const uint32_t *focusCheck = focusPrologue;
+    const uint32_t *keyCheck = inputPrologue;
+    const uint32_t *backCheck = inputPrologue;
     auto install = [&](uintptr_t offset, const uint32_t *prologue, size_t size,
             void *replacement, const char *name) -> void * {
         void *target = base + offset;
-        if (std::memcmp(target, prologue, size) != 0) return nullptr;
+        if (std::memcmp(target, prologue, size) != 0) {
+            return nullptr;
+        }
         void *backup = nullptr;
         const int result = g_api->hook_func(target, replacement, &backup);
         nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                 "Launcher %s hook result=%d", name, result);
         return result == 0 ? backup : nullptr;
     };
+    const uintptr_t focusOffset = profile == LauncherAbiProfile::kCurrent8584
+            ? 0x776420 : current ? 0x772360 : 0x757b34;
+    const uintptr_t keyOffset = profile == LauncherAbiProfile::kCurrent8584
+            ? 0x98058c : current ? 0x97a484 : 0x9736ec;
+    const uintptr_t backOffset = profile == LauncherAbiProfile::kCurrent8584
+            ? 0x729d14 : current ? 0x725c54 : 0x720ffc;
     g_original_launcher_focus = reinterpret_cast<LauncherFocusFn>(install(
-            current ? 0x772360 : 0x757b34, focusPrologue, sizeof(focusPrologue),
+            focusOffset, focusCheck, sizeof(focusPrologue),
             reinterpret_cast<void *>(&onLauncherWindowFocus), "window focus"));
     if (g_key_code != nullptr && g_key_action != nullptr) {
         g_original_launcher_key = reinterpret_cast<LauncherKeyFn>(install(
-                current ? 0x97a484 : 0x9736ec, inputPrologue, sizeof(inputPrologue),
+                keyOffset, keyCheck, sizeof(inputPrologue),
                 reinterpret_cast<void *>(&onLauncherKey), "key"));
     }
     g_original_launcher_back = reinterpret_cast<LauncherBackFn>(install(
-            current ? 0x725c54 : 0x720ffc, inputPrologue, sizeof(inputPrologue),
+            backOffset, backCheck, sizeof(inputPrologue),
             reinterpret_cast<void *>(&onLauncherBack), "back gesture"));
 }
 
@@ -5567,10 +6102,12 @@ bool buildModelMove(void *provider, int32_t nodeId, int32_t actionId,
     failureReason = "目标位置已变化，请重新选择位置";
     FavoritePlacement base = sources.front();
     int32_t startSlot = -1;
+    bool hotseatTarget = false;
     if (isVirtualNode(nodeId)) {
         for (size_t index = 0; index < slots.size(); ++index) {
             if (virtualIdForSlot(slots[index]) == nodeId) {
                 startSlot = static_cast<int32_t>(index);
+                hotseatTarget = slots[index].hotseat;
                 break;
             }
         }
@@ -5590,17 +6127,28 @@ bool buildModelMove(void *provider, int32_t nodeId, int32_t actionId,
                     g_grid_rows.load(), g_grid_columns.load());
             return false;
         }
-        base.container = kDesktopContainer;
-        // Accessibility page indexes are compact visual ordinals.  Home can
-        // retain a deleted page's database number, so resolve the current
-        // visual page back to the persisted favorites.screen value.
-        base.screen = databaseScreenForVisiblePage(
-                g_visible_screen.load(std::memory_order_acquire) + 1);
-        if (base.screen <= 0) {
-            nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
-                    "HyperOS4 move could not map visual page=%d to database screen",
+        for (size_t index = 0; index < sources.size(); ++index) {
+            if (slots[static_cast<size_t>(startSlot) + index].hotseat != hotseatTarget) {
+                failureReason = "目标位置已变化，请重新选择位置";
+                return false;
+            }
+        }
+        if (hotseatTarget) {
+            base.container = -101;
+            base.screen = slots[static_cast<size_t>(startSlot)].column;
+        } else {
+            base.container = kDesktopContainer;
+            // Accessibility page indexes are compact visual ordinals. Home can
+            // retain a deleted page's database number, so resolve the current
+            // visual page back to the persisted favorites.screen value.
+            base.screen = databaseScreenForVisiblePage(
                     g_visible_screen.load(std::memory_order_acquire) + 1);
-            return false;
+            if (base.screen <= 0) {
+                nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
+                        "HyperOS4 move could not map visual page=%d to database screen",
+                        g_visible_screen.load(std::memory_order_acquire) + 1);
+                return false;
+            }
         }
     } else {
         if (provider == nullptr) {
@@ -5648,7 +6196,8 @@ bool buildModelMove(void *provider, int32_t nodeId, int32_t actionId,
             }
         }
         std::vector<FavoritePlacement> page;
-        if (!loadPagePlacements(base.container, base.screen, page)) {
+        const bool hotseatReorder = base.container == -101;
+        if (!loadPagePlacements(base.container, base.screen, page, hotseatReorder)) {
             failureReason = "未能读取目标页，请稍后重试";
             nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
                     "HyperOS4 move page load failed stage=reorder node=%d action=0x%x page=%d",
@@ -5657,10 +6206,13 @@ bool buildModelMove(void *provider, int32_t nodeId, int32_t actionId,
         }
         std::unordered_set<int64_t> sourceIds;
         for (const auto &source : sources) sourceIds.insert(source.id);
-        const int columns = std::max(1, g_grid_columns.load(std::memory_order_relaxed));
-        const int rows = std::max(1, g_grid_rows.load(std::memory_order_relaxed));
+        const int columns = hotseatReorder
+                ? std::max(1, static_cast<int>(g_hotseat_cells.size()))
+                : std::max(1, g_grid_columns.load(std::memory_order_relaxed));
+        const int rows = hotseatReorder ? 1
+                : std::max(1, g_grid_rows.load(std::memory_order_relaxed));
         const int capacity = rows * columns;
-        const int anchorRank = base.cellY * columns + base.cellX;
+        const int anchorRank = hotseatReorder ? base.cellX : base.cellY * columns + base.cellX;
         if (anchorRank < 0 || anchorRank >= capacity) {
             nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
                     "HyperOS4 move anchor outside grid node=%d action=0x%x page=%d cell=%d,%d grid=%dx%d",
@@ -5668,9 +6220,9 @@ bool buildModelMove(void *provider, int32_t nodeId, int32_t actionId,
             return false;
         }
 
-        std::sort(page.begin(), page.end(), [columns](const auto &left, const auto &right) {
-            int leftRank = left.cellY * columns + left.cellX;
-            int rightRank = right.cellY * columns + right.cellX;
+        std::sort(page.begin(), page.end(), [columns, hotseatReorder](const auto &left, const auto &right) {
+            int leftRank = hotseatReorder ? left.cellX : left.cellY * columns + left.cellX;
+            int rightRank = hotseatReorder ? right.cellX : right.cellY * columns + right.cellX;
             return leftRank < rightRank;
         });
         std::vector<FavoritePlacement> ordered;
@@ -5731,7 +6283,7 @@ bool buildModelMove(void *provider, int32_t nodeId, int32_t actionId,
                 item.container = base.container;
                 item.screen = nextScreen;
                 item.cellX = index % columns;
-                item.cellY = index / columns;
+                item.cellY = hotseatReorder ? 0 : index / columns;
                 shifted.push_back(item);
             }
             ordered.resize(capacity);
@@ -5741,9 +6293,9 @@ bool buildModelMove(void *provider, int32_t nodeId, int32_t actionId,
         }
         for (size_t index = 0; index < ordered.size(); ++index) {
             ordered[index].container = base.container;
-            ordered[index].screen = base.screen;
+            ordered[index].screen = hotseatReorder ? static_cast<int32_t>(index) : base.screen;
             ordered[index].cellX = static_cast<int32_t>(index % columns);
-            ordered[index].cellY = static_cast<int32_t>(index / columns);
+            ordered[index].cellY = hotseatReorder ? 0 : static_cast<int32_t>(index / columns);
             shifted.push_back(ordered[index]);
         }
     }
@@ -5753,6 +6305,8 @@ bool buildModelMove(void *provider, int32_t nodeId, int32_t actionId,
             const Slot &slot = slots[static_cast<size_t>(startSlot) + index];
             target.cellX = slot.column;
             target.cellY = slot.row;
+            target.container = slot.hotseat ? -101 : kDesktopContainer;
+            if (slot.hotseat) target.screen = slot.column;
         } else {
             auto found = std::find_if(shifted.begin(), shifted.end(),
                     [&sources, index](const auto &item) {
@@ -5779,6 +6333,13 @@ bool buildModelMove(void *provider, int32_t nodeId, int32_t actionId,
                     nodeId, actionId, static_cast<long long>(target.id), target.screen,
                     target.cellX, target.cellY, target.spanX, target.spanY,
                     g_grid_rows.load(), g_grid_columns.load());
+            return false;
+        }
+        if (target.container == -101
+                && (target.cellX < 0 || target.cellX >= static_cast<int32_t>(g_hotseat_cells.size()))) {
+            nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
+                    "HyperOS4 move target outside hotseat stage=final node=%d id=%lld position=%d capacity=%zu",
+                    nodeId, static_cast<long long>(target.id), target.cellX, g_hotseat_cells.size());
             return false;
         }
         expected.push_back(target);
@@ -5855,6 +6416,9 @@ bool findVisiblePlacements(const std::vector<ObservedNode> &nodes,
 std::string placementAnnouncement(const std::vector<VisiblePlacement> &placed) {
     if (placed.empty()) return {};
     const auto &first = placed.front();
+    if (first.item.container == -101) {
+        return "已放置在底栏第" + std::to_string(first.item.cellX + 1) + "个位置";
+    }
     const int32_t page = visiblePageForDatabaseScreen(first.item.screen);
     // System Home's zh-CN announce_to_drop_workspace resource.
     return "已放置在第" + std::to_string(page > 0 ? page : first.item.screen)
@@ -5863,7 +6427,8 @@ std::string placementAnnouncement(const std::vector<VisiblePlacement> &placed) {
 }
 
 bool performFolderMoveOut(void *provider, int32_t nodeId) {
-    if (!moveActionsReady() || g_launcher_profile.load() != LauncherAbiProfile::kLegacy7748
+    const auto profile = g_launcher_profile.load();
+    if (!moveActionsReady() || !supportsFolderTransactions(profile)
             || g_model_move_running.load() || g_motion_new_with_display == nullptr
             || g_input_event == nullptr || g_input_drop == nullptr || g_inject_input == nullptr) return false;
     std::vector<ObservedNode> nodes;
@@ -5917,7 +6482,7 @@ bool performFolderMoveOut(void *provider, int32_t nodeId) {
     const AccessibilityEventSource eventSource{grid->host, grid->window, grid->id};
     const Bounds gridBounds = grid->bounds;
     const std::string sourceLabel = sourceNode->label;
-    dispatchWire(batchMoveOperation(g_launcher_profile.load()), wire.bytes);
+    dispatchWire(batchMoveOperation(profile), wire.bytes);
     const FavoritePlacement parent = parents.front();
     const bool emptyFolder = siblings.empty();
     std::thread([expected, eventSource, gridBounds, sourceLabel, parent, emptyFolder] {
@@ -5962,7 +6527,8 @@ bool performFolderMoveOut(void *provider, int32_t nodeId) {
 }
 
 bool performFolderReorder(void *provider, int32_t nodeId, int32_t actionId) {
-    if (!moveActionsReady() || g_launcher_profile.load() != LauncherAbiProfile::kLegacy7748
+    const auto profile = g_launcher_profile.load();
+    if (!moveActionsReady() || !supportsFolderTransactions(profile)
             || (actionId != kMoveBeforeAction && actionId != kMoveAfterAction)) return false;
     std::vector<ObservedNode> nodes;
     readTree(provider, -1, nodes);
@@ -5995,9 +6561,30 @@ bool performFolderReorder(void *provider, int32_t nodeId, int32_t actionId) {
             || source.container != container || source.id == target.id) return false;
     std::vector<FavoritePlacement> expected;
     if (!loadPagePlacements(container, source.screen, expected)) return false;
+    // Folder cells are a real two-dimensional grid.  Sorting by X alone
+    // collapses rows and makes a move after the third item jump to the wrong
+    // position on folders wider than one row.
     std::sort(expected.begin(), expected.end(), [](const auto &left, const auto &right) {
-        return left.cellX < right.cellX;
+        return left.cellY != right.cellY ? left.cellY < right.cellY
+                : left.cellX < right.cellX;
     });
+    int32_t folderColumns = 1;
+    for (const auto &item : expected) {
+        folderColumns = std::max(folderColumns, item.cellX + std::max(1, item.spanX));
+    }
+    if (folderColumns == 1) {
+        std::vector<int32_t> centers;
+        for (const auto &node : nodes) {
+            if (!node.icon() || !nodeDescendsFrom(nodes, node, grid->id)
+                    || node.bounds.width() <= 0 || node.bounds.height() <= 0) continue;
+            centers.push_back(node.bounds.centerX());
+        }
+        std::sort(centers.begin(), centers.end());
+        centers.erase(std::unique(centers.begin(), centers.end(), [](int32_t left, int32_t right) {
+            return std::abs(left - right) < 8;
+        }), centers.end());
+        folderColumns = std::max(folderColumns, static_cast<int32_t>(centers.size()));
+    }
     auto original = std::find_if(expected.begin(), expected.end(),
             [&](const auto &item) { return item.id == source.id; });
     if (original == expected.end()) return false;
@@ -6011,14 +6598,14 @@ bool performFolderReorder(void *provider, int32_t nodeId, int32_t actionId) {
     WireWriter wire;
     wire.put32(static_cast<int32_t>(expected.size()));
     for (size_t index = 0; index < expected.size(); ++index) {
-        expected[index].cellX = static_cast<int32_t>(index);
-        expected[index].cellY = 0;
+        expected[index].cellX = static_cast<int32_t>(index % folderColumns);
+        expected[index].cellY = static_cast<int32_t>(index / folderColumns);
         appendSparseItemInfo(wire, expected[index], expected[index]);
     }
     if (g_model_move_running.exchange(true)) return false;
     if (!beginFolderRefresh()) { g_model_move_running.store(false); return false; }
     const auto eventSource = captureDropParentEventSource(nodeId);
-    dispatchWire(batchMoveOperation(g_launcher_profile.load()), wire.bytes);
+    dispatchWire(batchMoveOperation(profile), wire.bytes);
     const Bounds gridBounds = grid->bounds;
     std::thread([expected, eventSource, title, sourceLabel, targetLabel = targetNode->label,
                  after = actionId == kMoveAfterAction, gridBounds, parent = parent.front()] {
@@ -6061,7 +6648,10 @@ bool performFolderReorder(void *provider, int32_t nodeId, int32_t actionId) {
 }
 
 bool performNativePlacement(void *provider, int32_t nodeId, int32_t actionId) {
-    if (g_lifted_folder_container.load() > 0) return performFolderReorder(provider, nodeId, actionId);
+    if (g_lifted_folder_container.load() > 0
+            && g_folder_lift_in_folder.load(std::memory_order_acquire)) {
+        return performFolderReorder(provider, nodeId, actionId);
+    }
     if (actionId == kCreateFolderAction) {
         return performNativeFolderPlacement(provider, nodeId);
     }
@@ -6128,8 +6718,10 @@ bool performNativePlacement(void *provider, int32_t nodeId, int32_t actionId) {
     std::vector<PendingPlacement> pendingTargets;
     pendingTargets.reserve(visibleTargets.size());
     for (const auto &target : visibleTargets) {
+        if (target.item.container == -101) continue;
         pendingTargets.push_back({target.item, target.label, target.bounds, false});
     }
+    const bool pendingVisibilityRequired = !pendingTargets.empty();
     // Native dispatch may publish fresh nodes before it returns.
     beginPendingPlacement(pendingTargets);
     const bool currentMoveProfile = g_current_frb_move_profile.load(
@@ -6148,7 +6740,7 @@ bool performNativePlacement(void *provider, int32_t nodeId, int32_t actionId) {
             itemWire.put32(expected.front().screen);
             itemWire.put32(expected.front().cellX);
             itemWire.put32(expected.front().cellY);
-            dispatchWire(kFrbMoveItemInDatabase, itemWire.bytes);
+            dispatchWire(singleMoveOperation(g_launcher_profile.load()), itemWire.bytes);
             nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                     "HyperOS4 move_item_in_database dispatched id=%lld target=%d payload=%zu",
                     static_cast<long long>(sources.front().id), nodeId,
@@ -6177,7 +6769,7 @@ bool performNativePlacement(void *provider, int32_t nodeId, int32_t actionId) {
                 operation, expected.size(), nodeId, wire.bytes.size());
     }
     std::thread([expected = std::move(expected), visibleTargets = std::move(visibleTargets),
-                 eventSource, directDatabaseCommit] {
+                 eventSource, directDatabaseCommit, pendingVisibilityRequired] {
         bool committed = directDatabaseCommit
                 ? updateFavoritePlacements(expected) && waitForPlacements(expected)
                 : waitForPlacements(expected);
@@ -6194,7 +6786,7 @@ bool performNativePlacement(void *provider, int32_t nodeId, int32_t actionId) {
             clearLiftSession();
             // Readers need invalidation before they query the nodes we wait for.
             sendEvent(eventSource, kTypeWindowContentChanged);
-            const bool visible = waitForPendingPlacementVisibility();
+            const bool visible = !pendingVisibilityRequired || waitForPendingPlacementVisibility();
             const bool persisted = placementsMatch(expected, "after_reload");
             const bool focused = g_launcher_window_focused.load(std::memory_order_acquire) != 0;
             if (focused) {
@@ -6307,7 +6899,7 @@ bool performActionImpl(void *provider, int32_t nodeId, int32_t actionId, void *a
             return node.resource == "com.miui.home:id/folder_grid_view";
         });
         if (folderGrid != nodes.end()) {
-            if (g_launcher_profile.load() != LauncherAbiProfile::kLegacy7748) {
+            if (!supportsFolderTransactions(g_launcher_profile.load())) {
                 sendAnnouncement(nodeId, "当前桌面版本暂不支持文件夹内移动");
                 return false;
             }
@@ -6318,6 +6910,7 @@ bool performActionImpl(void *provider, int32_t nodeId, int32_t actionId, void *a
             }
             clearLiftSession();
             g_lifted_folder_container.store(placement.container);
+            g_folder_lift_in_folder.store(true, std::memory_order_release);
             {
                 std::lock_guard lock(g_session_mutex);
                 g_source = *source;
@@ -6711,6 +7304,7 @@ void resolveLauncherApis(void *handle) {
         }
     }
     const uintptr_t motionOffset = profile == LauncherAbiProfile::kCurrent8565 ? 0xd40fd8
+            : profile == LauncherAbiProfile::kCurrent8584 ? 0xd47844
             : profile == LauncherAbiProfile::kLegacy7748 ? 0xd37904 : 0;
     if (motionOffset != 0 && g_launcher_fingerprint_ready.load()
             && !g_launcher_motion_hook_attempted.exchange(true)
@@ -6804,6 +7398,15 @@ void resolvePrivate(const char *name, void *handle) {
     }
     const bool paired = profileMatchesSystemAbi(profile, buildId, aidlId, uiId,
             privateFingerprint, aidlFingerprint, uiFingerprint);
+    nativeLog(ANDROID_LOG_WARN, "ActionGridNative",
+            "system ABI pair profile=%s paired=%d private=%llx/%llx aidl=%llx/%llx ui=%llx/%llx",
+            launcherAbiProfileName(profile), paired ? 1 : 0,
+            static_cast<unsigned long long>(privateFingerprint.first),
+            static_cast<unsigned long long>(privateFingerprint.second),
+            static_cast<unsigned long long>(aidlFingerprint.first),
+            static_cast<unsigned long long>(aidlFingerprint.second),
+            static_cast<unsigned long long>(uiFingerprint.first),
+            static_cast<unsigned long long>(uiFingerprint.second));
     g_launcher_system_compatible.store(paired, std::memory_order_release);
     if (paired) installLauncherLifecycleHooks(profile);
     if (!paired) {
@@ -7086,15 +7689,24 @@ void injectIconActions(void *node) {
     }
     if (lifted) {
         injectDirectAction(node, kCancelAction, kCancelLabel);
-        if (g_lifted_folder_container.load() > 0 && liftedSource) {
-            injectDirectAction(node, kMoveOutOfFolderAction, u"移出文件夹");
-        }
         const Bounds bounds = nodeField<Bounds>(node, kNodeBoundsOffset);
         std::string location;
         {
             std::lock_guard lock(g_session_mutex);
-            const bool hotseat = hotseatNodeLocked(describeNode(node));
-            if (hotseat) location = "，底栏";
+            const ObservedNode described = describeNode(node);
+            const bool hotseat = hotseatNodeLocked(described);
+            if (hotseat) {
+                Slot cell{};
+                if (hotseatCellForNodeLocked(described, cell)) {
+                    location = "，底栏第 " + std::to_string(cell.column + 1)
+                            + " 个位置";
+                } else {
+                    // Keep a useful fallback while the launcher is rebuilding
+                    // the hotseat geometry. The next root query will replace
+                    // it with the concrete column once the cells are known.
+                    location = "，底栏";
+                }
+            }
             for (const auto &cell : g_grid_cells) {
                 if (hotseat) break;
                 if (bounds.centerX() >= cell.bounds.left && bounds.centerX() < cell.bounds.right
@@ -7102,6 +7714,38 @@ void injectIconActions(void *node) {
                     location = "，第 " + std::to_string(cell.row + 1)
                             + " 行第 " + std::to_string(cell.column + 1) + " 列";
                     break;
+                }
+            }
+            if (!hotseat && g_folder_lift_in_folder.load(std::memory_order_acquire)
+                    && g_lifted_folder_container.load(std::memory_order_acquire) > 0) {
+                const auto grid = std::find_if(g_workspace.begin(), g_workspace.end(),
+                        [](const auto &candidate) {
+                            return candidate.resource == "com.miui.home:id/folder_grid_view";
+                        });
+                if (grid != g_workspace.end()) {
+                    std::vector<const ObservedNode *> members;
+                    for (const auto &candidate : g_workspace) {
+                        if (candidate.icon() && candidate.host == grid->host
+                                && candidate.window == grid->window
+                                && descendsFromLocked(candidate, grid->id)
+                                && candidate.bounds.centerX() >= grid->bounds.left
+                                && candidate.bounds.centerX() < grid->bounds.right
+                                && candidate.bounds.centerY() >= grid->bounds.top
+                                && candidate.bounds.centerY() < grid->bounds.bottom) {
+                            members.push_back(&candidate);
+                        }
+                    }
+                    std::sort(members.begin(), members.end(), [](const auto *left, const auto *right) {
+                        return left->bounds.top != right->bounds.top
+                                ? left->bounds.top < right->bounds.top
+                                : left->bounds.left < right->bounds.left;
+                    });
+                    for (size_t index = 0; index < members.size(); ++index) {
+                        if (members[index]->id == sourceId) {
+                            location = "，文件夹第 " + std::to_string(index + 1) + " 个位置";
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -7126,7 +7770,7 @@ void injectIconActions(void *node) {
                     && g_sources.front().resource == "com.miui.home:id/icon_icon";
         }
         if (canCreateFolder && g_lifted_folder_container.load() == 0
-                && g_launcher_profile.load() == LauncherAbiProfile::kLegacy7748) {
+                && supportsFolderTransactions(g_launcher_profile.load())) {
             std::u16string folderAction = folder
                     ? std::u16string(u"放进 ") + utf16FromUtf8(iconLabel)
                     : std::u16string(u"和 ") + utf16FromUtf8(iconLabel) + u" 创建文件夹";
@@ -7134,10 +7778,6 @@ void injectIconActions(void *node) {
         }
     } else if (!lifted) {
         AppTarget target = targetForNode(sourceId, node);
-        if (target.placement.container > 0 && !folder
-                && g_launcher_profile.load() == LauncherAbiProfile::kLegacy7748) {
-            injectDirectAction(node, kMoveOutOfFolderAction, u"移出文件夹");
-        }
         if (!target.package.empty() && !target.activity.empty()) {
             injectDirectAction(node, kAppInfoAction, kAppInfoLabel);
             if (target.user == 0 && uninstallLaunchReady()) {
@@ -7336,6 +7976,83 @@ int32_t workspaceFocusTarget(const std::vector<ObservedNode> &nodes,
                 || (node.bounds.top == first->bounds.top && node.bounds.left < first->bounds.left))) first = &node;
     }
     return first == nullptr ? indicator : first->id;
+}
+
+bool repairNativeWorkspaceFocus(void *provider, const std::vector<ObservedNode> &nodes,
+        int32_t page) {
+    if (provider == nullptr || g_original_find_focus == nullptr
+            || g_original_perform_action == nullptr || g_node_drop == nullptr
+            || g_launcher_window_focused.load(std::memory_order_acquire) != 1) return false;
+    if (std::any_of(nodes.begin(), nodes.end(), [](const auto &node) {
+        return node.resource == "com.miui.home:id/folder_grid_view";
+    })) return false;
+    const auto pageNode = std::find_if(nodes.begin(), nodes.end(), [](const auto &node) {
+        return node.resource == "com.miui.home:id/screen_content"
+                && node.bounds.width() > 0 && node.bounds.height() > 0;
+    });
+    if (pageNode == nodes.end()) return false;
+
+    NodeResult focused = g_original_find_focus(provider, 2);
+    int32_t focusedId = -1;
+    ObservedNode focusedNode{};
+    bool focusedObserved = false;
+    if ((focused.absent & 1U) == 0 && focused.node != nullptr) {
+        focusedNode = describeNode(focused.node);
+        focusedId = focusedNode.id;
+        focusedObserved = true;
+        g_node_drop(focused.node);
+    }
+    if (focusedObserved && focusedNode.host == pageNode->host
+            && focusedNode.window == pageNode->window) {
+        int32_t focusedPage = -1;
+        const bool indicator = parsePageIndicator(focusedNode.label, focusedPage)
+                && focusedPage == page;
+        const bool onPage = focusedNode.icon()
+                && nodeDescendsFrom(nodes, focusedNode, pageNode->id);
+        // The hotseat is shared by every workspace page.  Treating its icon
+        // as a valid page focus clears the pending repair before the new page
+        // has produced its first workspace icon.
+        if (indicator || onPage) return true;
+    }
+
+    const auto hotseat = std::find_if(nodes.begin(), nodes.end(), [](const auto &node) {
+        return node.resource == "com.miui.home:id/hotseat";
+    });
+    const ObservedNode *target = nullptr;
+    for (const auto &node : nodes) {
+        if (!node.icon() || node.host != pageNode->host || node.window != pageNode->window
+                || node.bounds.width() <= 0 || node.bounds.height() <= 0) continue;
+        const bool descendant = nodeDescendsFrom(nodes, node, pageNode->id);
+        const bool insidePage = node.bounds.centerX() >= pageNode->bounds.left
+                && node.bounds.centerX() < pageNode->bounds.right
+                && node.bounds.centerY() >= pageNode->bounds.top
+                && node.bounds.centerY() < pageNode->bounds.bottom;
+        const bool inHotseat = hotseat != nodes.end()
+                && nodeDescendsFrom(nodes, node, hotseat->id);
+        if (inHotseat || (!descendant && !insidePage)) continue;
+        if (target == nullptr || node.bounds.top < target->bounds.top
+                || (node.bounds.top == target->bounds.top
+                        && node.bounds.left < target->bounds.left)) target = &node;
+    }
+    if (target == nullptr) {
+        int32_t expectedRefresh = -1;
+        if (g_native_focus_refresh_page.compare_exchange_strong(
+                    expectedRefresh, page, std::memory_order_acq_rel)) {
+            sendEvent({pageNode->host, pageNode->window, pageNode->id},
+                    kTypeWindowContentChanged);
+        }
+        return false;
+    }
+    uintptr_t arguments[2]{1, 0};
+    if (focusedId >= 0) {
+        g_original_perform_action(provider, focusedId, kClearAccessibilityFocusAction, arguments);
+    }
+    const bool handled = g_original_perform_action(provider, target->id,
+            kAccessibilityFocusAction, arguments);
+    nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
+            "native workspace focus page=%d from=%d to=%d handled=%d",
+            page, focusedId, target->id, handled ? 1 : 0);
+    return handled;
 }
 
 void repairWorkspaceFocus(void *provider, const std::vector<ObservedNode> &nodes,

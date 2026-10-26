@@ -21,10 +21,16 @@ void prepareGrid() {
     g_visible_screen.store(2);
     g_lifted_screen.store(3);
     g_lifted.store(true);
+    g_lifted_folder_container.store(0);
+    g_folder_lift_in_folder.store(false);
+    g_folder_lift_returned_to_desktop.store(false);
+    g_folder_lift_returned_at_ms.store(0);
     g_virtual_hovered_id.store(-1);
     g_virtual_focused_id.store(-1);
     g_sources.clear();
     g_source_placements.clear();
+    g_last_desktop_workspace.clear();
+    g_last_desktop_screen = -1;
     g_app_targets.clear();
     g_snapshot = {};
     g_model_move_running.store(false);
@@ -473,6 +479,7 @@ struct AccessibilityCapture {
         g_workspace_window_id.store(-1);
         g_page_source_keys.clear();
         g_consume_back_up.store(false);
+        g_swallow_cancel_back_up.store(false);
     }
     ~AccessibilityCapture() {
         g_event_controller.store(nullptr);
@@ -487,6 +494,7 @@ struct AccessibilityCapture {
         g_key_code = nullptr; g_key_action = nullptr;
         g_original_launcher_focus = nullptr; g_original_launcher_key = nullptr;
         g_original_launcher_back = nullptr;
+        g_swallow_cancel_back_up.store(false);
     }
 };
 
@@ -1101,6 +1109,84 @@ void backKeyCancelsOnlyTheLiftedSession() {
             "normal keys were swallowed after leaving drag mode");
 }
 
+void folderBackKeepsLiftUntilTheSecondBack() {
+    AccessibilityCapture capture;
+    prepareGrid();
+    g_lifted_folder_container.store(241);
+    g_folder_lift_in_folder.store(true);
+    forwardedBacks = 0;
+    g_original_launcher_back = +[](void *) { ++forwardedBacks; };
+    onLauncherBack(reinterpret_cast<void *>(1));
+    require(g_lifted.load() && !g_folder_lift_in_folder.load()
+                    && forwardedBacks == 1,
+            "folder Back did not close only the folder surface");
+
+    forwardedKeys = 0;
+    g_key_code = +[](void *event) { return static_cast<TestKey *>(event)->code; };
+    g_key_action = +[](void *event) { return static_cast<TestKey *>(event)->action; };
+    g_original_launcher_key = +[](void *, void *) { ++forwardedKeys; return false; };
+    TestKey up{4, 1};
+    require(onLauncherKey(nullptr, &up) && forwardedKeys == 1,
+            "folder Back swallowed the matching key-up");
+
+    g_folder_lift_returned_at_ms.store(monotonicMillis() - 1000);
+    onLauncherBack(reinterpret_cast<void *>(1));
+    require(!g_lifted.load() && forwardedBacks == 2,
+            "the second folder Back did not cancel the retained lift");
+}
+
+void folderBackKeyCycleClearsTheFirstBackMarker() {
+    AccessibilityCapture capture;
+    prepareGrid();
+    g_lifted_folder_container.store(241);
+    g_folder_lift_in_folder.store(true);
+    forwardedKeys = 0;
+    g_key_code = +[](void *event) { return static_cast<TestKey *>(event)->code; };
+    g_key_action = +[](void *event) { return static_cast<TestKey *>(event)->action; };
+    g_original_launcher_key = +[](void *, void *) { ++forwardedKeys; return false; };
+    TestKey firstDown{4, 0}, firstUp{4, 1};
+    require(onLauncherKey(nullptr, &firstDown) && onLauncherKey(nullptr, &firstUp),
+            "first folder Back key cycle was not forwarded");
+    require(g_lifted.load() && !g_folder_lift_in_folder.load()
+                    && !g_consume_back_up.load(),
+            "first folder Back key cycle left a stale consume marker");
+
+    g_folder_lift_returned_at_ms.store(monotonicMillis() - 1000);
+    TestKey secondDown{4, 0}, secondUp{4, 1};
+    require(onLauncherKey(nullptr, &secondDown) && onLauncherKey(nullptr, &secondUp),
+            "second folder Back key cycle was not consumed");
+    require(!g_lifted.load() && forwardedKeys == 2,
+            "second folder Back key cycle did not cancel the retained lift");
+}
+
+void folderReturnRebuildsTheSavedDesktopGrid() {
+    AccessibilityCapture capture;
+    prepareGrid();
+    g_last_desktop_workspace = g_workspace;
+    g_last_desktop_screen = g_visible_screen.load();
+    g_workspace = {
+        {90, -1, 1, 2, {0, 0, 400, 600}, "com.miui.home:id/folder", "系统工具"},
+        {91, 90, 1, 2, {0, 0, 400, 600}, "com.miui.home:id/folder_grid_view", ""},
+        {92, 91, 1, 2, {0, 0, 100, 100}, "com.miui.home:id/icon_icon", "文件管理"}
+    };
+    g_source = g_workspace.back();
+    g_sources = {g_source};
+    g_lifted_folder_container.store(241);
+    g_folder_lift_in_folder.store(true);
+    g_drop_parent_node_id.store(91);
+    g_drop_parent_host_id.store(1);
+    g_drop_parent_window_id.store(2);
+    g_grid_cells.clear();
+    g_hotseat_cells.clear();
+    g_slots.clear();
+
+    require(returnFolderLiftToDesktop(),
+            "folder return did not transition to the desktop surface");
+    require(!g_folder_lift_in_folder.load() && g_grid_cells.size() == 24
+                    && g_slots.size() == 21 && g_drop_parent_node_id.load() == 10,
+            "folder return did not rebuild the saved desktop virtual grid immediately");
+}
+
 void leavingHomeCancelsGridAndRejectsStaleNodes() {
     AccessibilityCapture capture;
     prepareGrid();
@@ -1269,7 +1355,11 @@ void captureDispatch(uint32_t operation, int64_t, const uint8_t *bytes, uint32_t
 
 void moveRequestIncludesDestinationArguments() {
     prepareGrid();
-    expectedOperation = 833;
+    // Exercise the verified 8565 single-item contract.  The 8584 contract
+    // has the same wire shape with a different opcode and is covered by the
+    // profile table regression below.
+    g_launcher_profile.store(LauncherAbiProfile::kCurrent8565);
+    expectedOperation = singleMoveOperation(LauncherAbiProfile::kCurrent8565);
     SnapshotFavorite source;
     source.id = 101;
     source.title = "美团外卖";
@@ -1907,11 +1997,65 @@ void dockDoesNotBecomeTheLastDesktopRow() {
     g_workspace.push_back({20, -1, 1, 2, {0, 600, 400, 700}, "com.miui.home:id/hotseat", ""});
     g_workspace.push_back({21, 20, 1, 2, {0, 600, 100, 700}, "com.miui.home:id/icon_icon", "电话"});
     rebuildSlots();
-    require(virtualNodeAt(150, 650) == -1, "dock is exposed as an empty desktop cell");
+    const int32_t dockNode = virtualNodeAt(150, 650);
+    require(hotseatVirtualNode(dockNode), "dock is not exposed through the hotseat virtual grid");
     require(std::all_of(g_grid_cells.begin(), g_grid_cells.end(), [](const auto &cell) {
         return cell.bounds.bottom <= 600;
     }), "desktop row geometry includes the dock");
     require(gridNodeAtCellLocked(5, 0) != 21, "dock icon joined the desktop traversal");
+
+    g_source_placements = {{21, -101, 2, 0, 0, 1, 1, 0}};
+    g_sources = {g_workspace.back()};
+    rebuildSlots();
+    require(hotseatVirtualNode(virtualNodeAt(50, 650)),
+            "lifting the dock source did not free its original hotseat position");
+}
+
+std::u16string hotseatNodeDescription;
+
+void liftedHotseatItemsSpeakTheirConcretePosition() {
+    AccessibilityCapture capture;
+    ActionCapture actions;
+    prepareGrid();
+    g_snapshot.ready = true;
+    for (int32_t index = 0; index < 4; ++index) {
+        const int32_t column = index < 2 ? index : index + 1;
+        SnapshotFavorite favorite;
+        favorite.id = 500 + index;
+        favorite.title = "底栏" + std::to_string(column);
+        favorite.placement = {favorite.id, -101, 3, column, 0, 1, 1, 0};
+        g_snapshot.favorites.push_back(favorite);
+    }
+    g_workspace.push_back({20, -1, 1, 2, {0, 600, 400, 700},
+            "com.miui.home:id/hotseat", ""});
+    for (int32_t index = 0; index < 4; ++index) {
+        const int32_t column = index < 2 ? index : index + 1;
+        g_workspace.push_back({21 + index, 20, 1, 2,
+                {column * 80, 600, (column + 1) * 80, 700},
+                column == 0 ? "电话" : "应用"});
+    }
+    rebuildSlots();
+    require(g_hotseat_cells.size() == 5,
+            "hotseat position test did not build the five physical columns");
+
+    hotseatNodeDescription.clear();
+    g_node_set_content_description = +[](void *, void *string) {
+        auto &value = *static_cast<RustRString *>(string);
+        hotseatNodeDescription.assign(reinterpret_cast<const char16_t *>(value.first), value.second);
+    };
+    TestNode icon = testNode(21, 20, {0, 600, 80, 700},
+            "com.miui.home:id/icon_icon", "电话");
+    injectIconActions(icon.data());
+    require(hotseatNodeDescription == u"电话，底栏第 1 个位置",
+            "lifted hotseat icon omitted its concrete column");
+
+    const auto empty = std::find_if(g_slots.begin(), g_slots.end(),
+            [](const auto &slot) { return slot.hotseat; });
+    require(empty != g_slots.end()
+                    && virtualNodeDescription(virtualIdForSlot(*empty))
+                            == "移至底栏第 3 个位置",
+            "hotseat virtual empty cell lost its concrete position");
+    g_node_set_content_description = nullptr;
 }
 
 void nestedIconsAndEmptyCellsShareOneParent() {
@@ -2059,6 +2203,9 @@ int main() {
         {"ten returns to Home announce ten times", everyReturnHomeAnnouncesOnce},
         {"system Back gesture cancels lifted grid", backGestureCancelsLiftAndKeepsNativeCleanup},
         {"Back key cancels only the lifted session", backKeyCancelsOnlyTheLiftedSession},
+        {"folder Back closes then cancels in two steps", folderBackKeepsLiftUntilTheSecondBack},
+        {"folder Back key cycle clears its consume marker", folderBackKeyCycleClearsTheFirstBackMarker},
+        {"folder return rebuilds the saved desktop grid", folderReturnRebuildsTheSavedDesktopGrid},
         {"leaving Home cancels grid and rejects stale nodes", leavingHomeCancelsGridAndRejectsStaleNodes},
         {"reader child order matches physical touch order", childOrderMatchesTouchOrderWithoutTraversalHints},
         {"lifted source does not compete with its empty cell", liftedSourceDoesNotCompeteWithItsEmptyCell},
@@ -2071,6 +2218,7 @@ int main() {
         {"empty cell IDs survive occupancy changes", gridRefreshKeepsCellIdentityAndFocus},
         {"same-page refresh preserves empty-cell focus", samePageRefreshPreservesDoubleTapTarget},
         {"dock stays outside desktop rows and traversal", dockDoesNotBecomeTheLastDesktopRow},
+        {"lifted hotseat items speak their concrete position", liftedHotseatItemsSpeakTheirConcretePosition},
         {"nested icons share their parent with empty cells", nestedIconsAndEmptyCellsShareOneParent},
         {"wrapper bounds preserve descendant icon order", wrapperBoundsDoNotMoveTheirIconsAfterEmptyRows},
         {"Home speech waits for native focus completion", homeAnnouncementWaitsForNativeFocusCallback},

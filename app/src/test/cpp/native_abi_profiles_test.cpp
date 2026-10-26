@@ -13,8 +13,16 @@ static_assert(launcherAbiProfileForFingerprint(observed(kLegacy7748LauncherFinge
         == LauncherAbiProfile::kLegacy7748);
 static_assert(batchMoveOperation(LauncherAbiProfile::kLegacy7748) == 855U);
 static_assert(batchMoveOperation(LauncherAbiProfile::kLegacy7722) == 854U);
+static_assert(batchMoveOperation(LauncherAbiProfile::kCurrent8584) == 858U);
 static_assert(batchMoveOperation(LauncherAbiProfile::kUnknown) == 0U);
 static_assert(batchMoveOperation(LauncherAbiProfile::kCurrent8565) == 0U);
+static_assert(singleMoveOperation(LauncherAbiProfile::kCurrent8565) == 833U);
+static_assert(singleMoveOperation(LauncherAbiProfile::kCurrent8584) == 834U);
+static_assert(singleMoveOperation(LauncherAbiProfile::kUnknown) == 0U);
+static_assert(insertItemOperation(LauncherAbiProfile::kCurrent8584) == 830U);
+static_assert(deleteItemOperation(LauncherAbiProfile::kCurrent8584) == 821U);
+static_assert(supportsFolderTransactions(LauncherAbiProfile::kCurrent8584));
+static_assert(!supportsFolderTransactions(LauncherAbiProfile::kCurrent8565));
 static_assert(launcherAbiProfileForFingerprint({}) == LauncherAbiProfile::kUnknown);
 static_assert(launcherAbiProfileForFingerprint({kLegacy7748LauncherFingerprint.first,
         kLegacy7748LauncherFingerprint.second, false}) == LauncherAbiProfile::kUnknown);
@@ -39,6 +47,10 @@ static_assert(!launcherMatchesSystemAbi(LauncherAbiProfile::kLegacy7748,
         privateAbi, currentAidl, currentUi));
 static_assert(launcherMatchesSystemAbi(LauncherAbiProfile::kCurrent8565,
         privateAbi, currentAidl, currentUi));
+static_assert(launcherMatchesSystemAbi(LauncherAbiProfile::kCurrent8584,
+        privateAbi, currentAidl, currentUi));
+static_assert(launcherMatchesSystemAbi(LauncherAbiProfile::kCurrent8584,
+        privateAbi, legacyAidl, legacyUi));
 
 // Folder child moves require a separate transaction that maintains folder membership.
 static_assert(workspaceContainer(-100));

@@ -231,7 +231,7 @@ void fixtureConfigure() {
     g_frb_dispatcher = +[](uint32_t operation, int64_t, const uint8_t *bytes, uint32_t size, uint32_t) {
         // Capture the real production wire request before starting any persistence worker.
         int32_t screen = -1, column = -1, row = -1;
-        if (operation == kFrbMoveItemInDatabase && size >= 95) {
+        if (operation == singleMoveOperation(LauncherAbiProfile::kCurrent8565) && size >= 95) {
             std::memcpy(&screen, bytes + size - 12, 4);
             std::memcpy(&column, bytes + size - 8, 4);
             std::memcpy(&row, bytes + size - 4, 4);

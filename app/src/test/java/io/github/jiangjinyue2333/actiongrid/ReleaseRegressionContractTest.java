@@ -357,7 +357,7 @@ public final class ReleaseRegressionContractTest {
         String nodeHook = between(nativeSource, "NodeResult onCreateNode(void *provider, int32_t nodeId) {",
                 "void injectDirectAction");
 
-        assertTrue(nodeHook.contains("const bool pageChanged = rememberVisibleScreen(pageDescription);"));
+        assertTrue(nodeHook.contains("rememberVisibleScreen(pageDescription)"));
         assertTrue(nodeHook.contains("announceConfirmedPage"));
         assertFalse(nodeHook.contains("pageSignalAccepted"));
     }
@@ -450,7 +450,7 @@ public final class ReleaseRegressionContractTest {
         Path path = Files.exists(local) ? local : Path.of("app").resolve(local);
         String nativeSource = Files.readString(path);
 
-        assertTrue(nativeSource.contains("kVirtualNodeCount = 64"));
+        assertTrue(nativeSource.contains("kDesktopVirtualNodeCount = 64"));
         assertTrue(nativeSource.contains("移至第 "));
         assertTrue(nativeSource.contains("findDropParentNode"));
         assertTrue(nativeSource.contains("nodeId == g_drop_parent_node_id"));

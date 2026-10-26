@@ -277,9 +277,10 @@ $launcherProfile = switch ($launcherFingerprintKey) {
     '6aafec65d595b957d78ecbfd33f5b7af' { 'legacy7722' }
     '6018f13c7a9d6274d0b4054c1d248904' { 'legacy7748' }
     'd43e8de27a633a7e770a572f4b6ddfc6' { 'current8565' }
+    '903dbb518fbc909bd492dab28e9324a7' { 'current8584' }
     default { throw "桌面 ELF 指纹未验证：$launcherFingerprintKey (Build ID=$dartId)" }
 }
-if (($systemProfile -eq 'current8565') -ne ($launcherProfile -eq 'current8565')) {
+if (($systemProfile -eq 'current8565') -ne ($launcherProfile -eq 'current8565' -or $launcherProfile -eq 'current8584')) {
     throw "系统与桌面 ABI profile 不匹配：system=$systemProfile launcher=$launcherProfile"
 }
 
@@ -309,6 +310,7 @@ $workspaceReloadOffset = switch ($launcherProfile) {
     'legacy7722' { [UInt64] 0x7a2008 }
     'legacy7748' { [UInt64] 0x7a35a4 }
     'current8565' { [UInt64] 0x7aa050 }
+    'current8584' { [UInt64] 0x7ae2a8 }
     default { throw "没有 workspace reload profile：$launcherProfile" }
 }
 Verify-WorkspaceReloadPrologue $launcherPath $objdump $workspaceReloadOffset
@@ -391,6 +393,7 @@ foreach ($fingerprint in @(
     '6018f13c7a9d6274', 'd0b4054c1d248904',
     '6aafec65d595b957', 'd78ecbfd33f5b7af',
     'd43e8de27a633a7e', '770a572f4b6ddfc6'
+    '903dbb518fbc909b', 'd492dab28e9324a7'
 )) {
     if ($nativeSource -notmatch [regex]::Escape($fingerprint)) {
         throw "native_init.cpp 缺少已验证 ELF 指纹：$fingerprint"
@@ -399,13 +402,14 @@ foreach ($fingerprint in @(
 foreach ($op in @(
     'kFrbUpdateItemDatabaseBatch = 854U',
     'kFrbStartLoad = 851U',
-    'kFrbMoveItemInDatabase = 833U'
+    'singleMoveOperation',
+    'batchMoveOperation'
 )) {
     if ($nativeSource -notmatch [regex]::Escape($op)) {
         throw "缺少 HyperOS4 FRB 内部模型操作：$op"
     }
 }
-foreach ($offset in @('0x7a1660', '0x7a2008', '0x7a35a4', '0x7aa050')) {
+foreach ($offset in @('0x7a1660', '0x7a2008', '0x7a35a4', '0x7aa050', '0x7ae2a8')) {
     if ($nativeSource -notmatch [regex]::Escape($offset)) {
         throw "native_init.cpp 缺少 workspace reload profile 偏移：$offset"
     }

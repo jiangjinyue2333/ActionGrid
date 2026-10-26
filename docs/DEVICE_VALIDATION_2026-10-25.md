@@ -12,12 +12,24 @@
 
 当前设备布局允许保留，用户不要求还原。设备保持唤醒用于后续正式签名构建，结束收尾时才恢复原来的屏幕超时和锁屏状态。
 
+## 8.01.02.8584 真机复验（2026-10-26）
+
+同一台 `24129PN74C`（HyperOS `4.0.0.19.XOCCNXM`，分辨率 `1200×2670`）安装当前 Debug 包后，桌面 `8.01.02.8584` 的 ELF 指纹、系统 ABI 配对和窗口/按键/返回 Hook 均成功；日志 profile 为 `8.01.02.8584`，Home PID 在操作期间保持稳定。
+
+- 当前 `4×6`、7 页布局从第 1 页托起图标后连续前进到第 7 页，再反向回到第 1 页；每一页真实图标、虚拟空位和返回取消均通过，最终虚拟节点数为 0。
+- “系统工具”内文件管理与笔记前后移动均通过，恢复为文件管理第 1、笔记第 2；文件夹成员没有暴露“移出文件夹”操作。
+- 文件夹内第一次返回只关闭文件夹并保留托起源，第二次返回在 100ms 内清除全部虚拟节点；回到桌面后可正常浏览和放置。
+- 底栏电话与短信互换位置后再恢复，读屏节点始终标注“底栏”，底栏空位使用独立位置描述；桌面页网格不混入底栏。
+- `scripts/verify-native-probe.ps1 -Serial 192.168.1.36:33043` 通过；`logcat -b crash` 没有 `com.miui.home` 崩溃记录。
+
+当前真机实际验收的是 `4×6`；`test-native-grid.ps1` 的生产 C++ 回归覆盖不同列行数、稀疏页、底栏及文件夹边界，不能把离线布局矩阵冒充为手机上每种布局都已切换验收。
+
 ## 离线与构建回归
 
 - `gradlew.bat clean test lint assembleDebug assembleRelease --console=plain`：通过，186 个 Gradle task 成功；Java/C++ 测试、Lint、Debug 和 Release 均通过。Lint 保留 6 条既有构建配置/资源/SharedPreferences 警告，零错误。
-- `scripts/test-native-grid.ps1 -Serial 192.168.1.36:33043`：77 项通过，直接执行生产 C++ 网格、触摸、移动和焦点回归。
+- `scripts/test-native-grid.ps1 -Serial 192.168.1.36:33043`：84 项通过，直接执行生产 C++ 网格、触摸、移动和焦点回归。
 - `scripts/test-native-policy.ps1`、`scripts/test-apk-abi.ps1 -ApkPath app/build/outputs/apk/release/app-release-unsigned.apk`、`scripts/verify-project-structure.ps1`：全部通过。
-- `verify-launcher-contract.py`：7748 加 Flutter 语义 ABI、8565 独立 profile 均通过；把 7748 语义结构套到 8565 的负例按预期拒绝。
+- `verify-launcher-contract.py`：7748、8565 和 8584 profile 均通过；把错误 profile/操作号套用到样本的负例按预期拒绝。
 
 ## 0.4.14 历史记录
 
