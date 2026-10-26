@@ -7,6 +7,7 @@ import android.os.Build;
 import android.os.Process;
 import android.util.Log;
 import android.view.MotionEvent;
+import android.view.SoundEffectConstants;
 import android.view.View;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.accessibility.AccessibilityNodeProvider;
@@ -26,6 +27,7 @@ public final class ActionGridModule extends XposedModule {
     private final Set<String> loggedFailures = new HashSet<>();
     private SharedPreferences restartPreferences;
     private SharedPreferences.OnSharedPreferenceChangeListener restartListener;
+    private final ThreadLocal<Integer> systemClickCount = ThreadLocal.withInitial(() -> 0);
 
     @Override
     public void onModuleLoaded(ModuleLoadedParam param) {
@@ -146,6 +148,14 @@ public final class ActionGridModule extends XposedModule {
             return result;
         });
 
+        Method playSound = View.class.getMethod("playSoundEffect", int.class);
+        hook(playSound).setId("actiongrid.legacy.sound.v1").intercept(chain -> {
+            if ((int) chain.getArg(0) == SoundEffectConstants.CLICK) {
+                systemClickCount.set(systemClickCount.get() + 1);
+            }
+            return chain.proceed();
+        });
+
         Method performAction = View.class.getMethod(
                 "performAccessibilityAction", int.class, android.os.Bundle.class);
         hook(performAction).setId("actiongrid.legacy.action.v1").intercept(chain -> {
@@ -157,12 +167,14 @@ public final class ActionGridModule extends XposedModule {
                 } catch (RuntimeException exception) {
                     logHookFailure("action", exception);
                 }
+                int soundBefore = systemClickCount.get();
                 Object result = chain.proceed();
                 if ((int) chain.getArg(0) == android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK
                         && result instanceof Boolean handled && handled
                         && bridge.isSupportedIcon(view)) {
-                    // Use the platform event path so TalkBack supplies its normal
-                    // click feedback.  No module-owned sound is played here.
+                    if (systemClickCount.get() == soundBefore) {
+                        view.playSoundEffect(SoundEffectConstants.CLICK);
+                    }
                     view.sendAccessibilityEvent(
                             android.view.accessibility.AccessibilityEvent.TYPE_VIEW_CLICKED);
                 }

@@ -49,6 +49,33 @@ void prepareGrid() {
     rebuildSlots();
 }
 
+void folderAppendKeepsLegacyRowCoordinates() {
+    std::vector<FavoritePlacement> members{
+            {31, 65, -1, 2, 0, 1, 1, 0}, {32, 65, -1, 5, 1, 1, 1, 0},
+            {56, 65, -1, 6, 5, 1, 1, 0}, {84, 65, -1, 8, 4, 1, 1, 0}};
+    int32_t next = -1;
+    require(folderAppendRank(members, next) && next == 9,
+            "existing folder rows with retained desktop Y blocked insertion");
+    require(members[2].cellY == 5 && members[3].cellY == 4,
+            "appending an item changed existing folder members");
+    members.front().screen = 1;
+    require(!folderAppendRank(members, next), "non-folder screen was accepted as a member");
+}
+
+void folderReorderPreservesUnmovedMembers() {
+    std::vector<FavoritePlacement> members{
+            {31, 65, -1, 2, 0, 1, 1, 0}, {32, 65, -1, 5, 1, 1, 1, 0},
+            {34, 65, -1, 0, 1, 1, 1, 0}, {84, 65, -1, 8, 4, 1, 1, 0}};
+    require(sortFolderPlacements(members) == 4 && members[0].id == 34
+                    && members[1].id == 31 && members[2].id == 32 && members[3].id == 84,
+            "retained desktop Y rearranged unrelated folder members");
+    members = {{31, 65, -1, 0, 1, 1, 1, 0}, {32, 65, -1, 1, 0, 1, 1, 0},
+            {34, 65, -1, 0, 0, 1, 1, 0}, {84, 65, -1, 1, 1, 1, 1, 0}};
+    require(sortFolderPlacements(members) == 2 && members[0].id == 34
+                    && members[1].id == 32 && members[2].id == 31 && members[3].id == 84,
+            "two-dimensional folder cells lost row order");
+}
+
 void folderPlacementConfirmationMatchesHomeDatabaseRelations() {
     const std::vector<FavoritePlacement> createdFolder{
             {10, 300, -1, 0, 0, 1, 1, 0},
@@ -498,6 +525,37 @@ struct AccessibilityCapture {
     }
 };
 
+void iconClickUsesSystemSoundWithoutDuplicatingHome() {
+    AccessibilityCapture capture;
+    const bool previousCompatibility = g_launcher_system_compatible.load();
+    g_launcher_system_compatible.store(true);
+    returnedNode = testNode(11, 10, {0, 0, 100, 100}, "com.miui.home:id/icon_icon", "QQ");
+    static std::vector<std::pair<int32_t, uint64_t>> sounds;
+    sounds.clear();
+    g_original_system_sound = +[](int32_t effect, uint64_t user) {
+        sounds.emplace_back(effect, user);
+    };
+    g_original_perform_action = +[](void *, int32_t, int32_t, void *) { return true; };
+    require(onPerformAction(reinterpret_cast<void *>(1), 11, 16, nullptr), "icon click rejected");
+    require(sounds == std::vector<std::pair<int32_t, uint64_t>>{{0, 1}},
+            "icon click did not use the system effect and current-user option");
+    g_original_perform_action = +[](void *, int32_t, int32_t, void *) {
+        onSystemSound(0, 1);
+        return true;
+    };
+    require(onPerformAction(reinterpret_cast<void *>(1), 11, 16, nullptr), "native click rejected");
+    require(sounds.size() == 2, "Home's existing click sound was played twice");
+    g_original_perform_action = +[](void *, int32_t, int32_t, void *) { return false; };
+    require(!onPerformAction(reinterpret_cast<void *>(1), 11, 16, nullptr), "failed click accepted");
+    require(sounds.size() == 2, "failed click played a success sound");
+    g_original_perform_action = +[](void *, int32_t, int32_t, void *) { return true; };
+    g_launcher_system_compatible.store(false);
+    onPerformAction(reinterpret_cast<void *>(1), 11, 16, nullptr);
+    require(sounds.size() == 2, "unverified system ABI played a click sound");
+    g_original_system_sound = nullptr;
+    g_launcher_system_compatible.store(previousCompatibility);
+}
+
 void singleIconPageBuildsPhysicalGrid() {
     AccessibilityCapture capture;
     g_grid_columns.store(0);
@@ -942,6 +1000,33 @@ void moveUsesCachedFavoriteWhenSnapshotResolutionFails() {
             "cached folder favorite did not preserve its stable database identity");
 }
 
+void closedFolderSourceCanMoveToDesktop() {
+    prepareGrid();
+    g_launcher_profile.store(LauncherAbiProfile::kCurrent8584);
+    g_lifted_folder_container.store(500);
+    g_folder_lift_in_folder.store(false);
+    g_sources = {{71, 20, 7, 8, {200, 100, 300, 200},
+            "com.miui.home:id/icon_icon", "文件管理"}};
+    g_source_placements = {{101, 500, -1, 0, 0, 1, 1, 0}};
+    g_slots = {{{100, 0, 200, 100}, 0, 1}};
+    std::vector<FavoritePlacement> sources, expected;
+    WireWriter wire;
+    std::string failure;
+    require(buildModelMove(nullptr, kVirtualNodeBase + 1, 0,
+                    sources, expected, wire, failure),
+            "closing a lifted folder discarded its confirmed member identity");
+    require(sources.size() == 1 && sources.front().container == 500
+                    && expected.size() == 1 && expected.front().id == 101
+                    && expected.front().container == kDesktopContainer
+                    && expected.front().cellX == 1 && expected.front().cellY == 0,
+            "folder member did not plan a move into the selected desktop cell");
+    g_launcher_profile.store(LauncherAbiProfile::kUnknown);
+    sources.clear(); expected.clear(); wire.bytes.clear();
+    require(!buildModelMove(nullptr, kVirtualNodeBase + 1, 0,
+                    sources, expected, wire, failure),
+            "unknown ABI accepted a folder member transaction");
+}
+
 void pendingPlacementRequiresTheDestinationPage() {
     prepareGrid();
     struct Cleanup { ~Cleanup() { endPendingPlacement(); } } cleanup;
@@ -1267,6 +1352,58 @@ void touchHookUsesEventArgumentAndHandsBackOccupiedCells() {
     g_original_perform_action = +[](void *, int32_t, int32_t, void *) { return true; };
     onPerformAction(reinterpret_cast<void *>(1), 11, kAccessibilityFocusAction, nullptr);
     require(g_virtual_focused_id.load() == -1, "virtual focus remained after the reader focused an icon");
+    g_original_launcher_motion = nullptr;
+}
+
+void rawTouchHookFindsVirtualCells() {
+    AccessibilityCapture capture;
+    prepareGrid();
+    nativeMotionActions.clear();
+    droppedMotions = 0;
+    g_motion_action_masked = +[](void *event) { return static_cast<TestMotion *>(event)->action & 255; };
+    g_motion_raw_x = +[](void *event, int32_t) { return static_cast<TestMotion *>(event)->x; };
+    g_motion_raw_y = +[](void *event, int32_t) { return static_cast<TestMotion *>(event)->y; };
+    g_motion_clone = +[](void *event) -> void * { return new TestMotion(*static_cast<TestMotion *>(event)); };
+    g_motion_set_action = +[](void *event, int32_t action) { static_cast<TestMotion *>(event)->action = action; };
+    g_motion_drop = +[](void *event) { ++droppedMotions; delete static_cast<TestMotion *>(event); };
+    g_original_launcher_motion = +[](void *, void *event) {
+        nativeMotionActions.push_back(static_cast<TestMotion *>(event)->action);
+    };
+
+    TestMotion event{0, 50, 50};
+    onLauncherMotion(reinterpret_cast<void *>(1), &event);
+    require(nativeMotionActions == std::vector<int32_t>{0},
+            "raw touch on an occupied icon was not forwarded");
+    event = {2, 150, 50};
+    onLauncherMotion(reinterpret_cast<void *>(1), &event);
+    require(nativeMotionActions == std::vector<int32_t>({0, 3}),
+            "raw slide into an empty cell did not cancel the native stream");
+    require(g_virtual_hovered_id.load() == virtualNodeAt(150, 50),
+            "raw slide into an empty cell did not expose its virtual target");
+    event = {1, 150, 50};
+    onLauncherMotion(reinterpret_cast<void *>(1), &event);
+    require(g_virtual_hovered_id.load() == -1,
+            "raw touch-up did not release the virtual hover target");
+    require(nativeMotionActions == std::vector<int32_t>({0, 3}),
+            "raw touch-up leaked into the native workspace");
+    require(droppedMotions == 1, "raw touch cancellation clone leaked");
+    event = {0, 150, 50};
+    onLauncherMotion(reinterpret_cast<void *>(1), &event);
+    const int32_t target = virtualNodeAt(150, 50);
+    require(g_virtual_hovered_id.load() == target,
+            "direct touch did not expose the empty cell");
+    require(onPerformAction(reinterpret_cast<void *>(1), target,
+            kAccessibilityFocusAction, nullptr), "touched empty cell rejected reader focus");
+    event.action = 1;
+    onLauncherMotion(reinterpret_cast<void *>(1), &event);
+    require(g_virtual_hovered_id.load() == -1 && g_virtual_focused_id.load() == target,
+            "lifting the finger lost the target required for double tap placement");
+    event.action = 0;
+    onLauncherMotion(reinterpret_cast<void *>(1), &event);
+    event.action = 3;
+    onLauncherMotion(reinterpret_cast<void *>(1), &event);
+    require(g_virtual_hovered_id.load() == -1, "cancelled touch left a stale virtual target");
+    require(droppedMotions == 3, "direct touch cancellation clones leaked");
     g_original_launcher_motion = nullptr;
 }
 
@@ -1660,6 +1797,29 @@ struct ActionCapture {
         g_original_add_action = nullptr;
     }
 };
+
+void closedFolderSourceExposesOtherFolders() {
+    AccessibilityCapture capture;
+    ActionCapture actions;
+    prepareGrid();
+    g_launcher_profile.store(LauncherAbiProfile::kCurrent8584);
+    g_lifted_folder_container.store(500);
+    g_folder_lift_in_folder.store(false);
+    g_sources = {{71, 20, 7, 8, {200, 100, 300, 200},
+            "com.miui.home:id/icon_icon", "文件管理"}};
+    TestNode folder = testNode(12, 10, {200, 300, 300, 400},
+            "com.miui.home:id/folder", "读屏");
+    injectIconActions(folder.data());
+    require(std::find(capturedActions.begin(), capturedActions.end(), kCreateFolderAction)
+                    != capturedActions.end(),
+            "closed-folder source cannot access the destination folder action");
+    g_folder_lift_in_folder.store(true);
+    capturedActions.clear();
+    injectIconActions(folder.data());
+    require(std::find(capturedActions.begin(), capturedActions.end(), kCreateFolderAction)
+                    == capturedActions.end(),
+            "open folder unexpectedly offered a nested folder operation");
+}
 
 void returningHomeKeepsActionsOnNodesBuiltDuringFocusCallback() {
     AccessibilityCapture capture;
@@ -2155,6 +2315,8 @@ int main() {
         {"folder gesture confirmation matches Home database relations",
                 folderPlacementConfirmationMatchesHomeDatabaseRelations},
         {"workspace semantics recovery detects only missing current-page icons", workspaceRecoveryUsesVisiblePageIcons},
+        {"folder insertion accepts retained desktop row coordinates", folderAppendKeepsLegacyRowCoordinates},
+        {"folder reordering preserves unrelated member order", folderReorderPreservesUnmovedMembers},
         {"sparse ItemInfo preserves the verified 75-byte wire layout", sparseItemInfoKeepsTheVerifiedWireLayout},
         {"folder ItemInfo encodes UTF-8 title/label and all 35 fields", folderItemInfoEncodesUtf8TitleAndLabel},
         {"folder identity uses visible members to disambiguate", folderIdentityUsesVisibleMembersToDisambiguate},
@@ -2163,6 +2325,7 @@ int main() {
         {"move-out focus requires the saved desktop page and cell", movedOutIconRequiresItsConfirmedDesktopCell},
         {"folder order requires adjacent unique members", folderOrderRequiresAdjacentUniqueMembers},
         {"folder refresh confirms only an accepted focus action", folderRefreshWaitsForAcceptedFocus},
+        {"icon click uses the system effect once", iconClickUsesSystemSoundWithoutDuplicatingHome},
         {"single-icon page builds a complete physical grid", singleIconPageBuildsPhysicalGrid},
         {"missing page bounds preserve the confirmed grid", missingPageBoundsKeepConfirmedGrid},
         {"incomplete node tree keeps database cells occupied", incompleteNodeTreeKeepsDatabaseCellsOccupied},
@@ -2177,6 +2340,7 @@ int main() {
         {"actual six-row layout has no phantom seventh row", launcherDimensionsOverrideOldSeventhRow},
         {"widget spans and cell touch boundaries", widgetCellsAndTouchGapsAreHandled},
         {"native hover handoff and event ABI", touchHookUsesEventArgumentAndHandsBackOccupiedCells},
+        {"raw touch handoff exposes virtual cells", rawTouchHookFindsVirtualCells},
         {"cross-page counts require actual icon node and location", changedCountsDoNotProveIconVisible},
         {"move request includes full destination", moveRequestIncludesDestinationArguments},
         {"occupied placement batches every displaced icon", occupiedPlacementMovesDisplacedIconsInNativeBatch},
@@ -2193,6 +2357,8 @@ int main() {
         {"page speech survives native workspace source rebuild", pageSpeechSurvivesNativeWorkspaceSourceRebuild},
         {"announced page rebuilds a reused grid host", announcedPageRebuildsAReusedGridHost},
         {"move reuses cached favorite after source resolution failure", moveUsesCachedFavoriteWhenSnapshotResolutionFails},
+        {"closed folder member keeps its identity for desktop placement", closedFolderSourceCanMoveToDesktop},
+        {"closed folder member exposes destination folder actions", closedFolderSourceExposesOtherFolders},
         {"move visibility requires the destination page", pendingPlacementRequiresTheDestinationPage},
         {"placed icon regains accessibility focus once", placedIconReceivesFocusOnceAfterLiftCleanup},
         {"Back restores source focus on the next live query", backCancellationRestoresTheSourceOnTheNextQuery},

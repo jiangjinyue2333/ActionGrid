@@ -38,6 +38,8 @@ public final class NativeActionsProbe extends Instrumentation {
         arguments = args == null ? Bundle.EMPTY : args;
         requestedMode = arguments.getString("action", "");
         placementOnly = "place".equals(requestedMode);
+        sourceLabel = appLabel("source", "sourceAlias");
+        if (sourceLabel.isEmpty()) sourceLabel = null;
         requestedAction = "lift".equals(requestedMode) ? "托起" : requestedMode;
         if ("uninstall".equals(requestedMode)) requestedAction = "卸载";
         if ("move-before".equals(requestedMode)) {
@@ -99,6 +101,38 @@ public final class NativeActionsProbe extends Instrumentation {
                 return;
             }
             visitRoot(ui);
+            if (arguments.containsKey("touchX") && arguments.containsKey("touchY")) {
+                int x = Integer.parseInt(arguments.getString("touchX"));
+                int y = Integer.parseInt(arguments.getString("touchY"));
+                int duration = Integer.parseInt(arguments.getString("touchDuration", "180"));
+                if (arguments.containsKey("touchX2") && arguments.containsKey("touchY2")) {
+                    injectSwipe(ui, x, y,
+                            Integer.parseInt(arguments.getString("touchX2")),
+                            Integer.parseInt(arguments.getString("touchY2")), duration);
+                } else {
+                    int taps = arguments.containsKey("doubleTap") ? 2 : 1;
+                    for (int tap = 0; tap < taps; tap++) {
+                        injectTouch(ui, x, y, duration);
+                        if (tap + 1 < taps) SystemClock.sleep(100);
+                    }
+                }
+                SystemClock.sleep(350);
+                if (arguments.containsKey("touchTarget")) {
+                    AccessibilityNodeInfo focused = ui.findFocus(
+                            AccessibilityNodeInfo.FOCUS_ACCESSIBILITY);
+                    try {
+                        String expected = arguments.getString("touchTarget");
+                        if (focused == null || !expected.contentEquals(
+                                String.valueOf(focused.getContentDescription()))) {
+                            throw new AssertionError("Touch did not focus " + expected);
+                        }
+                        output.append("TOUCH_FOCUS ").append(expected).append('\n');
+                    } finally {
+                        if (focused != null) focused.recycle();
+                    }
+                }
+                visitRoot(ui);
+            }
             if (nativeMenuVisible) {
                 throw new AssertionError("Native long-press menu action is still exposed");
             }
@@ -128,10 +162,10 @@ public final class NativeActionsProbe extends Instrumentation {
                     if (arguments.containsKey("place") && !placed && !moveAction) {
                         placeFirstVirtual(ui.getRootInActiveWindow());
                     }
-                    if (placementOnly && placed) break;
                     if (placed || moveAction) {
                         placementConfirmed = findPlacedIcon(ui.getRootInActiveWindow());
                     }
+                    if (placementOnly && placed && placementConfirmed) break;
                     collectText(ui.getRootInActiveWindow(), visible);
                     if (isPageAction()) {
                         String pageAfter = findPageIndicator(ui.getRootInActiveWindow());
@@ -195,7 +229,7 @@ public final class NativeActionsProbe extends Instrumentation {
                         if (focused != null) focused.recycle();
                     }
                 }
-                if (arguments.containsKey("place") && !placementOnly && !placementConfirmed) {
+                if (arguments.containsKey("place") && !placementConfirmed) {
                     throw new AssertionError("Placement was not confirmed in the accessibility tree");
                 }
                 if (placementOnly && !placed) {
@@ -397,6 +431,35 @@ public final class NativeActionsProbe extends Instrumentation {
         }
     }
 
+    private static void injectTouch(UiAutomation ui, int x, int y, int duration) {
+        injectSwipe(ui, x, y, x, y, duration);
+    }
+
+    private static void injectSwipe(UiAutomation ui, int x1, int y1,
+            int x2, int y2, int duration) {
+        long down = SystemClock.uptimeMillis();
+        int steps = Math.max(1, duration / 20);
+        for (int step = 0; step <= steps; step++) {
+            int action = step == 0 ? android.view.MotionEvent.ACTION_DOWN
+                    : step == steps ? android.view.MotionEvent.ACTION_UP
+                    : android.view.MotionEvent.ACTION_MOVE;
+            float progress = steps == 0 ? 1.0f : (float) step / steps;
+            float x = x1 + (x2 - x1) * progress;
+            float y = y1 + (y2 - y1) * progress;
+            android.view.MotionEvent event = android.view.MotionEvent.obtain(
+                    down, SystemClock.uptimeMillis(), action, x, y, 0);
+            event.setSource(android.view.InputDevice.SOURCE_TOUCHSCREEN);
+            try {
+                if (!ui.injectInputEvent(event, true)) {
+                    throw new AssertionError("Touch injection failed");
+                }
+            } finally {
+                event.recycle();
+            }
+            SystemClock.sleep(20);
+        }
+    }
+
     private boolean isPageAction() {
         return "page-next".equals(requestedMode) || "page-previous".equals(requestedMode);
     }
@@ -407,7 +470,8 @@ public final class NativeActionsProbe extends Instrumentation {
     }
 
     private static boolean isPositionDescription(String description) {
-        return description.startsWith("移至第 ") || description.startsWith("放置到第")
+        return description.startsWith("移至第 ") || description.startsWith("移至底栏第 ")
+                || description.startsWith("放置到第")
                 || description.startsWith("桌面，第") || description.startsWith("底栏，第");
     }
 

@@ -4124,12 +4124,19 @@ int32_t virtualNodeAt(float x, float y) {
 
 bool updateTouchExplorationTarget(int32_t action, float x, float y) {
     if (!g_lifted.load(std::memory_order_acquire) || !moveActionsReady()) return false;
+    constexpr int32_t kActionDown = 0;
+    constexpr int32_t kActionUp = 1;
+    constexpr int32_t kActionMove = 2;
+    constexpr int32_t kActionCancel = 3;
     constexpr int32_t kActionHoverMove = 7;
     constexpr int32_t kActionHoverEnter = 9;
     constexpr int32_t kActionHoverExit = 10;
-    if (action != kActionHoverMove && action != kActionHoverEnter
-            && action != kActionHoverExit) return false;
-    if (action == kActionHoverExit) {
+    const bool touch = action == kActionDown || action == kActionMove
+            || action == kActionUp || action == kActionCancel;
+    const bool hover = action == kActionHoverMove || action == kActionHoverEnter
+            || action == kActionHoverExit;
+    if (!touch && !hover) return false;
+    if (action == kActionUp || action == kActionCancel || action == kActionHoverExit) {
         const int32_t previous = g_virtual_hovered_id.exchange(-1,
                 std::memory_order_acq_rel);
         if (isVirtualNode(previous)) {
@@ -4158,15 +4165,20 @@ void onLauncherMotion(void *scene, void *event) {
         const float x = g_motion_raw_x(event, 0);
         const float y = g_motion_raw_y(event, 0);
         const bool wasVirtual = isVirtualNode(g_virtual_hovered_id.load());
-        if (!wasVirtual && (action == 7 || action == 9) && g_lifted.load()
-                && moveActionsReady() && isVirtualNode(virtualNodeAt(x, y))) {
+        const bool rawTouch = action == 0 || action == 1 || action == 2;
+        const bool enteringVirtual = !wasVirtual
+                && (rawTouch ? (action == 0 || action == 2) : (action == 7 || action == 9))
+                && g_lifted.load(std::memory_order_acquire) && moveActionsReady()
+                && isVirtualNode(virtualNodeAt(x, y));
+        if (enteringVirtual) {
             // Clear native hover before announcing the virtual target; forwarding
-            // the original hover would let the icon behind the empty cell win.
+            // the original event would let the icon or workspace behind the empty
+            // cell win. A raw touch stream needs CANCEL; hover streams use EXIT.
             if (g_original_launcher_motion != nullptr && g_motion_clone != nullptr
                     && g_motion_drop != nullptr && g_motion_set_action != nullptr) {
                 void *exit = g_motion_clone(event);
                 if (exit != nullptr) {
-                    g_motion_set_action(exit, 10);
+                    g_motion_set_action(exit, rawTouch ? 3 : 10);
                     g_original_launcher_motion(scene, exit);
                     g_motion_drop(exit);
                 }
@@ -5076,6 +5088,48 @@ bool removeEmptyFolder7748(const FavoritePlacement &folder) {
     return false;
 }
 
+bool capturedFolderSource(const FavoritePlacement &source) {
+    return source.id >= 0 && source.container > 0 && source.itemType == 0
+            && supportsFolderTransactions(g_launcher_profile.load())
+            && source.container == g_lifted_folder_container.load()
+            && !g_folder_lift_in_folder.load(std::memory_order_acquire);
+}
+
+bool removeEmptiedSourceFolder(const FavoritePlacement &source) {
+    if (workspaceContainer(source.container)) return true;
+    std::vector<FavoritePlacement> members, parents;
+    if (!loadPagePlacements(source.container, -1, members, true)) return false;
+    if (!members.empty()) return true;
+    return loadFavoritePlacements({source.container}, parents) && parents.size() == 1
+            && removeEmptyFolder7748(parents.front());
+}
+
+bool folderAppendRank(const std::vector<FavoritePlacement> &members, int32_t &next) {
+    next = 0;
+    for (const auto &item : members) {
+        if (item.screen != -1 || item.cellX < 0 || item.cellX == INT32_MAX) return false;
+        // Existing folder rows can retain their old desktop cellY. Leave them intact.
+        next = std::max(next, item.cellX + 1);
+    }
+    return true;
+}
+
+int32_t sortFolderPlacements(std::vector<FavoritePlacement> &members) {
+    std::unordered_set<int32_t> ranks;
+    int32_t columns = 1;
+    for (const auto &item : members) {
+        ranks.insert(item.cellX);
+        columns = std::max(columns, item.cellX + std::max(1, item.spanX));
+    }
+    const bool linearRanks = ranks.size() == members.size();
+    std::sort(members.begin(), members.end(), [linearRanks](const auto &left, const auto &right) {
+        return !linearRanks && left.cellY != right.cellY ? left.cellY < right.cellY
+                : left.cellX < right.cellX;
+    });
+    // Unique X ranks are Home's folder order; Y may still be the old desktop row.
+    return linearRanks ? std::max(1, static_cast<int32_t>(members.size())) : columns;
+}
+
 bool performNativeFolderPlacement(void *provider, int32_t nodeId) {
     const auto profile = g_launcher_profile.load();
     if (provider == nullptr || !g_lifted.load() || !moveActionsReady()
@@ -5089,7 +5143,8 @@ bool performNativeFolderPlacement(void *provider, int32_t nodeId) {
         sourceNode = g_sources.front();
         source = g_source_placements.front();
     }
-    if (source.id < 0 || !workspaceContainer(source.container)) return false;
+    if (source.id < 0 || (!workspaceContainer(source.container)
+            && !capturedFolderSource(source))) return false;
     Bounds targetBounds{};
     std::string targetLabel;
     if (!nodeBounds(provider, nodeId, targetBounds, &targetLabel)) return false;
@@ -5097,7 +5152,7 @@ bool performNativeFolderPlacement(void *provider, int32_t nodeId) {
     AppTarget target;
     if (!resolveAppTarget(nodeId, targetLabel, target, g_visible_screen.load() + 1,
                 targetIsFolder ? 2 : 0, &targetBounds)
-            || target.placement.id == source.id
+            || target.placement.id == source.id || target.placement.id == source.container
             || target.placement.container != kDesktopContainer) return false;
     if (g_model_move_running.exchange(true)) return false;
     if (!beginFolderRefresh()) { g_model_move_running.store(false); return false; }
@@ -5136,11 +5191,9 @@ bool performNativeFolderPlacement(void *provider, int32_t nodeId) {
                 }
             }
             std::vector<FavoritePlacement> members;
+            int32_t next = 0;
             if (ready && loadPagePlacements(folder.id, -1, members, true)
-                    && std::all_of(members.begin(), members.end(),
-                            [](const auto &item) { return item.screen == -1 && item.cellY == 0; })) {
-                int next = 0;
-                for (const auto &item : members) next = std::max(next, item.cellX + 1);
+                    && folderAppendRank(members, next)) {
                 FavoritePlacement movedSource = source;
                 movedSource.container = folder.id;
                 movedSource.screen = -1;
@@ -5172,6 +5225,7 @@ bool performNativeFolderPlacement(void *provider, int32_t nodeId) {
             if (!committed && !targetIsFolder && folder.id > 0) removeEmptyFolder7748(folder);
         }
         if (committed) {
+            const bool sourceFolderCleaned = removeEmptiedSourceFolder(source);
             requestSnapshotRefresh(true);
             clearLiftSession();
             {
@@ -5189,7 +5243,8 @@ bool performNativeFolderPlacement(void *provider, int32_t nodeId) {
             }
             g_folder_refresh_active.store(false);
             committed = g_folder_refresh_result.load() == 1
-                    && waitForFolderPlacement(source.id, target.id, targetIsFolder);
+                    && waitForFolderPlacement(source.id, target.id, targetIsFolder)
+                    && sourceFolderCleaned;
         }
         g_folder_refresh_active.store(false);
         announceReliably(eventSource.host, eventSource.window, -1,
@@ -6061,7 +6116,8 @@ bool buildModelMove(void *provider, int32_t nodeId, int32_t actionId,
             // Captured in selection order at lift time: favorite IDs and
             // accessibility node IDs belong to different namespaces.
             if (cachedSources[index].id < 0
-                    || !workspaceContainer(cachedSources[index].container)) {
+                    || (!workspaceContainer(cachedSources[index].container)
+                    && !capturedFolderSource(cachedSources[index]))) {
                 cacheMatches = false;
                 break;
             }
@@ -6561,17 +6617,7 @@ bool performFolderReorder(void *provider, int32_t nodeId, int32_t actionId) {
             || source.container != container || source.id == target.id) return false;
     std::vector<FavoritePlacement> expected;
     if (!loadPagePlacements(container, source.screen, expected)) return false;
-    // Folder cells are a real two-dimensional grid.  Sorting by X alone
-    // collapses rows and makes a move after the third item jump to the wrong
-    // position on folders wider than one row.
-    std::sort(expected.begin(), expected.end(), [](const auto &left, const auto &right) {
-        return left.cellY != right.cellY ? left.cellY < right.cellY
-                : left.cellX < right.cellX;
-    });
-    int32_t folderColumns = 1;
-    for (const auto &item : expected) {
-        folderColumns = std::max(folderColumns, item.cellX + std::max(1, item.spanX));
-    }
+    int32_t folderColumns = sortFolderPlacements(expected);
     if (folderColumns == 1) {
         std::vector<int32_t> centers;
         for (const auto &node : nodes) {
@@ -6768,11 +6814,18 @@ bool performNativePlacement(void *provider, int32_t nodeId, int32_t actionId) {
                 "HyperOS4 model batch dispatched op=%u count=%zu target=%d bytes=%zu",
                 operation, expected.size(), nodeId, wire.bytes.size());
     }
-    std::thread([expected = std::move(expected), visibleTargets = std::move(visibleTargets),
+    std::thread([sources = std::move(sources), expected = std::move(expected),
+                 visibleTargets = std::move(visibleTargets),
                  eventSource, directDatabaseCommit, pendingVisibilityRequired] {
         bool committed = directDatabaseCommit
                 ? updateFavoritePlacements(expected) && waitForPlacements(expected)
                 : waitForPlacements(expected);
+        bool sourceFoldersCleaned = true;
+        if (committed) {
+            for (const auto &source : sources) {
+                if (!removeEmptiedSourceFolder(source)) sourceFoldersCleaned = false;
+            }
+        }
         if (committed && g_launcher_window_focused.load(std::memory_order_acquire) == 0) {
             endPendingPlacement();
             nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
@@ -6787,7 +6840,7 @@ bool performNativePlacement(void *provider, int32_t nodeId, int32_t actionId) {
             // Readers need invalidation before they query the nodes we wait for.
             sendEvent(eventSource, kTypeWindowContentChanged);
             const bool visible = !pendingVisibilityRequired || waitForPendingPlacementVisibility();
-            const bool persisted = placementsMatch(expected, "after_reload");
+            const bool persisted = placementsMatch(expected, "after_reload") && sourceFoldersCleaned;
             const bool focused = g_launcher_window_focused.load(std::memory_order_acquire) != 0;
             if (focused) {
                 announceReliably(eventSource.host, eventSource.window, eventSource.nodeId,
@@ -6812,6 +6865,49 @@ bool performNativePlacement(void *provider, int32_t nodeId, int32_t actionId) {
         g_model_move_running.store(false, std::memory_order_release);
     }).detach();
     return true;
+}
+
+using SystemSoundFn = void (*)(int32_t, uint64_t);
+SystemSoundFn g_original_system_sound = nullptr;
+std::atomic<bool> g_system_sound_hook_attempted{false};
+thread_local uint64_t g_system_click_count = 0;
+
+void onSystemSound(int32_t effect, uint64_t user) {
+    if (effect == 0) ++g_system_click_count;
+    if (g_original_system_sound != nullptr) g_original_system_sound(effect, user);
+}
+
+void playSystemClickIfNeeded(uint64_t before) {
+    if (g_original_system_sound == nullptr || g_system_click_count != before
+            || !g_launcher_system_compatible.load(std::memory_order_acquire)) return;
+    // Same FX_KEY_CLICK / current-user Option as Home's Flutter SystemSound.click.
+    // AudioService checks sound_effects_enabled before playing the system effect.
+    onSystemSound(0, 1);
+}
+
+void installSystemSoundHook(LauncherAbiProfile profile) {
+    if ((profile != LauncherAbiProfile::kLegacy7748
+            && profile != LauncherAbiProfile::kCurrent8565
+            && profile != LauncherAbiProfile::kCurrent8584)
+            || g_api == nullptr || g_api->hook_func == nullptr
+            || g_system_sound_hook_attempted.load()) return;
+    ElfFingerprint fingerprint{};
+    constexpr KnownFingerprint kMediaPublicFingerprint{
+            0x495cd5c5204db7dbULL, 0x2854eccdacdd03b5ULL};
+    if (!readModuleFingerprint("libhyper_os_media_public.so", fingerprint)
+            || !fingerprintMatches(fingerprint, kMediaPublicFingerprint)) return;
+    void *target = findLoadedSymbol("libhyper_os_media_public.so",
+            "audio_manager_play_sound_effect");
+    if (target == nullptr || g_system_sound_hook_attempted.exchange(true)) return;
+    void *backup = nullptr;
+    const int result = g_api->hook_func(target,
+            reinterpret_cast<void *>(&onSystemSound), &backup);
+    if (result == 0 && backup != nullptr) {
+        g_original_system_sound = reinterpret_cast<SystemSoundFn>(backup);
+    }
+    nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
+            "System click sound hook result=%d available=%d", result,
+            g_original_system_sound != nullptr ? 1 : 0);
 }
 
 bool performActionImpl(void *provider, int32_t nodeId, int32_t actionId, void *arguments) {
@@ -6868,11 +6964,11 @@ bool performActionImpl(void *provider, int32_t nodeId, int32_t actionId, void *a
     if (actionId == 16 && !isVirtualNode(nodeId)
             && !g_lifted.load(std::memory_order_acquire)
             && isDesktopIconNode(provider, nodeId, &opened)) {
+        const uint64_t soundBefore = g_system_click_count;
         const bool success = g_original_perform_action != nullptr
                 && g_original_perform_action(provider, nodeId, actionId, arguments);
         if (success) {
-            // Let the platform accessibility service produce the feedback.
-            // The module does not synthesize or play its own sound.
+            playSystemClickIfNeeded(soundBefore);
             sendEvent(nodeId, kTypeViewClicked);
         }
         return success;
@@ -7287,6 +7383,7 @@ void resolveLauncherApis(void *handle) {
     char dartBuildId[33] = {};
     LauncherAbiProfile profile = refreshLauncherAbiProfile(
             dartBuildId, sizeof(dartBuildId));
+    installSystemSoundHook(profile);
     bool motionBuildMatch = matchesLauncherMotionBuildId(dartBuildId);
     bool frbBuildMatch = profile != LauncherAbiProfile::kUnknown
             && matchesFrbModelBuildId(dartBuildId);
@@ -7769,7 +7866,7 @@ void injectIconActions(void *node) {
             canCreateFolder = g_sources.size() == 1
                     && g_sources.front().resource == "com.miui.home:id/icon_icon";
         }
-        if (canCreateFolder && g_lifted_folder_container.load() == 0
+        if (canCreateFolder && !g_folder_lift_in_folder.load(std::memory_order_acquire)
                 && supportsFolderTransactions(g_launcher_profile.load())) {
             std::u16string folderAction = folder
                     ? std::u16string(u"放进 ") + utf16FromUtf8(iconLabel)

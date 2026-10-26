@@ -636,6 +636,15 @@ def verify(sample, llvm_nm, profile, batch_op=None, move_op=None, flutter=None):
             f"Grid {axis} getter no longer returns the configured i32 through w0")
         grid_getters[axis] = {"address": hex(address), "symbol": name,
                               "abi": "i32 ()", "prologue": [f"{word:08x}" for word in GRID_GETTER_PROLOGUE]}
+    sound_symbol = ("<engine_platform::plugin::platform::platform_plugin::PlatformHandler as "
+                    "engine_platform::channel::platform_channel::PlatformMessageHandler>::play_sound")
+    sound_address, sound_size = symbol(symbols, sound_symbol)
+    require(sound_size == 20 and elf.words(sound_address, 4) == (
+        0x34000041, 0xd65f03c0, 0x2a1f03e0, 0x52800021),
+        "System click no longer passes effect 0 and current-user Option 1")
+    sound_plt = branch_target(sound_address + 16, elf.words(sound_address + 16, 1)[0])
+    require(import_at_plt(elf, elf.plt_imports(), sound_plt) == "audio_manager_play_sound_effect",
+            "System click no longer calls the expected public audio API")
     motion = verify_motion_contract(elf, symbols, baseline)
     lifecycle = verify_lifecycle_contract(elf, symbols, baseline)
     evidence = {"profile": profile, "sample": str(sample.resolve()),
@@ -649,6 +658,8 @@ def verify(sample, llvm_nm, profile, batch_op=None, move_op=None, flutter=None):
                         "move_end_call": hex(decode_calls[-1][0]),
                         "single_item_database": single_item_database},
             "grid_getters": grid_getters,
+            "system_click": {"address": hex(sound_address), "effect": 0, "user_option": 1,
+                             "import": "audio_manager_play_sound_effect"},
             "motion": motion,
             "lifecycle": lifecycle,
             "scope": "offline ELF contract only; no target execution or runtime compatibility claim"}
@@ -685,6 +696,7 @@ def main():
         if evidence["decoder"]["single_item_database"]:
             print("  insert/delete wire: exactly one ItemInfo, then end; no vector count or tail")
         print(f"  grid getters: x {evidence['grid_getters']['x']['address']}, y {evidence['grid_getters']['y']['address']}; i32 () verified")
+        print(f"  system click: {evidence['system_click']['address']}; effect 0 / current-user Option 1 to public audio API verified")
         print(f"  motion: {evidence['motion']['address']}; void (scene*, event*) with event x1; LauncherUi callers and clone/setAction/drop imports verified")
         print(f"  focus: {evidence['lifecycle']['focus']['address']}; void (window*, bool) with focus w1 verified")
         print(f"  key: {evidence['lifecycle']['key']['address']}; bool (scene*, event*) with event x1 and key getter imports verified")
