@@ -56,6 +56,8 @@ ActionGrid/
 - 0.4.15 将语义节点和焦点恢复扩展到任意桌面页，并修复虚拟网格触摸、滑动、放置、跨页移动、图标前后移动、文件夹内移动、移入移出和创建文件夹。7748 真机逐项验收见 `docs/RELEASE_0.4.15.md` 与 `docs/DEVICE_VALIDATION_2026-10-25.md`。
 - 0.4.16 修复文件夹内托起返回桌面时的虚拟网格即时恢复、两步返回取消托起和底栏具体位置播报；8584 真机、原生网格回归和 Home 崩溃检查记录见 `docs/RELEASE_0.4.16.md`。
 - 0.4.17 补齐原始触摸流的虚拟空格命中、文件夹拖出与跨文件夹移动、旧行号兼容及不涉及成员的排序保持；系统点击音效使用经过指纹校验的 media 接口，7.x 使用 `View.playSoundEffect`。见 `docs/RELEASE_0.4.17.md` 和 `docs/SYSTEM_CLICK_SOUND.md`。
+- 0.4.17 的原生边缘返回保留桌面手势识别，仅在托起期间启用已验证的路由与提交入口；使用 Home looper 处理跨线程状态恢复，并按按键事件标识区分重复分发和第二次返回。接口证据及限制见 `docs/NATIVE_EDGE_BACK.md`。
+- 0.4.17 的 8565/8584 空格放置与占用位置插入共用 favorites 事务；提交后才验证位置，避免异步单项保存与验证查询争用数据库锁。真机重现与回归见 `docs/RELEASE_0.4.17.md`。
 - `zip_directory.h` 为 APK 中直接加载的 Rust 库定位 ZIP 尾记录，检查截断和注释长度，避免兼容性探测读取末尾以外的内存；同一 native 回归包含空 ZIP、注释与缺失尾记录。
 - `scripts/verify-launcher-contract.py` 从指定桌面 ELF 的真实跳转表验证 FRB 操作号、刷新入口及 `Vec<ItemInfo>` 解码调用链，证据见 `docs/LAUNCHER_7748_ABI.md`；不用于运行时猜测新接口。
 - 应用最低支持 Android 14，目标版本为 Android 17。
@@ -69,7 +71,7 @@ ActionGrid/
 - 只有推送形如 `v<version>` 的 tag 才进入正式签名 job；工作流从 APK 实际元数据生成 `ActionGrid-<version>.apk` 并创建 GitHub Release。
 - 发布 tag 的版本必须与 `app/build.gradle.kts` 的 `versionName` 完全一致，`versionCode` 只能递增。
 - `scripts/verify-release.ps1` 校验包名、版本、Xposed 元数据、固定发布证书、DEX 入口和 arm64 native ABI；成功输出只说明 APK 的静态校验结果。
-- 签名文件和密码由 README 所列四个 Repository secrets 注入，临时签名文件在结束时清理。外部 PR 不执行正式签名；工作流不自动修改在线更新清单。
+- 签名文件和密码由 README 所列四个 Repository secrets 注入，临时签名文件在结束时清理。外部 PR 不执行正式签名；工作流生成 GitHub Release 的 `latest.json`，不修改 GitCode 更新清单。
 
 ## 完成任务前检查
 

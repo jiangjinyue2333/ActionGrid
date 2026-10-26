@@ -261,6 +261,11 @@ FOCUS_PROLOGUE = (0xd102c3ff, 0xa9057bfd, 0xf90033fb, 0xa90767fa,
                   0xa9085ff8, 0xa90957f6, 0xa90a4ff4, 0x910143fd)
 KEY_BACK_PROLOGUE = (0xd10483ff, 0xa90c7bfd, 0xa90d6ffc, 0xa90e67fa,
                      0xa90f5ff8, 0xa91057f6, 0xa9114ff4, 0x910303fd)
+REDIRECT_SETTER = "<app_launcher::recents::base_recents_impl::BaseRecentsImpl>::update_window_motion_event_redict"
+REDIRECT_PROLOGUE = (0xd10343ff, 0xa9077bfd, 0xa9086ffc, 0xa90967fa,
+                     0xa90a5ff8, 0xa90b57f6, 0xa90c4ff4, 0x9101c3fd)
+BACK_MOTION_PROLOGUE = (0x6db82beb, 0x6d0123e9, 0xa9027bfd, 0xa9036ffc,
+                        0xa90467fa, 0xa9055ff8, 0xa90657f6, 0xa9074ff4)
 BASELINES = {
     "7748": {"export": 0x9b750c, "dispatcher": 0x7ee954, "move": 831, "batch": 855,
              "reload": 0x7a35a4, "move_target": 0x87bb20, "batch_target": 0x89bca8,
@@ -269,14 +274,18 @@ BASELINES = {
              "grid_x_load": 0xb9458920, "grid_y_load": 0xb9458d20,
              "motion": 0xd37904, "motion_caller": 0x743a80, "motion_caller_v2": 0x743e40,
              "focus": 0x757b34, "key": 0x9736ec, "key_caller": 0x743138,
-             "key_caller_v2": 0x743a74, "back": 0x720ffc, "back_call": 0x6fffd4},
+             "key_caller_v2": 0x743a74, "back": 0x720ffc, "back_call": 0x6fffd4,
+             "redirect": 0x6ae0d8, "back_motion": 0x6fe948, "back_motion_size": 0x20ac,
+             "invoke_gate_load": 0x560},
     "8565": {"export": 0x9be128, "dispatcher": 0x7f5844, "move": 833, "batch": 857,
              "reload": 0x7aa050, "move_target": 0x881cb8, "batch_target": 0x8a1dd8,
              "grid_x": 0x6c9588, "grid_y": 0x6c9634,
              "grid_x_load": 0xb9486920, "grid_y_load": 0xb9486d20,
              "motion": 0xd40fd8, "motion_caller": 0x75df1c, "motion_caller_v2": 0x75e2dc,
              "focus": 0x772360, "key": 0x97a484, "key_caller": 0x75d5d4,
-             "key_caller_v2": 0x75df10, "back": 0x725c54, "back_call": 0x7050c8},
+             "key_caller_v2": 0x75df10, "back": 0x725c54, "back_call": 0x7050c8,
+             "redirect": 0x6b1978, "back_motion": 0x7039c0, "back_motion_size": 0x2100,
+             "invoke_gate_load": 0x584},
     "8584": {"export": 0x9c4738, "dispatcher": 0x7f9e10, "move": 834, "batch": 858,
              "reload": 0x7ae2a8, "move_target": 0x8874cc, "batch_target": 0x8a75ec,
              "insert": 830, "insert_target": 0x881bc0, "delete": 821, "delete_target": 0x8811b0,
@@ -284,7 +293,9 @@ BASELINES = {
              "grid_x_load": 0xb9479920, "grid_y_load": 0xb9479d20,
              "motion": 0xd47844, "motion_caller": 0x761fdc, "motion_caller_v2": 0x76239c,
              "focus": 0x776420, "key": 0x98058c, "key_caller": 0x761694,
-             "key_caller_v2": 0x761fd0, "back": 0x729d14, "back_call": 0x70910c},
+             "key_caller_v2": 0x761fd0, "back": 0x729d14, "back_call": 0x70910c,
+             "redirect": 0x6b57f4, "back_motion": 0x707a04, "back_motion_size": 0x2100,
+             "invoke_gate_load": 0x584},
 }
 
 
@@ -363,6 +374,11 @@ def verify_lifecycle_contract(elf, symbols, baseline):
             and elf.words(back + 0x20, 1) == (0xaa0003fa,),
             "Back invocation prologue or helper x0 preservation changed")
     caller = symbol(symbols, BACK_GESTURE)
+    require(caller == (baseline["back_motion"], baseline["back_motion_size"])
+            and elf.words(caller[0], 8) == BACK_MOTION_PROLOGUE
+            and elf.words(caller[0] + baseline["invoke_gate_load"], 1) == (0xf9406288,)
+            and elf.words(caller[0] + baseline["invoke_gate_load"] + 8, 1) == (0x39404108,),
+            "Back recognizer or its Arc window +0xc0 / Cell +0x10 invoke gate changed")
     calls = [call for call, target in direct_calls(elf, caller) if target == back]
     require(calls == [baseline["back_call"]]
             and elf.words(calls[0] - 4, 1) == (0xf9406660,),
@@ -382,7 +398,20 @@ def verify_lifecycle_contract(elf, symbols, baseline):
         0xa9514ff4, 0xa95057f6, 0xa94f5ff8, 0xa94e67fa,
         0xa94d6ffc, 0xa94c7bfd, 0x910483ff, 0xd65f03c0),
         "Back invocation return path changed")
+    redirect, size = symbol(symbols, REDIRECT_SETTER)
+    require((redirect, size) == (baseline["redirect"], 0x15c)
+            and elf.words(redirect, 8) == REDIRECT_PROLOGUE,
+            "Native edge redirect setter differs from baseline")
+    require(elf.words(redirect + 0x28, 1) == (0x2a0003f3,)
+            and elf.words(redirect + 0x94, 4) == (0xf9404008, 0x390093f3, 0xaa0003f5, 0x39404109)
+            and elf.words(redirect + 0x104, 1) == (0x39004113,),
+            "Redirect setter must preserve bool w0 in w19 and store it in the original window cell")
     return {
+        "redirect": {"address": hex(redirect), "symbol": REDIRECT_SETTER, "abi": "void (bool)",
+                     "prologue": [f"{word:08x}" for word in REDIRECT_PROLOGUE]},
+        "back_motion": {"address": hex(caller[0]), "symbol": BACK_GESTURE,
+                        "abi": "void (window*, event*)", "invoke_cell_offset": "0xb0",
+                        "cell_value_offset": "0x10"},
         "focus": {"address": hex(focus), "symbol": focus_names[0], "abi": "void (window*, bool)",
                   "focus_register": "w1", "prologue": [f"{word:08x}" for word in FOCUS_PROLOGUE]},
         "key": {"address": hex(key), "symbol": KEY_SCENE, "abi": "bool (scene*, event*)",
@@ -701,6 +730,7 @@ def main():
         print(f"  focus: {evidence['lifecycle']['focus']['address']}; void (window*, bool) with focus w1 verified")
         print(f"  key: {evidence['lifecycle']['key']['address']}; bool (scene*, event*) with event x1 and key getter imports verified")
         print(f"  back gesture: {evidence['lifecycle']['back']['address']}; void (helper*) with committed gesture caller and callback cleanup verified")
+        print(f"  edge redirect: {evidence['lifecycle']['redirect']['address']}; native void (bool) setter verified")
         if "semantics" in evidence:
             print("  7748 semantics: exported interface, holder ownership, bool dispatch and weak task lifetime verified")
         print("  Offline evidence only; the launcher was not executed.")

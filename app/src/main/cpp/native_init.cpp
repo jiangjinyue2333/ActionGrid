@@ -3,12 +3,14 @@
 #include "native_diagnostics.h"
 
 #include <android/log.h>
+#include <android/looper.h>
 #include <jni.h>
 #include <dlfcn.h>
 #include <elf.h>
 #include <link.h>
 #include <dirent.h>
 #include <unistd.h>
+#include <sys/eventfd.h>
 
 #include <algorithm>
 #include <array>
@@ -292,11 +294,22 @@ LauncherMotionFn g_original_launcher_motion = nullptr;
 using LauncherFocusFn = void (*)(void *, bool);
 using LauncherKeyFn = bool (*)(void *, void *);
 using LauncherBackFn = void (*)(void *);
+using LauncherRedirectFn = void (*)(bool);
 LauncherFocusFn g_original_launcher_focus = nullptr;
 LauncherKeyFn g_original_launcher_key = nullptr;
 LauncherBackFn g_original_launcher_back = nullptr;
+LauncherRedirectFn g_original_launcher_redirect = nullptr;
+LauncherMotionFn g_original_back_motion = nullptr;
+std::atomic<int> g_native_redirect_requested{-1};
+std::atomic<int> g_native_redirect_applied{-1};
+std::atomic<int> g_redirect_event_fd{-1};
+std::atomic<pid_t> g_redirect_looper_tid{0};
+std::mutex g_redirect_looper_mutex;
 MotionActionFn g_key_code = nullptr;
 MotionActionFn g_key_action = nullptr;
+using KeyTimeFn = int64_t (*)(void *);
+KeyTimeFn g_key_down_time = nullptr;
+thread_local bool g_forwarding_back_key = false;
 std::atomic<bool> g_launcher_lifecycle_hook_attempted{false};
 std::atomic<int32_t> g_launcher_window_focused{-1};
 std::atomic<bool> g_consume_back_up{false};
@@ -475,6 +488,8 @@ std::atomic<int64_t> g_lifted_folder_container{0};
 // Home dismisses the folder. Keep this one-shot marker for that transition.
 std::atomic<bool> g_folder_lift_returned_to_desktop{false};
 std::atomic<int64_t> g_folder_lift_returned_at_ms{0};
+std::atomic<int64_t> g_folder_return_key_time{-1};
+std::atomic<int64_t> g_folder_return_key_up_time{-1};
 
 int64_t monotonicMillis() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -2696,11 +2711,89 @@ void appendSparseItemInfo(WireWriter &wire, const FavoritePlacement &source,
     wire.none();                         // field 35
 }
 
+bool liftNeedsNativeBack() {
+    const auto profile = g_launcher_profile.load(std::memory_order_acquire);
+    return (profile == LauncherAbiProfile::kLegacy7748
+                    || profile == LauncherAbiProfile::kCurrent8565
+                    || profile == LauncherAbiProfile::kCurrent8584)
+            && g_launcher_fingerprint_ready.load(std::memory_order_acquire)
+            && g_launcher_system_compatible.load(std::memory_order_acquire)
+            && g_original_back_motion != nullptr && g_original_launcher_back != nullptr
+            && g_redirect_event_fd.load(std::memory_order_acquire) >= 0
+            && g_lifted.load(std::memory_order_acquire)
+            && g_launcher_window_focused.load(std::memory_order_acquire) == 1;
+}
+
+void applyLauncherRedirect() {
+    const int requested = g_native_redirect_requested.load(std::memory_order_acquire);
+    if (g_original_launcher_redirect == nullptr || requested < 0) return;
+    const int redirect = liftNeedsNativeBack() ? 0 : requested;
+    if (g_native_redirect_applied.exchange(redirect, std::memory_order_acq_rel) != redirect) {
+        g_original_launcher_redirect(redirect != 0);
+    }
+}
+
+int onLauncherRedirectWake(int fd, int events, void *) {
+    uint64_t pending;
+    if ((events & ALOOPER_EVENT_INPUT) != 0) {
+        while (read(fd, &pending, sizeof(pending)) < 0 && errno == EINTR) {}
+        // Apply the current session, not an old queued begin/end operation.
+        applyLauncherRedirect();
+    }
+    return 1;
+}
+
+void captureLauncherRedirectLooper() {
+    if (g_original_launcher_redirect == nullptr
+            || g_redirect_event_fd.load(std::memory_order_acquire) >= 0) return;
+    std::lock_guard lock(g_redirect_looper_mutex);
+    if (g_redirect_event_fd.load(std::memory_order_relaxed) >= 0) return;
+    using ForThreadFn = ALooper *(*)();
+    using AddFdFn = int (*)(ALooper *, int, int, int, ALooper_callbackFunc, void *);
+    static void *android = dlopen("libandroid.so", RTLD_NOW);
+    if (android == nullptr) return;
+    const auto forThread = reinterpret_cast<ForThreadFn>(dlsym(android, "ALooper_forThread"));
+    const auto addFd = reinterpret_cast<AddFdFn>(dlsym(android, "ALooper_addFd"));
+    ALooper *looper = forThread == nullptr ? nullptr : forThread();
+    if (looper == nullptr || addFd == nullptr) return;
+    const int fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (fd < 0) return;
+    if (addFd(looper, fd, ALOOPER_POLL_CALLBACK, ALOOPER_EVENT_INPUT,
+            onLauncherRedirectWake, nullptr) != 1) {
+        close(fd);
+        return;
+    }
+    g_redirect_looper_tid.store(gettid(), std::memory_order_release);
+    g_redirect_event_fd.store(fd, std::memory_order_release);
+    nativeLog(ANDROID_LOG_INFO, "ActionGridNative", "Back redirect looper ready tid=%d", gettid());
+}
+
+void updateLauncherRedirect() {
+    const int fd = g_redirect_event_fd.load(std::memory_order_acquire);
+    if (fd < 0 || g_original_launcher_redirect == nullptr) return;
+    if (gettid() == g_redirect_looper_tid.load(std::memory_order_acquire)) {
+        applyLauncherRedirect();
+        return;
+    }
+    const uint64_t pending = 1;
+    while (write(fd, &pending, sizeof(pending)) < 0 && errno == EINTR) {}
+}
+
+void onLauncherRedirect(bool redirect) {
+    captureLauncherRedirectLooper();
+    g_native_redirect_requested.store(redirect ? 1 : 0, std::memory_order_release);
+    const bool effective = !liftNeedsNativeBack() && redirect;
+    g_native_redirect_applied.store(effective ? 1 : 0, std::memory_order_release);
+    if (g_original_launcher_redirect != nullptr) g_original_launcher_redirect(effective);
+}
+
 void clearLiftSession() {
     g_lifted_folder_container.store(0);
     g_folder_lift_in_folder.store(false, std::memory_order_release);
     g_folder_lift_returned_to_desktop.store(false, std::memory_order_release);
     g_folder_lift_returned_at_ms.store(0, std::memory_order_release);
+    g_folder_return_key_time.store(-1, std::memory_order_release);
+    g_folder_return_key_up_time.store(-1, std::memory_order_release);
     const int32_t hovered = g_virtual_hovered_id.exchange(-1, std::memory_order_acq_rel);
     const int32_t focused = g_virtual_focused_id.exchange(-1, std::memory_order_acq_rel);
     const AccessibilityEventSource hoveredSource = captureEventSource(hovered);
@@ -2708,6 +2801,7 @@ void clearLiftSession() {
     if (isVirtualNode(hovered)) sendEvent(hoveredSource, 256);
     if (isVirtualNode(focused)) sendEvent(focusedSource, 65536);
     g_lifted.store(false, std::memory_order_release);
+    updateLauncherRedirect();
     g_lifted_node_id.store(-1, std::memory_order_release);
     g_lifted_screen.store(-1, std::memory_order_release);
     g_drop_parent_node_id.store(-1, std::memory_order_release);
@@ -2734,6 +2828,8 @@ bool returnFolderLiftToDesktop() {
     }
     g_folder_lift_returned_to_desktop.store(true, std::memory_order_release);
     g_folder_lift_returned_at_ms.store(monotonicMillis(), std::memory_order_release);
+    g_folder_return_key_time.store(-1, std::memory_order_release);
+    g_folder_return_key_up_time.store(-1, std::memory_order_release);
     const AccessibilityEventSource oldParent = captureDropParentEventSource(-1);
     g_virtual_hovered_id.store(-1, std::memory_order_release);
     g_virtual_focused_id.store(-1, std::memory_order_release);
@@ -5429,6 +5525,7 @@ void setSurfaceState(SurfaceState next, void *provider) {
 }
 
 void onLauncherWindowFocus(void *window, bool focused) {
+    captureLauncherRedirectLooper();
     if (!focused) {
         g_folder_refresh_active.store(false);
         g_folder_refresh_result.store(-1);
@@ -5518,6 +5615,16 @@ void onLauncherWindowFocus(void *window, bool focused) {
         }
     }
     if (!focused && g_original_launcher_focus != nullptr) g_original_launcher_focus(window, false);
+    updateLauncherRedirect();
+}
+
+bool forwardLauncherBackKey(void *scene, void *event) {
+    if (g_original_launcher_key == nullptr) return false;
+    const bool previous = g_forwarding_back_key;
+    g_forwarding_back_key = true;
+    const bool result = g_original_launcher_key(scene, event);
+    g_forwarding_back_key = previous;
+    return result;
 }
 
 bool onLauncherKey(void *scene, void *event) {
@@ -5525,28 +5632,36 @@ bool onLauncherKey(void *scene, void *event) {
     if (event != nullptr && g_key_code != nullptr && g_key_action != nullptr
             && g_key_code(event) == 4) {
         const int32_t action = g_key_action(event);
-        if (action == 0) {
-            const int64_t returnedAt = g_folder_lift_returned_at_ms.load(
-                    std::memory_order_acquire);
-            if (g_folder_lift_returned_to_desktop.load(std::memory_order_acquire)
-                    && returnedAt > 0 && monotonicMillis() - returnedAt < 600) {
-                // The same Back can arrive through both the key and gesture
-                // hooks. Let the duplicate reach Home without cancelling the
-                // source retained for the desktop surface.
-                if (g_original_launcher_key != nullptr) g_original_launcher_key(scene, event);
+        const int64_t keyTime = g_key_down_time == nullptr ? -1 : g_key_down_time(event);
+        if ((action == 0 || action == 1)
+                && g_folder_lift_returned_to_desktop.load(std::memory_order_acquire)) {
+            auto &savedKeyTime = action == 0 ? g_folder_return_key_time : g_folder_return_key_up_time;
+            const int64_t savedTime = savedKeyTime.load(std::memory_order_acquire);
+            const int64_t returnedAt = g_folder_lift_returned_at_ms.load(std::memory_order_acquire);
+            const bool awaitingUp = action == 1 && savedTime < 0 && g_consume_back_up.load();
+            const bool sameKey = awaitingUp || (keyTime >= 0 && savedTime >= 0 ? keyTime == savedTime
+                    : returnedAt > 0 && monotonicMillis() - returnedAt < 600);
+            if (sameKey) {
+                // Flutter redispatches the same key pair after reporting it unhandled.
+                if (savedTime < 0 && keyTime >= 0) savedKeyTime.store(keyTime);
+                if (action == 0 && savedTime < 0) g_consume_back_up.store(true);
+                if (action == 1) g_consume_back_up.store(false, std::memory_order_release);
+                forwardLauncherBackKey(scene, event);
                 return true;
             }
-            if (g_folder_lift_returned_to_desktop.load(std::memory_order_acquire)) {
-                g_folder_lift_returned_to_desktop.store(false, std::memory_order_release);
-                g_folder_lift_returned_at_ms.store(0, std::memory_order_release);
-            }
+            g_folder_lift_returned_to_desktop.store(false, std::memory_order_release);
+            g_folder_lift_returned_at_ms.store(0, std::memory_order_release);
+            g_consume_back_up.store(false, std::memory_order_release);
+        }
+        if (action == 0) {
             // A folder lift has two surfaces.  The first Back must be passed
             // to Home so it closes the folder while the captured source stays
             // available for the desktop virtual grid.  The second Back then
             // cancels the still-active lift session.
             if (returnFolderLiftToDesktop()) {
+                g_folder_return_key_time.store(keyTime, std::memory_order_release);
                 g_consume_back_up.store(true, std::memory_order_release);
-                if (g_original_launcher_key != nullptr) g_original_launcher_key(scene, event);
+                forwardLauncherBackKey(scene, event);
                 return true;
             }
             if (g_consume_back_up.load(std::memory_order_acquire)
@@ -5560,23 +5675,6 @@ bool onLauncherKey(void *scene, void *event) {
                 return true;
             }
         }
-        if (action == 1 && g_folder_lift_returned_to_desktop.load(
-                std::memory_order_acquire)) {
-            const int64_t returnedAt = g_folder_lift_returned_at_ms.load(
-                    std::memory_order_acquire);
-            if (returnedAt > 0 && monotonicMillis() - returnedAt < 600) {
-                // The first folder Back may arrive through the gesture hook
-                // before the matching key-up.  Forward that key-up so Home
-                // can finish dismissing the folder surface.
-                // It is the end of this same key cycle, so do not carry the
-                // consume marker into the user's next Back.
-                g_consume_back_up.store(false, std::memory_order_release);
-                if (g_original_launcher_key != nullptr) {
-                    g_original_launcher_key(scene, event);
-                }
-                return true;
-            }
-        }
         if (action == 1 && g_swallow_cancel_back_up.exchange(false,
                 std::memory_order_acq_rel)) {
             return true;
@@ -5585,13 +5683,13 @@ bool onLauncherKey(void *scene, void *event) {
             // Keep the original key-up event.  HyperOS commits the folder
             // close from the complete down/up pair; swallowing this half
             // leaves the folder open after the first Back.
-            if (g_original_launcher_key != nullptr) g_original_launcher_key(scene, event);
+            forwardLauncherBackKey(scene, event);
             return true;
         }
         // Some accessibility services deliver only the key-up event.
         if (action == 1 && returnFolderLiftToDesktop()) {
-            return g_original_launcher_key != nullptr
-                    && g_original_launcher_key(scene, event);
+            g_folder_return_key_up_time.store(keyTime, std::memory_order_release);
+            return forwardLauncherBackKey(scene, event);
         }
         if (action == 1 && cancelLiftSession(-1)) return true;
     }
@@ -5607,11 +5705,8 @@ void onLauncherBack(void *helper) {
     // Back.  The key-down path has already moved a folder source to the
     // desktop surface; do not let this second callback cancel that session
     // before the matching key-up reaches Home.
-    const int64_t returnedAt = g_folder_lift_returned_at_ms.load(
-            std::memory_order_acquire);
     const bool duplicateBack = g_folder_lift_returned_to_desktop.load(
-            std::memory_order_acquire) && returnedAt > 0
-            && monotonicMillis() - returnedAt < 600;
+            std::memory_order_acquire) && g_forwarding_back_key;
     if (!returnedToDesktop && !duplicateBack
             && !g_consume_back_up.load(std::memory_order_acquire)) {
         g_folder_lift_returned_to_desktop.store(false, std::memory_order_release);
@@ -5622,6 +5717,24 @@ void onLauncherBack(void *helper) {
     if (g_original_launcher_back != nullptr) {
         g_original_launcher_back(helper);
     }
+}
+
+void onLauncherBackMotion(void *window, void *event) {
+    if (g_original_back_motion == nullptr) return;
+    if (window == nullptr || !liftNeedsNativeBack()) {
+        g_original_back_motion(window, event);
+        return;
+    }
+    // Verified Arc<Cell<bool>>: window data +0xb0, Arc header +0x10.
+    auto *cell = nodeField<uint8_t *>(window, 0xb0);
+    if (cell == nullptr || cell[0x10] > 1) {
+        g_original_back_motion(window, event);
+        return;
+    }
+    const uint8_t previous = cell[0x10];
+    cell[0x10] = 1;
+    g_original_back_motion(window, event);
+    cell[0x10] = previous;
 }
 
 void installLauncherLifecycleHooks(LauncherAbiProfile profile) {
@@ -5638,6 +5751,8 @@ void installLauncherLifecycleHooks(LauncherAbiProfile profile) {
             findLoadedSymbol("libhyper_os_ui_public.so", "input_KeyEvent_getKeyCode"));
     if (g_key_action == nullptr) g_key_action = reinterpret_cast<MotionActionFn>(
             findLoadedSymbol("libhyper_os_ui_public.so", "input_KeyEvent_getAction"));
+    if (g_key_down_time == nullptr) g_key_down_time = reinterpret_cast<KeyTimeFn>(
+            findLoadedSymbol("libhyper_os_ui_public.so", "input_KeyEvent_getDownTime"));
     if (g_key_code == nullptr || g_key_action == nullptr
             || g_launcher_lifecycle_hook_attempted.exchange(true)) {
         return;
@@ -5646,6 +5761,10 @@ void installLauncherLifecycleHooks(LauncherAbiProfile profile) {
             0xa90767faU, 0xa9085ff8U, 0xa90957f6U, 0xa90a4ff4U, 0x910143fdU};
     constexpr uint32_t inputPrologue[] = {0xd10483ffU, 0xa90c7bfdU, 0xa90d6ffcU,
             0xa90e67faU, 0xa90f5ff8U, 0xa91057f6U, 0xa9114ff4U, 0x910303fdU};
+    constexpr uint32_t redirectPrologue[] = {0xd10343ffU, 0xa9077bfdU, 0xa9086ffcU,
+            0xa90967faU, 0xa90a5ff8U, 0xa90b57f6U, 0xa90c4ff4U, 0x9101c3fdU};
+    constexpr uint32_t backMotionPrologue[] = {0x6db82bebU, 0x6d0123e9U, 0xa9027bfdU,
+            0xa9036ffcU, 0xa90467faU, 0xa9055ff8U, 0xa90657f6U, 0xa9074ff4U};
     const uint32_t *focusCheck = focusPrologue;
     const uint32_t *keyCheck = inputPrologue;
     const uint32_t *backCheck = inputPrologue;
@@ -5678,6 +5797,16 @@ void installLauncherLifecycleHooks(LauncherAbiProfile profile) {
     g_original_launcher_back = reinterpret_cast<LauncherBackFn>(install(
             backOffset, backCheck, sizeof(inputPrologue),
             reinterpret_cast<void *>(&onLauncherBack), "back gesture"));
+    const uintptr_t redirectOffset = profile == LauncherAbiProfile::kCurrent8584
+            ? 0x6b57f4 : current ? 0x6b1978 : 0x6ae0d8;
+    g_original_launcher_redirect = reinterpret_cast<LauncherRedirectFn>(install(
+            redirectOffset, redirectPrologue, sizeof(redirectPrologue),
+            reinterpret_cast<void *>(&onLauncherRedirect), "back redirect"));
+    const uintptr_t backMotionOffset = profile == LauncherAbiProfile::kCurrent8584
+            ? 0x707a04 : current ? 0x7039c0 : 0x6fe948;
+    g_original_back_motion = reinterpret_cast<LauncherMotionFn>(install(
+            backMotionOffset, backMotionPrologue, sizeof(backMotionPrologue),
+            reinterpret_cast<void *>(&onLauncherBackMotion), "back recognition"));
 }
 
 void observeSurfaceSample(void *provider, SurfaceState observed,
@@ -6772,33 +6901,13 @@ bool performNativePlacement(void *provider, int32_t nodeId, int32_t actionId) {
     beginPendingPlacement(pendingTargets);
     const bool currentMoveProfile = g_current_frb_move_profile.load(
             std::memory_order_acquire);
-    bool directDatabaseCommit = false;
+    const bool directDatabaseCommit = currentMoveProfile;
     if (currentMoveProfile) {
-        // 8565 op 833 takes one ItemInfo and four destination arguments.
-        // Keep this path to one source and an empty slot, without a vector count.
-        if (sources.size() == 1 && isVirtualNode(nodeId)
-                && actionId == 0 && expected.size() == 1) {
-            WireWriter itemWire;
-            appendSparseItemInfo(itemWire, sources.front(), expected.front());
-            // move_item_in_database also decodes four destination arguments
-            // after ItemInfo; omitting them leaves the native model unchanged.
-            itemWire.put64(expected.front().container);
-            itemWire.put32(expected.front().screen);
-            itemWire.put32(expected.front().cellX);
-            itemWire.put32(expected.front().cellY);
-            dispatchWire(singleMoveOperation(g_launcher_profile.load()), itemWire.bytes);
-            nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
-                    "HyperOS4 move_item_in_database dispatched id=%lld target=%d payload=%zu",
-                    static_cast<long long>(sources.front().id), nodeId,
-                    itemWire.bytes.size());
-        } else {
-            // 8565 batch model effects still lack runtime validation. Retain
-            // the existing favorites transaction for occupied cells.
-            directDatabaseCommit = true;
-            nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
-                    "HyperOS4 occupied reorder using direct favorites transaction count=%zu target=%d",
-                    expected.size(), nodeId);
-        }
+        // Home's asynchronous single move can lose a SQLite lock race with
+        // verification. Reuse reorder's transaction, then verify after COMMIT.
+        nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
+                "HyperOS4 placement using direct favorites transaction count=%zu target=%d",
+                expected.size(), nodeId);
     } else {
         // Older verified profiles use the batch operation and its vector
         // envelope.
@@ -7016,6 +7125,7 @@ bool performActionImpl(void *provider, int32_t nodeId, int32_t actionId, void *a
             }
             g_lifted_node_id.store(nodeId);
             g_lifted.store(true);
+            updateLauncherRedirect();
             g_drop_parent_node_id.store(folderGrid->id);
             g_drop_parent_host_id.store(folderGrid->host);
             g_drop_parent_window_id.store(folderGrid->window);
@@ -7124,6 +7234,7 @@ bool performActionImpl(void *provider, int32_t nodeId, int32_t actionId, void *a
         }
         g_lifted_node_id.store(nodeId, std::memory_order_release);
         g_lifted.store(true, std::memory_order_release);
+        updateLauncherRedirect();
         g_custom_action_calls.fetch_add(1, std::memory_order_relaxed);
         const auto parent = captureDropParentEventSource(nodeId);
         sendEvent(parent, kTypeWindowContentChanged);

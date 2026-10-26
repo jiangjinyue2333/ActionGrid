@@ -519,8 +519,11 @@ struct AccessibilityCapture {
         g_node_set_traversal_before = nullptr;
         g_node_set_content_description = nullptr;
         g_key_code = nullptr; g_key_action = nullptr;
+        g_key_down_time = nullptr;
         g_original_launcher_focus = nullptr; g_original_launcher_key = nullptr;
         g_original_launcher_back = nullptr;
+        g_original_launcher_redirect = nullptr;
+        g_original_back_motion = nullptr;
         g_swallow_cancel_back_up.store(false);
     }
 };
@@ -1118,7 +1121,7 @@ void cancelledSwipeKeepsConfirmedPage() {
 }
 
 int forwardedFocus = 0, forwardedKeys = 0, forwardedBacks = 0;
-struct TestKey { int32_t code, action; };
+struct TestKey { int32_t code, action; int64_t downTime = 1; };
 
 void everyReturnHomeAnnouncesOnce() {
     AccessibilityCapture capture;
@@ -1228,19 +1231,21 @@ void folderBackKeyCycleClearsTheFirstBackMarker() {
     forwardedKeys = 0;
     g_key_code = +[](void *event) { return static_cast<TestKey *>(event)->code; };
     g_key_action = +[](void *event) { return static_cast<TestKey *>(event)->action; };
+    g_key_down_time = +[](void *event) { return static_cast<TestKey *>(event)->downTime; };
     g_original_launcher_key = +[](void *, void *) { ++forwardedKeys; return false; };
-    TestKey firstDown{4, 0}, firstUp{4, 1};
+    TestKey firstDown{4, 0, 1}, firstUp{4, 1, 2};
     require(onLauncherKey(nullptr, &firstDown) && onLauncherKey(nullptr, &firstUp),
             "first folder Back key cycle was not forwarded");
     require(g_lifted.load() && !g_folder_lift_in_folder.load()
                     && !g_consume_back_up.load(),
             "first folder Back key cycle left a stale consume marker");
 
-    g_folder_lift_returned_at_ms.store(monotonicMillis() - 1000);
-    TestKey secondDown{4, 0}, secondUp{4, 1};
+    require(onLauncherKey(nullptr, &firstDown) && onLauncherKey(nullptr, &firstUp)
+                    && g_lifted.load(), "redispatched first Back cancelled the folder lift");
+    TestKey secondDown{4, 0, 3}, secondUp{4, 1, 3};
     require(onLauncherKey(nullptr, &secondDown) && onLauncherKey(nullptr, &secondUp),
             "second folder Back key cycle was not consumed");
-    require(!g_lifted.load() && forwardedKeys == 2,
+    require(!g_lifted.load() && forwardedKeys == 4,
             "second folder Back key cycle did not cancel the retained lift");
 }
 
@@ -1490,13 +1495,9 @@ void captureDispatch(uint32_t operation, int64_t, const uint8_t *bytes, uint32_t
     throw CapturedDispatch{}; // Stop before the asynchronous database confirmation.
 }
 
-void moveRequestIncludesDestinationArguments() {
+void emptyMoveRejectsOutOfGridDestination() {
     prepareGrid();
-    // Exercise the verified 8565 single-item contract.  The 8584 contract
-    // has the same wire shape with a different opcode and is covered by the
-    // profile table regression below.
     g_launcher_profile.store(LauncherAbiProfile::kCurrent8565);
-    expectedOperation = singleMoveOperation(LauncherAbiProfile::kCurrent8565);
     SnapshotFavorite source;
     source.id = 101;
     source.title = "美团外卖";
@@ -1506,34 +1507,12 @@ void moveRequestIncludesDestinationArguments() {
     g_sources = {{90, 20, 1, 2, {200, 100, 300, 200},
             "com.miui.home:id/icon_icon", "美团外卖"}};
     g_slots = {{{100, 0, 200, 100}, 0, 1}};
-    g_frb_dispatcher = captureDispatch;
-    g_capabilities.fetch_or(CAP_FRB_MODEL);
-    g_current_frb_move_profile.store(true);
-    try {
-        performNativePlacement(nullptr, (kVirtualNodeBase + 1), 0);
-        throw std::runtime_error("move was not dispatched");
-    } catch (const CapturedDispatch &) {
-        g_model_move_running.store(false);
-    }
-    WireWriter expected;
-    FavoritePlacement target = source.placement;
-    target.screen = 3;
-    target.cellX = 1;
-    target.cellY = 0;
-    appendSparseItemInfo(expected, source.placement, target);
-    expected.put64(kDesktopContainer);
-    expected.put32(3);
-    expected.put32(1);
-    expected.put32(0);
-    require(dispatched == expected.bytes,
-            "op 833 is missing container, screen, cellX and cellY after ItemInfo");
     g_slots.front().row = 6;
     std::vector<FavoritePlacement> sources, targets;
     WireWriter invalid;
     std::string failureReason;
     require(!buildModelMove(nullptr, (kVirtualNodeBase + 1), 0, sources, targets, invalid, failureReason),
             "stale out-of-grid drop was accepted");
-    g_frb_dispatcher = nullptr;
 }
 
 std::vector<std::array<int64_t, 8>> pageRows;
@@ -1617,7 +1596,8 @@ void occupiedPlacementMovesDisplacedIconsInNativeBatch() {
     g_cached_db_path.clear();
 }
 
-void checkPlacementAfterReload(bool positionChanged, bool nodesArriveDuringDispatch = false) {
+void checkPlacementAfterReload(bool positionChanged, bool nodesArriveDuringDispatch = false,
+        LauncherAbiProfile profile = LauncherAbiProfile::kLegacy7748) {
     AccessibilityCapture capture;
     prepareGrid();
     const bool workerWasStarted = g_snapshot_worker_started.exchange(true);
@@ -1629,6 +1609,7 @@ void checkPlacementAfterReload(bool positionChanged, bool nodesArriveDuringDispa
             g_frb_dispatcher = nullptr;
             g_trigger_workspace_reload = nullptr;
             g_sqlite_open_v2 = nullptr;
+            g_sqlite_exec = nullptr;
             g_cached_db_path.clear();
             endPendingPlacement();
         }
@@ -1637,21 +1618,40 @@ void checkPlacementAfterReload(bool positionChanged, bool nodesArriveDuringDispa
             "com.miui.home:id/icon_icon", "美团外卖"}};
     g_source_placements = {{101, kDesktopContainer, 4, 2, 1, 1, 1, 0}};
     g_capabilities.fetch_or(CAP_FRB_MODEL);
-    g_current_frb_move_profile.store(false);
-    g_launcher_profile.store(LauncherAbiProfile::kLegacy7748);
+    const bool current = singleMoveOperation(profile) != 0;
+    g_current_frb_move_profile.store(current);
+    g_launcher_profile.store(profile);
     g_launcher_window_focused.store(1);
     g_frb_dispatcher = +[](uint32_t, int64_t, const uint8_t *bytes, uint32_t, uint32_t) {
         std::free(const_cast<uint8_t *>(bytes));
         onCreateNode(reinterpret_cast<void *>(1), 91);
     };
     g_trigger_workspace_reload = positionChanged ? +[]() { pageRows[0][3] = 0; } : +[]() {};
-    pageRows = {{101, kDesktopContainer, 3, 1, 0, 1, 1, 0}};
+    // Reproduce Home's SQLITE_BUSY result: dispatch can return without saving.
+    pageRows = current ? std::vector<std::array<int64_t, 8>>{{101, kDesktopContainer, 4, 2, 1, 1, 1, 0}}
+                       : std::vector<std::array<int64_t, 8>>{{101, kDesktopContainer, 3, 1, 0, 1, 1, 0}};
+    static bool verifyAfterCommit, updated, committed, verifiedBeforeCommit;
+    verifyAfterCommit = current;
+    updated = committed = verifiedBeforeCommit = false;
     g_cached_db_path = "/dev/null";
     g_sqlite_open_v2 = +[](const char *, Sqlite3 **db, int, const char *) {
         *db = reinterpret_cast<Sqlite3 *>(1); return 0;
     };
     g_sqlite_prepare_v2 = +[](Sqlite3 *, const char *, int, Sqlite3Stmt **query, const char **) {
+        if (verifyAfterCommit && !committed) verifiedBeforeCommit = true;
         queryRow = -1; *query = reinterpret_cast<Sqlite3Stmt *>(1); return 0;
+    };
+    g_sqlite_exec = +[](Sqlite3 *, const char *sql, int (*)(void *, int, char **, char **),
+            void *, char **) {
+        if (std::strcmp(sql, "UPDATE favorites SET container=-100,screen=3,cellX=1,cellY=0 WHERE _id=101") == 0) {
+            updated = true;
+        }
+        if (std::strcmp(sql, "COMMIT") == 0) {
+            if (!updated) return 1;
+            pageRows = {{101, kDesktopContainer, 3, 1, 0, 1, 1, 0}};
+            committed = true;
+        }
+        return 0;
     };
     g_sqlite_step = +[](Sqlite3Stmt *) {
         return ++queryRow < static_cast<int>(pageRows.size()) ? kSqliteRow : kSqliteDone;
@@ -1672,6 +1672,8 @@ void checkPlacementAfterReload(bool positionChanged, bool nodesArriveDuringDispa
     require(performNativePlacement(reinterpret_cast<void *>(1), kVirtualNodeBase + 1, 0),
             "empty-cell move was rejected");
     while (g_model_move_running.load()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    require(!current || (committed && !verifiedBeforeCommit),
+            "empty-cell verification raced an uncommitted native write");
     const bool announcedSuccess = std::any_of(events.begin(), events.end(), [](const auto &event) {
         return event.text == u"已放置在第3页，第1行，第2列";
     });
@@ -1694,6 +1696,11 @@ void placementRechecksDatabaseAfterReload() {
 
 void placementKeepsNodesObservedDuringDispatch() {
     checkPlacementAfterReload(false, true);
+}
+
+void currentEmptyPlacementCommitsBeforeVerification() {
+    checkPlacementAfterReload(false, false, LauncherAbiProfile::kCurrent8565);
+    checkPlacementAfterReload(false, false, LauncherAbiProfile::kCurrent8584);
 }
 
 void cancelRemovesVirtualGridAndFocus() {
@@ -2088,6 +2095,101 @@ void liftingIconUsesLauncherFeedback() {
     }) == 1, "multi-lift must use the launcher's plural drag feedback");
 }
 
+void liftingIconKeepsNativeEdgeBackAvailable() {
+    AccessibilityCapture capture;
+    prepareGrid();
+    g_node_drop = +[](void *) {};
+    g_snapshot.ready = true;
+    g_lifted.store(false);
+    g_launcher_profile.store(LauncherAbiProfile::kCurrent8584);
+    g_launcher_fingerprint_ready.store(true);
+    void *android = dlopen("libandroid.so", RTLD_NOW);
+    using PrepareLooperFn = ALooper *(*)(int);
+    const auto prepareLooper = reinterpret_cast<PrepareLooperFn>(dlsym(android, "ALooper_prepare"));
+    require(prepareLooper != nullptr && prepareLooper(0) != nullptr, "Android test looper unavailable");
+    static bool nativeRedirect;
+    nativeRedirect = false;
+    g_original_back_motion = +[](void *, void *) {};
+    g_original_launcher_back = +[](void *) {};
+    g_original_launcher_redirect = +[](bool redirect) {
+        require(gettid() == g_redirect_looper_tid.load(), "native redirect ran off its Home looper");
+        nativeRedirect = redirect;
+    };
+    onLauncherWindowFocus(nullptr, true);
+    onLauncherRedirect(true);
+    require(g_redirect_event_fd.load() >= 0, "native redirect looper registration failed");
+    require(nativeRedirect, "normal Home edge routing was changed before lifting");
+    readerTree.clear();
+    readerTree.emplace(-1, testNode(10, -1, {0, 0, 400, 600}, "com.miui.home:id/screen_content", ""));
+    readerTree.emplace(11, testNode(11, 10, {0, 0, 100, 100}, "com.miui.home:id/icon_icon", "QQ"));
+    childIds = {(int64_t{11} << 32) | 7};
+    setChildren(readerTree.at(-1), childIds);
+    g_original_create_node = +[](void *, int32_t id) -> NodeResult {
+        auto found = readerTree.find(id);
+        return found == readerTree.end() ? NodeResult{1, nullptr} : NodeResult{0, found->second.data()};
+    };
+    require(onPerformAction(reinterpret_cast<void *>(1), 11, kLiftAction, nullptr), "lift failed");
+    require(liftNeedsNativeBack(), "active lift did not qualify for native Back");
+    require(!nativeRedirect, "lifting left the native edge gesture redirected to workspace paging");
+    onLauncherRedirect(true);
+    require(!nativeRedirect, "native Home visibility update disabled Back during a lift");
+    g_original_launcher_back = +[](void *) {};
+    onLauncherBack(nullptr);
+    require(!g_lifted.load() && nativeRedirect, "Back did not restore native Home routing");
+    require(onPerformAction(reinterpret_cast<void *>(1), 11, kLiftAction, nullptr), "worker lift failed");
+    std::thread([] { clearLiftSession(); }).join();
+    require(!nativeRedirect, "placement worker changed native routing before the Home callback");
+    using PollLooperFn = int (*)(int, int *, int *, void **);
+    const auto pollLooper = reinterpret_cast<PollLooperFn>(dlsym(android, "ALooper_pollOnce"));
+    require(pollLooper != nullptr && pollLooper(1000, nullptr, nullptr, nullptr) == ALOOPER_POLL_CALLBACK
+                    && nativeRedirect, "placement completion did not restore routing on the Home looper");
+    require(onPerformAction(reinterpret_cast<void *>(1), 11, kLiftAction, nullptr), "second lift failed");
+    onLauncherRedirect(false);
+    clearLiftSession();
+    require(!nativeRedirect, "placement did not preserve the latest native redirect request");
+    onLauncherRedirect(true);
+    require(onPerformAction(reinterpret_cast<void *>(1), 11, kLiftAction, nullptr), "third lift failed");
+    onLauncherWindowFocus(nullptr, false);
+    require(nativeRedirect && !g_lifted.load(), "leaving Home did not restore native edge routing");
+    g_launcher_profile.store(LauncherAbiProfile::kUnknown);
+    g_lifted.store(true);
+    g_launcher_window_focused.store(1);
+    onLauncherRedirect(true);
+    require(nativeRedirect, "unknown launcher ABI overrode native edge routing");
+    clearLiftSession();
+}
+
+void edgeMotionTemporarilyEnablesOnlyLiftCancellation() {
+    AccessibilityCapture capture;
+    prepareGrid();
+    g_launcher_profile.store(LauncherAbiProfile::kCurrent8584);
+    g_launcher_fingerprint_ready.store(true);
+    g_launcher_window_focused.store(1);
+    g_original_launcher_back = +[](void *) {};
+    std::array<uint8_t, 0x100> window{};
+    std::array<uint8_t, 0x18> invokeCell{};
+    void *cell = invokeCell.data();
+    std::memcpy(window.data() + 0xb0, &cell, sizeof(cell));
+    g_original_back_motion = +[](void *window, void *event) {
+        require(event == reinterpret_cast<void *>(1), "native edge event identity changed");
+        auto *cell = nodeField<uint8_t *>(window, 0xb0);
+        require(cell[0x10] == 1, "active lift was blocked by the native invoke-back gate");
+        // The original recognizer may cancel the lift while completing the gesture.
+        clearLiftSession();
+    };
+    onLauncherBackMotion(window.data(), reinterpret_cast<void *>(1));
+    require(invokeCell[0x10] == 0, "native invoke-back gate was not restored after cancellation");
+    g_original_back_motion = +[](void *window, void *) {
+        require(nodeField<uint8_t *>(window, 0xb0)[0x10] == 0,
+                "ordinary Home edge handling was changed without an active lift");
+    };
+    onLauncherBackMotion(window.data(), nullptr);
+    g_lifted.store(true);
+    g_launcher_profile.store(LauncherAbiProfile::kUnknown);
+    onLauncherBackMotion(window.data(), nullptr);
+    clearLiftSession();
+}
+
 void announcementFallbackFlushesAfterControllerRecovery() {
     AccessibilityCapture capture;
     g_launcher_window_focused.store(1);
@@ -2342,7 +2444,7 @@ int main() {
         {"native hover handoff and event ABI", touchHookUsesEventArgumentAndHandsBackOccupiedCells},
         {"raw touch handoff exposes virtual cells", rawTouchHookFindsVirtualCells},
         {"cross-page counts require actual icon node and location", changedCountsDoNotProveIconVisible},
-        {"move request includes full destination", moveRequestIncludesDestinationArguments},
+        {"empty move rejects out-of-grid destination", emptyMoveRejectsOutOfGridDestination},
         {"occupied placement batches every displaced icon", occupiedPlacementMovesDisplacedIconsInNativeBatch},
         {"recycled node ID across pages keeps target actions", recycledNodeOnAnotherPageIsNotTheLiftedSource},
         {"cancel restores normal accessibility", cancelRemovesVirtualGridAndFocus},
@@ -2365,6 +2467,7 @@ int main() {
         {"move refresh notifies reader before waiting for its nodes", placementRefreshNotifiesReaderBeforeVisibilityWait},
         {"move rechecks persisted coordinates after reload", placementRechecksDatabaseAfterReload},
         {"move retains nodes observed during native dispatch", placementKeepsNodesObservedDuringDispatch},
+        {"current empty placement commits before verifying", currentEmptyPlacementCommitsBeforeVerification},
         {"cancelled swipe keeps confirmed page", cancelledSwipeKeepsConfirmedPage},
         {"ten returns to Home announce ten times", everyReturnHomeAnnouncesOnce},
         {"system Back gesture cancels lifted grid", backGestureCancelsLiftAndKeepsNativeCleanup},
@@ -2378,6 +2481,8 @@ int main() {
         {"stale focus keeps lifted grid visible", staleFocusStillExposesLiftedGrid},
         {"cancelled virtual IDs never reach native launcher", cancelledVirtualNodesNeverReachLauncher},
         {"single and multiple lift use launcher speech", liftingIconUsesLauncherFeedback},
+        {"lifting enables the native edge Back recognizer", liftingIconKeepsNativeEdgeBackAvailable},
+        {"native edge invoke gate is temporary and ABI guarded", edgeMotionTemporarilyEnablesOnlyLiftCancellation},
         {"quick Home return without node query announces once", quickReturnHomeWithoutNodeQueryAnnounces},
         {"announcement fallback survives controller replacement", announcementFallbackFlushesAfterControllerRecovery},
         {"real focus clears old empty-cell target", realFocusReplacesVirtualDoubleTapTarget},
