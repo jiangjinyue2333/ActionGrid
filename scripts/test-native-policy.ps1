@@ -16,4 +16,4 @@ $toolchain = Join-Path $NdkDirectory 'toolchains/llvm/prebuilt/windows-x86_64'
     "--sysroot=$toolchain/sysroot" -std=c++17 -fsyntax-only `
     (Join-Path $root 'app/src/test/cpp/native_abi_profiles_test.cpp')
 if ($LASTEXITCODE -ne 0) { throw 'Native ABI 能力分级回归失败' }
-Write-Output 'Native ABI 回归通过：7748 操作号、未知接口降级、完整系统配对和文件夹边界。'
+Write-Output 'Native ABI 回归通过：7748/8584/8593 操作号、8593 多任务操作、未知接口降级、完整系统配对和文件夹边界。'

@@ -11,8 +11,8 @@ android {
         applicationId = "io.github.jiangjinyue2333.actiongrid"
         minSdk = 34
         targetSdk = 37
-        versionCode = 33
-        versionName = "0.4.17"
+        versionCode = 34
+        versionName = "0.4.18"
         testInstrumentationRunner = "io.github.jiangjinyue2333.actiongrid.diagnostics.DiagnosticsInstrumentation"
 
         externalNativeBuild {

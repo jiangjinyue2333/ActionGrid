@@ -69,7 +69,7 @@ ActionGrid/
 
 - 普通 push/PR 只运行结构检查、测试、Lint 和 unsigned build，不读取签名 Secrets。
 - 只有推送形如 `v<version>` 的 tag 才进入正式签名 job；工作流从 APK 实际元数据生成 `ActionGrid-<version>.apk` 并创建 GitHub Release。
-- 发布 tag 的版本必须与 `app/build.gradle.kts` 的 `versionName` 完全一致，`versionCode` 只能递增。
+- 发布 tag 的版本必须与 `app/build.gradle.kts` 的 `versionName` 完全一致，`versionCode` 只能递增。对应的 `docs/RELEASE_<version>.md` 用作 Release 说明，其中 `- ` 条目写入应用更新清单；发布后显式设为最新正式版。
 - `scripts/verify-release.ps1` 校验包名、版本、Xposed 元数据、固定发布证书、DEX 入口和 arm64 native ABI；成功输出只说明 APK 的静态校验结果。
 - 签名文件和密码由 README 所列四个 Repository secrets 注入，临时签名文件在结束时清理。外部 PR 不执行正式签名；工作流生成 GitHub Release 的 `latest.json`，不修改 GitCode 更新清单。
 

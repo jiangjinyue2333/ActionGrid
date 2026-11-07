@@ -23,6 +23,27 @@ static_assert(insertItemOperation(LauncherAbiProfile::kCurrent8584) == 830U);
 static_assert(deleteItemOperation(LauncherAbiProfile::kCurrent8584) == 821U);
 static_assert(supportsFolderTransactions(LauncherAbiProfile::kCurrent8584));
 static_assert(!supportsFolderTransactions(LauncherAbiProfile::kCurrent8565));
+static_assert(launcherAbiProfileForFingerprint(observed(kCurrent8593LauncherFingerprint))
+        == LauncherAbiProfile::kCurrent8593);
+static_assert(launcherAbiProfileForFingerprint({kCurrent8593LauncherFingerprint.first,
+        kCurrent8593LauncherFingerprint.second ^ 1, true}) == LauncherAbiProfile::kUnknown);
+static_assert(launcherAbiProfileForFingerprint({kCurrent8593LauncherFingerprint.first,
+        kCurrent8593LauncherFingerprint.second, false}) == LauncherAbiProfile::kUnknown);
+static_assert(singleMoveOperation(LauncherAbiProfile::kCurrent8593) == 834U);
+static_assert(batchMoveOperation(LauncherAbiProfile::kCurrent8593) == 858U);
+static_assert(insertItemOperation(LauncherAbiProfile::kCurrent8593) == 830U);
+static_assert(deleteItemOperation(LauncherAbiProfile::kCurrent8593) == 821U);
+static_assert(supportsFolderTransactions(LauncherAbiProfile::kCurrent8593));
+static_assert(recentFreeformOperation(LauncherAbiProfile::kCurrent8593) == 1026U);
+static_assert(recentSplitOperation(LauncherAbiProfile::kCurrent8593) == 792U);
+static_assert([] {
+    for (auto profile : {LauncherAbiProfile::kUnknown, LauncherAbiProfile::kLegacy7653,
+            LauncherAbiProfile::kLegacy7722, LauncherAbiProfile::kLegacy7748,
+            LauncherAbiProfile::kCurrent8565, LauncherAbiProfile::kCurrent8584}) {
+        if (recentFreeformOperation(profile) != 0 || recentSplitOperation(profile) != 0) return false;
+    }
+    return true;
+}());
 static_assert(launcherAbiProfileForFingerprint({}) == LauncherAbiProfile::kUnknown);
 static_assert(launcherAbiProfileForFingerprint({kLegacy7748LauncherFingerprint.first,
         kLegacy7748LauncherFingerprint.second, false}) == LauncherAbiProfile::kUnknown);
@@ -51,6 +72,14 @@ static_assert(launcherMatchesSystemAbi(LauncherAbiProfile::kCurrent8584,
         privateAbi, currentAidl, currentUi));
 static_assert(launcherMatchesSystemAbi(LauncherAbiProfile::kCurrent8584,
         privateAbi, legacyAidl, legacyUi));
+static_assert(launcherMatchesSystemAbi(LauncherAbiProfile::kCurrent8593,
+        privateAbi, currentAidl, currentUi));
+static_assert(!launcherMatchesSystemAbi(LauncherAbiProfile::kCurrent8593,
+        privateAbi, legacyAidl, legacyUi));
+static_assert(!launcherMatchesSystemAbi(LauncherAbiProfile::kCurrent8593,
+        privateAbi, currentAidl, legacyUi));
+static_assert(!launcherMatchesSystemAbi(LauncherAbiProfile::kCurrent8593,
+        {}, currentAidl, currentUi));
 
 // Folder child moves require a separate transaction that maintains folder membership.
 static_assert(workspaceContainer(-100));

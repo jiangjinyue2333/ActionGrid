@@ -114,7 +114,10 @@ jobs:
           if ($null -eq $apk) {
             throw '找不到已验证的发布 APK'
           }
-          ./scripts/create-update-manifest.ps1 -ApkPath $apk.FullName -ReleaseTag $env:GITHUB_REF_NAME -OutputPath artifacts/latest.json
+          $releaseNotes = "docs/RELEASE_$($env:GITHUB_REF_NAME.Substring(1)).md"
+          $changelog = @(Get-Content -LiteralPath $releaseNotes -ErrorAction Stop |
+            Where-Object { $_.StartsWith('- ') } | ForEach-Object { $_.Substring(2) })
+          ./scripts/create-update-manifest.ps1 -ApkPath $apk.FullName -ReleaseTag $env:GITHUB_REF_NAME -OutputPath artifacts/latest.json -Changelog $changelog
 
       - name: Upload verified APK
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -138,7 +141,8 @@ jobs:
           if ($null -eq $manifest) {
             throw '找不到 GitHub 更新清单'
           }
-          gh release create $env:GITHUB_REF_NAME $apk.FullName $manifest.FullName --title "ActionGrid $env:GITHUB_REF_NAME" --generate-notes
+          $releaseNotes = "docs/RELEASE_$($env:GITHUB_REF_NAME.Substring(1)).md"
+          gh release create $env:GITHUB_REF_NAME $apk.FullName $manifest.FullName --title "ActionGrid $env:GITHUB_REF_NAME" --notes-file $releaseNotes --verify-tag --latest
 
       - name: Remove temporary signing key
         if: always()

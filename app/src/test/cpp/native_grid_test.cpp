@@ -1305,6 +1305,39 @@ void launcherDimensionsOverrideOldSeventhRow() {
     }), "a seventh-row drop would make the icon disappear");
 }
 
+void sevenRowGridUsesLauncherDimensions() {
+    prepareGrid();
+    g_cell_count_x = +[]() { return 4; };
+    g_cell_count_y = +[]() { return 7; };
+    struct Cleanup {
+        ~Cleanup() { g_cell_count_x = nullptr; g_cell_count_y = nullptr; }
+    } cleanup;
+    g_workspace[0].bounds.bottom = 800;
+    g_workspace.back().bounds = {300, 600, 400, 700};
+    g_workspace.push_back({20, -1, 1, 2, {0, 700, 400, 800}, "com.miui.home:id/hotseat", ""});
+    for (int32_t column = 0; column < 4; ++column) {
+        g_workspace.push_back({21 + column, 20, 1, 2,
+                {column * 100, 700, (column + 1) * 100, 800},
+                "com.miui.home:id/icon_icon", "底栏"});
+    }
+    rebuildSlots();
+    require(g_grid_columns.load() == 4 && g_grid_rows.load() == 7
+                    && g_grid_cells.size() == 28 && g_hotseat_cells.size() == 4,
+            "the current four-column seven-row grid was truncated or merged with the dock");
+    const int32_t empty = virtualNodeAt(150, 650);
+    require(isVirtualNode(empty) && !hotseatVirtualNode(empty)
+                    && virtualNodeDescription(empty) == "移至第 7 行第 2 列",
+            "the seventh row lost its touch target or physical coordinates");
+    require(!isVirtualNode(virtualNodeAt(350, 650))
+                    && gridNodeAtCellLocked(6, 3) == 13,
+            "the occupied seventh-row icon was exposed as an empty cell");
+    require(std::all_of(g_grid_cells.begin(), g_grid_cells.end(), [](const auto &cell) {
+        return cell.bounds.bottom <= 700;
+    }) && std::none_of(g_slots.begin(), g_slots.end(), [](const auto &slot) {
+        return !slot.hotseat && slot.row >= 7;
+    }), "the dock created an eighth desktop row");
+}
+
 void widgetCellsAndTouchGapsAreHandled() {
     prepareGrid();
     SnapshotFavorite widget;
@@ -1493,6 +1526,125 @@ void captureDispatch(uint32_t operation, int64_t, const uint8_t *bytes, uint32_t
     std::free(const_cast<uint8_t *>(bytes));
     endPendingPlacement();
     throw CapturedDispatch{}; // Stop before the asynchronous database confirmation.
+}
+
+void recent8593UsesVerifiedFrbWire() {
+    struct Cleanup {
+        uint32_t capabilities = g_capabilities.load();
+        LauncherAbiProfile profile = g_launcher_profile.load();
+        bool ready = g_launcher_fingerprint_ready.load();
+        bool compatible = g_launcher_system_compatible.load();
+        FrbDispatcherFn dispatcher = g_frb_dispatcher;
+        LauncherLaunchSoscFn split = g_launcher_launch_sosc;
+        LauncherStartFreeformFn freeform = g_launcher_start_freeform;
+        ComponentNameNewFn component = g_component_name_new;
+        ~Cleanup() {
+            g_capabilities.store(capabilities);
+            g_launcher_profile.store(profile);
+            g_launcher_fingerprint_ready.store(ready);
+            g_launcher_system_compatible.store(compatible);
+            g_frb_dispatcher = dispatcher;
+            g_launcher_launch_sosc = split;
+            g_launcher_start_freeform = freeform;
+            g_component_name_new = component;
+        }
+    } cleanup;
+    static std::vector<uint32_t> operations;
+    operations.clear();
+    g_frb_dispatcher = +[](uint32_t operation, int64_t port,
+            const uint8_t *bytes, uint32_t size, uint32_t capacity) {
+        operations.push_back(operation);
+        dispatched.assign(bytes, bytes + size);
+        std::free(const_cast<uint8_t *>(bytes));
+        require(port == 0 && capacity == size, "FRB ownership envelope changed");
+    };
+    g_launcher_launch_sosc = nullptr;
+    g_launcher_start_freeform = nullptr;
+    g_component_name_new = nullptr;
+    g_launcher_profile.store(LauncherAbiProfile::kCurrent8593);
+    g_launcher_fingerprint_ready.store(true);
+    g_launcher_system_compatible.store(true);
+    g_capabilities.store(CAP_FRB_MODEL);
+    const AppTarget target{"com.example", u8"Main界", "", 999};
+    constexpr int32_t task = 0x01020304;
+    // Literal SSE bytes: two bare UTF-8 Strings, task, user, then true.
+    const std::vector<uint8_t> freeformWire{
+        11, 0, 0, 0, 'c', 'o', 'm', '.', 'e', 'x', 'a', 'm', 'p', 'l', 'e',
+        7, 0, 0, 0, 'M', 'a', 'i', 'n', 0xe7, 0x95, 0x8c,
+        4, 3, 2, 1, 0xe7, 3, 0, 0, 1};
+    require(performDirectRecentAction(kRecentFreeformAction, target, task)
+                    && operations == std::vector<uint32_t>{1026} && dispatched == freeformWire,
+            "8593 freeform did not submit the verified UTF-8 wire");
+    require(performDirectRecentAction(kRecentSplitAction, target, task)
+                    && operations == std::vector<uint32_t>({1026, 792})
+                    && dispatched == std::vector<uint8_t>({4, 3, 2, 1}),
+            "8593 split did not submit exactly one task id");
+    for (int field = 0; field < 3; ++field) {
+        AppTarget invalid = target;
+        if (field == 0) invalid.package.clear();
+        if (field == 1) invalid.activity.clear();
+        if (field == 2) invalid.user = -1;
+        require(!performDirectRecentAction(kRecentFreeformAction, invalid, task),
+                "incomplete freeform identity was submitted");
+    }
+    require(!performDirectRecentAction(kRecentFreeformAction, target, -1)
+                    && !performDirectRecentAction(kRecentSplitAction, target, -1)
+                    && !performDirectRecentAction(kRecentCloseAction, target, task)
+                    && operations.size() == 2,
+            "an invalid task or unrelated recent action reached FRB");
+    auto rejectBoth = [&] {
+        require(!performDirectRecentAction(kRecentFreeformAction, target, task)
+                        && !performDirectRecentAction(kRecentSplitAction, target, task)
+                        && operations.size() == 2,
+                "unverified recent capability reached FRB or reported success");
+    };
+    g_launcher_fingerprint_ready.store(false);
+    rejectBoth();
+    g_launcher_fingerprint_ready.store(true);
+    g_launcher_system_compatible.store(false);
+    rejectBoth();
+    g_launcher_system_compatible.store(true);
+    g_capabilities.store(0);
+    rejectBoth();
+    g_capabilities.store(CAP_FRB_MODEL);
+    g_launcher_profile.store(LauncherAbiProfile::kUnknown);
+    rejectBoth();
+    g_launcher_profile.store(LauncherAbiProfile::kCurrent8593);
+    WireWriter emptyString;
+    require(emptyString.putString("") && emptyString.bytes == std::vector<uint8_t>({0, 0, 0, 0}),
+            "a bare empty string gained an Option tag");
+    require(!dispatchWire(0, {1}) && !dispatchWire(1026, {}) && operations.size() == 2,
+            "empty wire or zero operation was dispatched");
+    g_frb_dispatcher = nullptr;
+    rejectBoth();
+    require(!dispatchWire(792, {4, 3, 2, 1}), "missing dispatcher reported submission");
+
+    static int legacyCalls;
+    legacyCalls = 0;
+    g_launcher_launch_sosc = +[](int32_t taskId) {
+        require(taskId == task, "legacy split task changed");
+        ++legacyCalls;
+    };
+    g_component_name_new = +[](const char *package, size_t packageSize,
+            const char *activity, size_t activitySize) -> void * {
+        require(std::string(package, packageSize) == "com.example"
+                        && std::string(activity, activitySize) == u8"Main界",
+                "legacy component identity changed");
+        return reinterpret_cast<void *>(1);
+    };
+    g_launcher_start_freeform = +[](void *component, int32_t taskId, int32_t user, int32_t flag) {
+        require(component == reinterpret_cast<void *>(1) && taskId == task && user == 999 && flag == 1,
+                "legacy freeform ABI changed");
+        ++legacyCalls;
+        return true;
+    };
+    rejectBoth();
+    require(legacyCalls == 0, "8593 fell back to the incompatible ComponentName helper");
+    g_launcher_profile.store(LauncherAbiProfile::kLegacy7722);
+    require(performDirectRecentAction(kRecentFreeformAction, target, task)
+                    && performDirectRecentAction(kRecentSplitAction, target, task)
+                    && legacyCalls == 2 && operations.size() == 2,
+            "the existing legacy recent helpers stopped working");
 }
 
 void emptyMoveRejectsOutOfGridDestination() {
@@ -1701,6 +1853,7 @@ void placementKeepsNodesObservedDuringDispatch() {
 void currentEmptyPlacementCommitsBeforeVerification() {
     checkPlacementAfterReload(false, false, LauncherAbiProfile::kCurrent8565);
     checkPlacementAfterReload(false, false, LauncherAbiProfile::kCurrent8584);
+    checkPlacementAfterReload(false, false, LauncherAbiProfile::kCurrent8593);
 }
 
 void cancelRemovesVirtualGridAndFocus() {
@@ -2421,6 +2574,7 @@ int main() {
         {"folder reordering preserves unrelated member order", folderReorderPreservesUnmovedMembers},
         {"sparse ItemInfo preserves the verified 75-byte wire layout", sparseItemInfoKeepsTheVerifiedWireLayout},
         {"folder ItemInfo encodes UTF-8 title/label and all 35 fields", folderItemInfoEncodesUtf8TitleAndLabel},
+        {"8593 recent actions use verified FRB bytes and reject unavailable capabilities", recent8593UsesVerifiedFrbWire},
         {"folder identity uses visible members to disambiguate", folderIdentityUsesVisibleMembersToDisambiguate},
         {"folder identity ignores icons outside the open grid", folderIdentityIgnoresIconsOutsideTheOpenGrid},
         {"folder refresh stops touch input after cancellation", folderRefreshInputStopsAfterCancellation},
@@ -2440,6 +2594,7 @@ int main() {
         {"touch empty cell reads coordinates", touchingEmptyCellReadsItsCoordinates},
         {"hover exit preserves double tap target", liftingFingerKeepsDoubleTapTarget},
         {"actual six-row layout has no phantom seventh row", launcherDimensionsOverrideOldSeventhRow},
+        {"actual seven-row layout keeps all 28 cells separate from the dock", sevenRowGridUsesLauncherDimensions},
         {"widget spans and cell touch boundaries", widgetCellsAndTouchGapsAreHandled},
         {"native hover handoff and event ABI", touchHookUsesEventArgumentAndHandsBackOccupiedCells},
         {"raw touch handoff exposes virtual cells", rawTouchHookFindsVirtualCells},

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify offline 7748/8565 ARM64 launcher contracts and optional 7748 semantics ABI.
+"""Verify offline 7748/8565/8584/8593 launcher contracts and optional 7748 semantics ABI.
 
 Uses only Python's standard library and a caller-selected llvm-nm executable.
 This never loads the shared library, talks to a device, or infers a new runtime profile.
@@ -237,6 +237,7 @@ def import_at_plt(elf, imports, address):
 
 
 WIRE_PREFIX = "app_launcher::frb_generated::wire__crate__api__launcher_model__launcher_model_"
+RECENTS_WIRE_PREFIX = "app_launcher::frb_generated::wire__crate__api__recents__recents_menu_api__"
 DISPATCHER_IMPL = "app_launcher::frb_generated::pde_ffi_dispatcher_primary_impl"
 RELOAD = "<app_launcher::launcher::data::launcher_model_internal::LauncherModelInternal>::maybe_trigger_workspace_reload"
 DECODE = " as app_launcher::frb_generated::SseDecode>::sse_decode"
@@ -295,6 +296,20 @@ BASELINES = {
              "focus": 0x776420, "key": 0x98058c, "key_caller": 0x761694,
              "key_caller_v2": 0x761fd0, "back": 0x729d14, "back_call": 0x70910c,
              "redirect": 0x6b57f4, "back_motion": 0x707a04, "back_motion_size": 0x2100,
+             "invoke_gate_load": 0x584},
+    "8593": {"export": 0x9c4f70, "dispatcher": 0x7fa600, "move": 834, "batch": 858,
+             "reload": 0x7b02a0, "move_target": 0x887cbc, "batch_target": 0x8a7ddc,
+             "insert": 830, "insert_target": 0x8823b0, "delete": 821, "delete_target": 0x8819a0,
+             "freeform": 1026, "freeform_target": 0x885e94, "split": 792, "split_target": 0x8a4138,
+             "grid_x": 0x6cd790, "grid_y": 0x6cd83c,
+             "grid_x_load": 0xb942a920, "grid_y_load": 0xb942ad20,
+             "motion": 0xd482e0, "motion_caller": 0x763e44, "motion_caller_v2": 0x764204,
+             "motion_v2_call_offset": 0x28,
+             "motion_cancel_symbol": "<app_launcher::recents::gesture::gesture_input_monitor::GestureInputMonitor>::give_up_gesture_for_accessibility",
+             "motion_cancel_clone_offset": 0xe4,
+             "focus": 0x778420, "key": 0x980dc0, "key_caller": 0x7634fc,
+             "key_caller_v2": 0x763e38, "back": 0x729ed4, "back_call": 0x7092cc,
+             "redirect": 0x6b5c10, "back_motion": 0x707bc4, "back_motion_size": 0x2100,
              "invoke_gate_load": 0x584},
 }
 
@@ -446,7 +461,7 @@ def verify_motion_contract(elf, symbols, baseline):
             and branch_target(delegate + 0x54, elf.words(delegate + 0x54, 1)[0]) == accessibility,
             "SceneDelegate no longer forwards its event to AccessibilityPlugin")
     callers = {}
-    for suffix, call_offset in (("", 0x1c), ("_v2", 0x24)):
+    for suffix, call_offset in (("", 0x1c), ("_v2", baseline.get("motion_v2_call_offset", 0x24))):
         matches = [name for name in symbols
                    if name.startswith("<hyper_os_ui::scene::ffi::FfiUi_trait::FfiUi_MV<")
                    and "PlatformScene<app_launcher::launcher::components::ui::launcher_ui::LauncherUi>" in name
@@ -458,12 +473,13 @@ def verify_motion_contract(elf, symbols, baseline):
                 and branch_target(caller + call_offset, elf.words(caller + call_offset, 1)[0], True) == address,
                 "LauncherUi caller no longer forwards its event x2 into shared entry x1")
         callers["on_motion_event" + suffix] = {"address": hex(caller), "call": hex(caller + call_offset)}
-    cancel = symbol(symbols, MOTION_CANCEL)[0]
-    require(elf.words(cancel + 0x40, 2) == (0x52800061, 0xaa0003f6),
+    cancel = symbol(symbols, baseline.get("motion_cancel_symbol", MOTION_CANCEL))[0]
+    clone_call = cancel + baseline.get("motion_cancel_clone_offset", 0x3c)
+    require(elf.words(clone_call + 4, 2) == (0x52800061, 0xaa0003f6),
             "Motion clone/setAction call no longer forwards the clone result and i32 action")
     import_calls = {
-        "input_MotionEvent_clone": (cancel + 0x3c, True, "void* (void*)"),
-        "input_MotionEvent_setAction": (cancel + 0x48, True, "void (void*, i32)"),
+        "input_MotionEvent_clone": (clone_call, True, "void* (void*)"),
+        "input_MotionEvent_setAction": (clone_call + 12, True, "void (void*, i32)"),
         "input_MotionEvent_drop": (baseline["motion_caller"] + 0x54, False, "void (void*)"),
     }
     import_evidence = {}
@@ -593,14 +609,17 @@ def verify(sample, llvm_nm, profile, batch_op=None, move_op=None, flutter=None):
             "Dispatcher export does not branch to its exact implementation symbol")
     table = dispatcher_table(elf, dispatcher)
     operations = {}
-    operation_specs = [("batch", "update_item_database_batch_impl", batch_op),
-                       ("move", "move_item_in_database_impl", move_op)]
+    operation_specs = [("batch", WIRE_PREFIX + "update_item_database_batch_impl", batch_op),
+                       ("move", WIRE_PREFIX + "move_item_in_database_impl", move_op)]
     for kind in ("insert", "delete"):
         if kind in baseline:
-            operation_specs.append((kind, kind + "_item_database_impl", None))
-    for kind, suffix, override in operation_specs:
+            operation_specs.append((kind, WIRE_PREFIX + kind + "_item_database_impl", None))
+    for kind, suffix in (("freeform", "start_free_form_activity_impl"),
+                         ("split", "launch_sosc_multi_window_task_impl")):
+        if kind in baseline:
+            operation_specs.append((kind, RECENTS_WIRE_PREFIX + suffix, None))
+    for kind, expected_name, override in operation_specs:
         operation = baseline[kind] if override is None else override
-        expected_name = WIRE_PREFIX + suffix
         expected_address = symbol(symbols, expected_name)[0]
         require(expected_address == baseline[kind + "_target"],
                 f"{kind} symbol does not match selected baseline")
@@ -651,6 +670,26 @@ def verify(sample, llvm_nm, profile, batch_op=None, move_op=None, flutter=None):
                 f"{kind} wire must call end immediately after ItemInfo decoding")
         single_item_database[kind] = {"type": "ItemInfo", "call": hex(item_call),
                                       "decoder": hex(item[0]), "end_call": hex(item_call + 8)}
+    recent_arguments = {}
+    end = symbol(symbols, DESERIALIZER_END)[0]
+    for kind, types, names in (
+            ("freeform", ["alloc::string::String", "alloc::string::String", "i32", "i32", "bool"],
+             ["package", "activity", "taskId", "userId", "flag"]),
+            ("split", ["i32"], ["taskId"])):
+        if kind not in operations:
+            continue
+        calls = direct_calls(elf, symbol(symbols, operations[kind]["symbol"]))
+        decoded = [(call, target) for call, target in calls if target in decoder_addresses or target == end]
+        expected = [symbol(symbols, "<" + item_type + DECODE)[0] for item_type in types] + [end]
+        require([target for _, target in decoded] == expected,
+                f"{kind} wire must decode {', '.join(types)} then end, with no extra arguments")
+        first = calls.index(decoded[0])
+        require(calls[first:first + len(expected)] == decoded,
+                f"{kind} argument decoding must end before other calls")
+        recent_arguments[kind] = {
+            "arguments": [{"name": name, "type": item_type, "call": hex(call), "decoder": hex(target)}
+                          for name, item_type, (call, target) in zip(names, types, decoded)],
+            "end_call": hex(decoded[-1][0])}
     grid_getters = {}
     for axis in ("x", "y"):
         name = GRID_GETTER_PREFIX + axis
@@ -685,7 +724,8 @@ def verify(sample, llvm_nm, profile, batch_op=None, move_op=None, flutter=None):
             "decoder": {"vector": hex(vector[0]), "item": hex(item[0]), "count_type": "i32",
                         "move_arguments": move_arguments, "move_tail_bytes": 20,
                         "move_end_call": hex(decode_calls[-1][0]),
-                        "single_item_database": single_item_database},
+                        "single_item_database": single_item_database,
+                        "recent_arguments": recent_arguments},
             "grid_getters": grid_getters,
             "system_click": {"address": hex(sound_address), "effect": 0, "user_option": 1,
                              "import": "audio_manager_play_sound_effect"},
@@ -724,6 +764,8 @@ def main():
         print("  move wire: ItemInfo + i64 container + i32 screen + i32 cellX + i32 cellY (20-byte tail)")
         if evidence["decoder"]["single_item_database"]:
             print("  insert/delete wire: exactly one ItemInfo, then end; no vector count or tail")
+        if evidence["decoder"]["recent_arguments"]:
+            print("  recents wire: freeform String package/activity + i32 task/user + bool; split i32 task; exact end verified")
         print(f"  grid getters: x {evidence['grid_getters']['x']['address']}, y {evidence['grid_getters']['y']['address']}; i32 () verified")
         print(f"  system click: {evidence['system_click']['address']}; effect 0 / current-user Option 1 to public audio API verified")
         print(f"  motion: {evidence['motion']['address']}; void (scene*, event*) with event x1; LauncherUi callers and clone/setAction/drop imports verified")

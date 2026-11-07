@@ -1026,6 +1026,9 @@ LauncherWorkspaceReloadFn resolveWorkspaceReloadForProfile(
         case LauncherAbiProfile::kCurrent8584:
             offset = 0x7ae2a8;
             break;
+        case LauncherAbiProfile::kCurrent8593:
+            offset = 0x7b02a0;
+            break;
         case LauncherAbiProfile::kUnknown:
             return nullptr;
     }
@@ -1070,6 +1073,9 @@ void resolveGridCounts(LauncherAbiProfile profile) {
     } else if (profile == LauncherAbiProfile::kCurrent8584) {
         offsetX = 0x6cd5d0;
         offsetY = 0x6cd67c;
+    } else if (profile == LauncherAbiProfile::kCurrent8593) {
+        offsetX = 0x6cd790;
+        offsetY = 0x6cd83c;
     } else if (profile == LauncherAbiProfile::kLegacy7748) {
         offsetX = 0x6c5a74;
         offsetY = 0x6c5b20;
@@ -1823,7 +1829,8 @@ void ensureDiagnosticsWorker() {
     const auto profile = g_launcher_profile.load();
     if (profile != LauncherAbiProfile::kLegacy7748
             && profile != LauncherAbiProfile::kCurrent8565
-            && profile != LauncherAbiProfile::kCurrent8584) return;
+            && profile != LauncherAbiProfile::kCurrent8584
+            && profile != LauncherAbiProfile::kCurrent8593) return;
     void *runtime = g_runtime_shared_address.load(std::memory_order_acquire);
     if (runtime == nullptr || g_original_content_resolver_new == nullptr
             || g_content_resolver_delete == nullptr || g_content_resolver_call == nullptr
@@ -2384,6 +2391,7 @@ const char *launcherAbiProfileName(LauncherAbiProfile profile) {
         case LauncherAbiProfile::kLegacy7748: return "8.01.02.7748";
         case LauncherAbiProfile::kCurrent8565: return "8.01.02.8565";
         case LauncherAbiProfile::kCurrent8584: return "8.01.02.8584";
+        case LauncherAbiProfile::kCurrent8593: return "8.01.02.8593";
         case LauncherAbiProfile::kUnknown: return "unknown";
     }
     return "unknown";
@@ -2652,6 +2660,12 @@ struct WireWriter {
     void none() { put8(0); }
     void someI32(int32_t value) { put8(1); put32(value); }
     void someI64(int64_t value) { put8(1); put64(value); }
+    bool putString(const std::string &value) {
+        if (value.size() > static_cast<size_t>(std::numeric_limits<int32_t>::max())) return false;
+        put32(static_cast<int32_t>(value.size()));
+        bytes.insert(bytes.end(), value.begin(), value.end());
+        return true;
+    }
     void someString(const std::string &value) {
         put8(1);
         put32(static_cast<int32_t>(value.size()));
@@ -2659,15 +2673,17 @@ struct WireWriter {
     }
 };
 
-void dispatchWire(uint32_t operation, const std::vector<uint8_t> &bytes) {
-    if (g_frb_dispatcher == nullptr || bytes.empty()) return;
+bool dispatchWire(uint32_t operation, const std::vector<uint8_t> &bytes) {
+    if (operation == 0 || g_frb_dispatcher == nullptr || bytes.empty()
+            || bytes.size() > std::numeric_limits<uint32_t>::max()) return false;
     // The FRB dispatcher takes ownership of its byte buffer. Give it a
     // detached allocation instead of a std::vector buffer it would double-free.
     auto *owned = static_cast<uint8_t *>(std::malloc(bytes.size()));
-    if (owned == nullptr) return;
+    if (owned == nullptr) return false;
     std::memcpy(owned, bytes.data(), bytes.size());
     auto size = static_cast<uint32_t>(bytes.size());
     g_frb_dispatcher(operation, 0, owned, size, size);
+    return true;
 }
 
 void appendSparseItemInfo(WireWriter &wire, const FavoritePlacement &source,
@@ -2715,7 +2731,8 @@ bool liftNeedsNativeBack() {
     const auto profile = g_launcher_profile.load(std::memory_order_acquire);
     return (profile == LauncherAbiProfile::kLegacy7748
                     || profile == LauncherAbiProfile::kCurrent8565
-                    || profile == LauncherAbiProfile::kCurrent8584)
+                    || profile == LauncherAbiProfile::kCurrent8584
+                    || profile == LauncherAbiProfile::kCurrent8593)
             && g_launcher_fingerprint_ready.load(std::memory_order_acquire)
             && g_launcher_system_compatible.load(std::memory_order_acquire)
             && g_original_back_motion != nullptr && g_original_launcher_back != nullptr
@@ -5739,7 +5756,8 @@ void onLauncherBackMotion(void *window, void *event) {
 
 void installLauncherLifecycleHooks(LauncherAbiProfile profile) {
     const bool current = profile == LauncherAbiProfile::kCurrent8565
-            || profile == LauncherAbiProfile::kCurrent8584;
+            || profile == LauncherAbiProfile::kCurrent8584
+            || profile == LauncherAbiProfile::kCurrent8593;
     if ((!current && profile != LauncherAbiProfile::kLegacy7748)
             || !g_launcher_fingerprint_ready.load() || !g_launcher_system_compatible.load()
             || g_api == nullptr || g_api->hook_func == nullptr) {
@@ -5780,11 +5798,14 @@ void installLauncherLifecycleHooks(LauncherAbiProfile profile) {
                 "Launcher %s hook result=%d", name, result);
         return result == 0 ? backup : nullptr;
     };
-    const uintptr_t focusOffset = profile == LauncherAbiProfile::kCurrent8584
+    const uintptr_t focusOffset = profile == LauncherAbiProfile::kCurrent8593 ? 0x778420
+            : profile == LauncherAbiProfile::kCurrent8584
             ? 0x776420 : current ? 0x772360 : 0x757b34;
-    const uintptr_t keyOffset = profile == LauncherAbiProfile::kCurrent8584
+    const uintptr_t keyOffset = profile == LauncherAbiProfile::kCurrent8593 ? 0x980dc0
+            : profile == LauncherAbiProfile::kCurrent8584
             ? 0x98058c : current ? 0x97a484 : 0x9736ec;
-    const uintptr_t backOffset = profile == LauncherAbiProfile::kCurrent8584
+    const uintptr_t backOffset = profile == LauncherAbiProfile::kCurrent8593 ? 0x729ed4
+            : profile == LauncherAbiProfile::kCurrent8584
             ? 0x729d14 : current ? 0x725c54 : 0x720ffc;
     g_original_launcher_focus = reinterpret_cast<LauncherFocusFn>(install(
             focusOffset, focusCheck, sizeof(focusPrologue),
@@ -5797,12 +5818,14 @@ void installLauncherLifecycleHooks(LauncherAbiProfile profile) {
     g_original_launcher_back = reinterpret_cast<LauncherBackFn>(install(
             backOffset, backCheck, sizeof(inputPrologue),
             reinterpret_cast<void *>(&onLauncherBack), "back gesture"));
-    const uintptr_t redirectOffset = profile == LauncherAbiProfile::kCurrent8584
+    const uintptr_t redirectOffset = profile == LauncherAbiProfile::kCurrent8593 ? 0x6b5c10
+            : profile == LauncherAbiProfile::kCurrent8584
             ? 0x6b57f4 : current ? 0x6b1978 : 0x6ae0d8;
     g_original_launcher_redirect = reinterpret_cast<LauncherRedirectFn>(install(
             redirectOffset, redirectPrologue, sizeof(redirectPrologue),
             reinterpret_cast<void *>(&onLauncherRedirect), "back redirect"));
-    const uintptr_t backMotionOffset = profile == LauncherAbiProfile::kCurrent8584
+    const uintptr_t backMotionOffset = profile == LauncherAbiProfile::kCurrent8593 ? 0x707bc4
+            : profile == LauncherAbiProfile::kCurrent8584
             ? 0x707a04 : current ? 0x7039c0 : 0x6fe948;
     g_original_back_motion = reinterpret_cast<LauncherMotionFn>(install(
             backMotionOffset, backMotionPrologue, sizeof(backMotionPrologue),
@@ -6071,6 +6094,30 @@ bool resolveRecentTaskId(void *provider, int32_t nodeId, const std::string &labe
 
 bool performDirectRecentAction(int32_t actionId, const AppTarget &target, int32_t taskId) {
     if (taskId < 0) return false;
+    const auto profile = g_launcher_profile.load(std::memory_order_acquire);
+    if (profile == LauncherAbiProfile::kCurrent8593) {
+        const uint32_t operation = actionId == kRecentSplitAction ? recentSplitOperation(profile)
+                : actionId == kRecentFreeformAction ? recentFreeformOperation(profile) : 0U;
+        if (operation == 0 || !g_launcher_fingerprint_ready.load(std::memory_order_acquire)
+                || !g_launcher_system_compatible.load(std::memory_order_acquire)
+                || (g_capabilities.load(std::memory_order_acquire) & CAP_FRB_MODEL) == 0) return false;
+        WireWriter wire;
+        if (actionId == kRecentFreeformAction
+                && (target.package.empty() || target.activity.empty() || target.user < 0
+                    || !wire.putString(target.package) || !wire.putString(target.activity))) return false;
+        wire.put32(taskId);
+        if (actionId == kRecentFreeformAction) {
+            wire.put32(target.user);
+            wire.put8(1);
+        }
+        // ponytail: use the verified wire; the direct helper consumes two Rust Strings,
+        // not the opaque ComponentName handle. Submission is not a completion signal.
+        const bool submitted = dispatchWire(operation, wire.bytes);
+        nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
+                "recent wire op=%u task=%d package=%s submitted=%d", operation, taskId,
+                target.package.c_str(), submitted ? 1 : 0);
+        return submitted;
+    }
     if (actionId == kRecentSplitAction && g_launcher_launch_sosc != nullptr) {
         nativeLog(ANDROID_LOG_INFO, "ActionGridNative",
                 "recent split task=%d package=%s", taskId, target.package.c_str());
@@ -6997,7 +7044,8 @@ void playSystemClickIfNeeded(uint64_t before) {
 void installSystemSoundHook(LauncherAbiProfile profile) {
     if ((profile != LauncherAbiProfile::kLegacy7748
             && profile != LauncherAbiProfile::kCurrent8565
-            && profile != LauncherAbiProfile::kCurrent8584)
+            && profile != LauncherAbiProfile::kCurrent8584
+            && profile != LauncherAbiProfile::kCurrent8593)
             || g_api == nullptr || g_api->hook_func == nullptr
             || g_system_sound_hook_attempted.load()) return;
     ElfFingerprint fingerprint{};
@@ -7513,6 +7561,7 @@ void resolveLauncherApis(void *handle) {
     }
     const uintptr_t motionOffset = profile == LauncherAbiProfile::kCurrent8565 ? 0xd40fd8
             : profile == LauncherAbiProfile::kCurrent8584 ? 0xd47844
+            : profile == LauncherAbiProfile::kCurrent8593 ? 0xd482e0
             : profile == LauncherAbiProfile::kLegacy7748 ? 0xd37904 : 0;
     if (motionOffset != 0 && g_launcher_fingerprint_ready.load()
             && !g_launcher_motion_hook_attempted.exchange(true)
