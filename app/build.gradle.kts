@@ -11,9 +11,11 @@ android {
         applicationId = "io.github.jiangjinyue2333.actiongrid"
         minSdk = 34
         targetSdk = 37
-        versionCode = 34
-        versionName = "0.4.18"
-        testInstrumentationRunner = "io.github.jiangjinyue2333.actiongrid.diagnostics.DiagnosticsInstrumentation"
+        versionCode = 35
+        versionName = "0.4.19"
+        testInstrumentationRunner = providers.gradleProperty("testRunner").getOrElse(
+            "io.github.jiangjinyue2333.actiongrid.diagnostics.DiagnosticsInstrumentation"
+        )
 
         externalNativeBuild {
             ndkBuild {

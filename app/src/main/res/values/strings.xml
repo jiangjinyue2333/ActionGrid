@@ -34,6 +34,13 @@
     <string name="back_to_status">返回运行状态</string>
     <string name="source_repository">GitHub 源码仓库</string>
     <string name="source_repository_unavailable">无法打开 GitHub 源码仓库</string>
+    <string name="hide_launcher_icon">隐藏桌面图标</string>
+    <string name="launcher_icon_visible">桌面图标处于显示状态。隐藏后，可从 LSPosed → ActionGrid → 模块设置打开并恢复。</string>
+    <string name="launcher_icon_hidden">桌面图标已设为隐藏。可从 LSPosed → ActionGrid → 模块设置打开并恢复，模块功能不受影响。</string>
+    <string name="hide_launcher_icon_confirmation">将隐藏 ActionGrid 在桌面和应用抽屉中的启动图标。隐藏后，可从 LSPosed → ActionGrid → 模块设置重新打开并恢复，模块功能不受影响。桌面显示可能稍后刷新；恢复后图标位置由桌面决定。</string>
+    <string name="hide_launcher_icon_confirm">隐藏</string>
+    <string name="launcher_icon_change_failed">修改桌面图标设置失败，请重试。</string>
+    <string name="launcher_icon_read_failed">暂时无法读取桌面图标状态，请重新打开此页面后重试。</string>
     <string name="logging">记录日志</string>
     <string name="logging_summary">记录桌面操作和异常，自动保留最近日志。出问题后直接点“发送日志”，无需连接电脑。日志可能包含应用名称；关闭记录会清除日志。</string>
     <string name="logging_connection_status">原生桌面日志：%1$s</string>

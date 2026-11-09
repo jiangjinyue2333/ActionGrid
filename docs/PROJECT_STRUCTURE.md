@@ -62,6 +62,7 @@ ActionGrid/
 - `scripts/verify-launcher-contract.py` 从指定桌面 ELF 的真实跳转表验证 FRB 操作号、刷新入口及 `Vec<ItemInfo>` 解码调用链，证据见 `docs/LAUNCHER_7748_ABI.md`；不用于运行时猜测新接口。
 - 应用最低支持 Android 14，目标版本为 Android 17。
 - 关于页显示作者，并通过明确按钮打开 GitHub 源码仓库。
+- 关于页的“隐藏桌面图标”仅切换 `LauncherAlias`；`MainActivity` 保留 `INFO` 和 LSPosed 模块设置入口。组件状态由系统持久化，恢复时不保证原图标位置。
 - `UpdateSource` / `UpdateClient` / `UpdateState` 管理 GitHub 与 GitCode 更新来源；关于页显示当前来源并以原生单选对话框切换。GitHub 正式工作流用 `scripts/create-update-manifest.ps1` 从已验证 APK 生成 `latest.json` 并作为 Release 资产上传。
 - `README.md` 记录当前支持范围、7748/8584 的真机验证边界、仅澎湃 3 的页码开关和其他桌面版本的能力降级。当前工作区的任意页翻页、图标/文件夹移动及焦点验证见 `docs/DEVICE_VALIDATION_2026-10-25.md`。
 
@@ -80,3 +81,5 @@ ActionGrid/
    随后运行 `scripts/test-native-policy.ps1` 和 `scripts/test-apk-abi.ps1 -ApkPath app/build/outputs/apk/release/app-release-unsigned.apk`。
 3. 对签名包运行 `scripts/verify-release.ps1 -ApkPath <apk>`。
 4. 检查 `git status`，确认构建产物和本机文件未进入版本控制。
+
+桌面图标设备回归：运行 `gradlew.bat :app:assembleDebug :app:assembleDebugAndroidTest "-PtestRunner=io.github.jiangjinyue2333.actiongrid.LauncherIconInstrumentation"`，在测试设备安装生成的 debug APK 和 androidTest APK，然后执行 `adb -s <设备> shell am instrument -w io.github.jiangjinyue2333.actiongrid.test/io.github.jiangjinyue2333.actiongrid.LauncherIconInstrumentation`。回归操作实际开关与确认框，覆盖默认显示、焦点、取消、返回、隐藏、模块设置重新打开和恢复，结束时还原原组件状态。输出另列系统 Launcher API 返回的图标数量；小米桌面实际图标、覆盖升级、设备重启和真实读屏仍需独立验收。未指定 `testRunner` 时仍使用原有诊断回归。

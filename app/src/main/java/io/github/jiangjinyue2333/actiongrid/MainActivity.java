@@ -7,6 +7,7 @@ import android.app.AlertDialog;
 import android.app.ActivityManager;
 import android.content.BroadcastReceiver;
 import android.content.ClipData;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
@@ -46,6 +47,8 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
     private static final String SOURCE_REPOSITORY_URL =
             "https://github.com/jiangjinyue2333/ActionGrid";
     private static final int NOTIFICATION_PERMISSION_REQUEST = 1002;
+    private static final ComponentName LAUNCHER_ALIAS = new ComponentName(
+            BuildConfig.APPLICATION_ID, BuildConfig.APPLICATION_ID + ".LauncherAlias");
 
     private LinearLayout statusPage;
     private LinearLayout aboutPage;
@@ -61,6 +64,8 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
     private Button selectUpdateSource;
     private TextView updateSourceSummary;
     private Switch loggingSwitch;
+    private Switch hideLauncherIcon;
+    private TextView launcherIconSummary;
     private Switch pageOrderSwitch;
     private TextView pageOrderSummary;
     private boolean updatingPageOrder;
@@ -117,6 +122,7 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
     protected void onResume() {
         super.onResume();
         refreshLogStatus();
+        refreshLauncherIcon();
         if (pendingUpdateAfterNotificationPermission != null
                 && UpdateNotification.canNotify(this)) {
             UpdateManifest pending = pendingUpdateAfterNotificationPermission;
@@ -155,6 +161,8 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
         selectUpdateSource = findViewById(R.id.select_update_source);
         updateSourceSummary = findViewById(R.id.update_source_summary);
         loggingSwitch = findViewById(R.id.logging_switch);
+        hideLauncherIcon = findViewById(R.id.hide_launcher_icon);
+        launcherIconSummary = findViewById(R.id.launcher_icon_summary);
         pageOrderSwitch = findViewById(R.id.page_order_switch);
         pageOrderSummary = findViewById(R.id.page_order_summary);
         ((TextView) findViewById(R.id.version_text)).setText(
@@ -169,6 +177,7 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
         findViewById(R.id.back_to_status).setOnClickListener(view -> showStatusPage());
         findViewById(R.id.open_source_repository)
                 .setOnClickListener(view -> openSourceRepository());
+        hideLauncherIcon.setOnClickListener(view -> changeLauncherIcon());
         loggingSwitch.setOnCheckedChangeListener((button, enabled) -> {
             if (updatingLogging) return;
             LogStore.setEnabled(this, enabled);
@@ -206,6 +215,62 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
         });
         findViewById(R.id.send_logs).setEnabled(LogStore.hasLogs(this));
         refreshUpdateSourceSummary();
+    }
+
+    private void changeLauncherIcon() {
+        boolean hidden = hideLauncherIcon.isChecked();
+        hideLauncherIcon.setChecked(!hidden);
+        if (!refreshLauncherIcon() || hidden == hideLauncherIcon.isChecked()) return;
+        if (!hidden) {
+            setLauncherIconHidden(false);
+            return;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.hide_launcher_icon)
+                .setMessage(R.string.hide_launcher_icon_confirmation)
+                .setPositiveButton(R.string.hide_launcher_icon_confirm,
+                        (dialog, which) -> setLauncherIconHidden(true))
+                .setNegativeButton(R.string.cancel, null)
+                .setOnDismissListener(dialog -> focusForAccessibility(hideLauncherIcon))
+                .show();
+    }
+
+    private boolean refreshLauncherIcon() {
+        try {
+            // ponytail: PackageManager owns persistence; no duplicate preference to synchronize.
+            boolean hidden = getPackageManager().getComponentEnabledSetting(LAUNCHER_ALIAS)
+                    == PackageManager.COMPONENT_ENABLED_STATE_DISABLED;
+            hideLauncherIcon.setChecked(hidden);
+            hideLauncherIcon.setEnabled(true);
+            launcherIconSummary.setText(hidden
+                    ? R.string.launcher_icon_hidden : R.string.launcher_icon_visible);
+            return true;
+        } catch (RuntimeException exception) {
+            hideLauncherIcon.setEnabled(false);
+            launcherIconSummary.setText(R.string.launcher_icon_read_failed);
+            LogStore.append(this, "app", "读取桌面图标状态失败 "
+                    + exception.getClass().getSimpleName());
+            return false;
+        }
+    }
+
+    private void setLauncherIconHidden(boolean hidden) {
+        try {
+            getPackageManager().setComponentEnabledSetting(LAUNCHER_ALIAS,
+                    hidden ? PackageManager.COMPONENT_ENABLED_STATE_DISABLED
+                            : PackageManager.COMPONENT_ENABLED_STATE_DEFAULT,
+                    PackageManager.DONT_KILL_APP);
+        } catch (RuntimeException exception) {
+            if (refreshLauncherIcon()) {
+                launcherIconSummary.setText(R.string.launcher_icon_change_failed);
+            }
+            LogStore.append(this, "app", "修改桌面图标状态失败 "
+                    + exception.getClass().getSimpleName());
+            return;
+        }
+        if (refreshLauncherIcon() && hideLauncherIcon.isChecked() != hidden) {
+            launcherIconSummary.setText(R.string.launcher_icon_change_failed);
+        }
     }
 
     private void confirmHomeRestart() {
@@ -467,6 +532,7 @@ public final class MainActivity extends Activity implements ActionGridApp.Servic
         showingAbout = true;
         statusPage.setVisibility(View.GONE);
         aboutPage.setVisibility(View.VISIBLE);
+        refreshLauncherIcon();
         updateIgnoredStatus();
         focusForAccessibility(findViewById(R.id.back_to_status));
     }
