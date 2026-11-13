@@ -12,6 +12,7 @@ enum class LauncherAbiProfile : uint8_t {
     kCurrent8565,
     kCurrent8584,
     kCurrent8593,
+    kCurrent9239,
 };
 
 struct ElfFingerprint {
@@ -52,6 +53,8 @@ constexpr KnownFingerprint kCurrent8584LauncherFingerprint{
         0x903dbb518fbc909bULL, 0xd492dab28e9324a7ULL};
 constexpr KnownFingerprint kCurrent8593LauncherFingerprint{
         0xcbeed432e2b66754ULL, 0x857131b8c64b7be4ULL};
+constexpr KnownFingerprint kCurrent9239LauncherFingerprint{
+        0x19ea17777ae33aeaULL, 0x537555cbb005ab82ULL};
 
 constexpr bool fingerprintMatches(const ElfFingerprint &actual, KnownFingerprint expected) {
     return actual.valid && actual.first == expected.first && actual.second == expected.second;
@@ -76,6 +79,9 @@ constexpr LauncherAbiProfile launcherAbiProfileForFingerprint(const ElfFingerpri
     if (fingerprintMatches(launcher, kCurrent8593LauncherFingerprint)) {
         return LauncherAbiProfile::kCurrent8593;
     }
+    if (fingerprintMatches(launcher, kCurrent9239LauncherFingerprint)) {
+        return LauncherAbiProfile::kCurrent9239;
+    }
     return LauncherAbiProfile::kUnknown;
 }
 
@@ -83,6 +89,14 @@ constexpr bool isLegacyLauncherProfile(LauncherAbiProfile profile) {
     return profile == LauncherAbiProfile::kLegacy7653
             || profile == LauncherAbiProfile::kLegacy7722
             || profile == LauncherAbiProfile::kLegacy7748;
+}
+
+// Home 9239+ announces workspace/Recents transitions; only verified older profiles need fallback.
+constexpr bool needsSurfaceTransitionAnnouncement(LauncherAbiProfile profile) {
+    return isLegacyLauncherProfile(profile)
+            || profile == LauncherAbiProfile::kCurrent8565
+            || profile == LauncherAbiProfile::kCurrent8584
+            || profile == LauncherAbiProfile::kCurrent8593;
 }
 
 constexpr bool knownSystemAbi(const ElfFingerprint &privateFingerprint,
@@ -99,7 +113,8 @@ constexpr bool launcherMatchesSystemAbi(LauncherAbiProfile profile,
         const ElfFingerprint &aidl, const ElfFingerprint &ui) {
     if (!knownSystemAbi(privateFingerprint, aidl, ui)) return false;
     if (profile == LauncherAbiProfile::kCurrent8565
-            || profile == LauncherAbiProfile::kCurrent8593) {
+            || profile == LauncherAbiProfile::kCurrent8593
+            || profile == LauncherAbiProfile::kCurrent9239) {
         return fingerprintMatches(aidl, kCurrentAidlFingerprint);
     }
     if (profile == LauncherAbiProfile::kCurrent8584) {
@@ -115,6 +130,7 @@ constexpr bool launcherMatchesSystemAbi(LauncherAbiProfile profile,
 }
 
 constexpr uint32_t batchMoveOperation(LauncherAbiProfile profile) {
+    if (profile == LauncherAbiProfile::kCurrent9239) return 864U;
     if (profile == LauncherAbiProfile::kLegacy7748) return 855U;
     if (profile == LauncherAbiProfile::kCurrent8584
             || profile == LauncherAbiProfile::kCurrent8593) return 858U;
@@ -124,6 +140,7 @@ constexpr uint32_t batchMoveOperation(LauncherAbiProfile profile) {
 }
 
 constexpr uint32_t singleMoveOperation(LauncherAbiProfile profile) {
+    if (profile == LauncherAbiProfile::kCurrent9239) return 840U;
     if (profile == LauncherAbiProfile::kCurrent8565) return 833U;
     if (profile == LauncherAbiProfile::kCurrent8584
             || profile == LauncherAbiProfile::kCurrent8593) return 834U;
@@ -131,6 +148,7 @@ constexpr uint32_t singleMoveOperation(LauncherAbiProfile profile) {
 }
 
 constexpr uint32_t insertItemOperation(LauncherAbiProfile profile) {
+    if (profile == LauncherAbiProfile::kCurrent9239) return 836U;
     if (profile == LauncherAbiProfile::kLegacy7748) return 827U;
     if (profile == LauncherAbiProfile::kCurrent8584
             || profile == LauncherAbiProfile::kCurrent8593) return 830U;
@@ -138,6 +156,7 @@ constexpr uint32_t insertItemOperation(LauncherAbiProfile profile) {
 }
 
 constexpr uint32_t deleteItemOperation(LauncherAbiProfile profile) {
+    if (profile == LauncherAbiProfile::kCurrent9239) return 827U;
     if (profile == LauncherAbiProfile::kLegacy7748) return 818U;
     if (profile == LauncherAbiProfile::kCurrent8584
             || profile == LauncherAbiProfile::kCurrent8593) return 821U;
@@ -147,14 +166,17 @@ constexpr uint32_t deleteItemOperation(LauncherAbiProfile profile) {
 constexpr bool supportsFolderTransactions(LauncherAbiProfile profile) {
     return profile == LauncherAbiProfile::kLegacy7748
             || profile == LauncherAbiProfile::kCurrent8584
-            || profile == LauncherAbiProfile::kCurrent8593;
+            || profile == LauncherAbiProfile::kCurrent8593
+            || profile == LauncherAbiProfile::kCurrent9239;
 }
 
 constexpr uint32_t recentFreeformOperation(LauncherAbiProfile profile) {
+    if (profile == LauncherAbiProfile::kCurrent9239) return 1033U;
     return profile == LauncherAbiProfile::kCurrent8593 ? 1026U : 0U;
 }
 
 constexpr uint32_t recentSplitOperation(LauncherAbiProfile profile) {
+    if (profile == LauncherAbiProfile::kCurrent9239) return 798U;
     return profile == LauncherAbiProfile::kCurrent8593 ? 792U : 0U;
 }
 

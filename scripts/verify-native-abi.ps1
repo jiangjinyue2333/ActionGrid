@@ -279,10 +279,11 @@ $launcherProfile = switch ($launcherFingerprintKey) {
     'd43e8de27a633a7e770a572f4b6ddfc6' { 'current8565' }
     '903dbb518fbc909bd492dab28e9324a7' { 'current8584' }
     'cbeed432e2b66754857131b8c64b7be4' { 'current8593' }
+    '19ea17777ae33aea537555cbb005ab82' { 'current9239' }
     default { throw "桌面 ELF 指纹未验证：$launcherFingerprintKey (Build ID=$dartId)" }
 }
 if ($launcherProfile -ne 'current8584' -and
-        (($systemProfile -eq 'current8565') -ne ($launcherProfile -in @('current8565', 'current8593')))) {
+        (($systemProfile -eq 'current8565') -ne ($launcherProfile -in @('current8565', 'current8593', 'current9239')))) {
     throw "系统与桌面 ABI profile 不匹配：system=$systemProfile launcher=$launcherProfile"
 }
 
@@ -314,6 +315,7 @@ $workspaceReloadOffset = switch ($launcherProfile) {
     'current8565' { [UInt64] 0x7aa050 }
     'current8584' { [UInt64] 0x7ae2a8 }
     'current8593' { [UInt64] 0x7b02a0 }
+    'current9239' { [UInt64] 0x7d4c68 }
     default { throw "没有 workspace reload profile：$launcherProfile" }
 }
 Verify-WorkspaceReloadPrologue $launcherPath $objdump $workspaceReloadOffset
@@ -399,6 +401,7 @@ foreach ($fingerprint in @(
     'd43e8de27a633a7e', '770a572f4b6ddfc6'
     '903dbb518fbc909b', 'd492dab28e9324a7'
     'cbeed432e2b66754', '857131b8c64b7be4'
+    '19ea17777ae33aea', '537555cbb005ab82'
 )) {
     if ($nativeSource -notmatch [regex]::Escape($fingerprint)) {
         throw "native_init.cpp 缺少已验证 ELF 指纹：$fingerprint"
@@ -414,7 +417,7 @@ foreach ($op in @(
         throw "缺少 HyperOS4 FRB 内部模型操作：$op"
     }
 }
-foreach ($offset in @('0x7a1660', '0x7a2008', '0x7a35a4', '0x7aa050', '0x7ae2a8', '0x7b02a0')) {
+foreach ($offset in @('0x7a1660', '0x7a2008', '0x7a35a4', '0x7aa050', '0x7ae2a8', '0x7b02a0', '0x7d4c68')) {
     if ($nativeSource -notmatch [regex]::Escape($offset)) {
         throw "native_init.cpp 缺少 workspace reload profile 偏移：$offset"
     }

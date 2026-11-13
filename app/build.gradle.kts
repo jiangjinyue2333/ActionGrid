@@ -11,8 +11,8 @@ android {
         applicationId = "io.github.jiangjinyue2333.actiongrid"
         minSdk = 34
         targetSdk = 37
-        versionCode = 35
-        versionName = "0.4.19"
+        versionCode = 36
+        versionName = "0.4.20"
         testInstrumentationRunner = providers.gradleProperty("testRunner").getOrElse(
             "io.github.jiangjinyue2333.actiongrid.diagnostics.DiagnosticsInstrumentation"
         )

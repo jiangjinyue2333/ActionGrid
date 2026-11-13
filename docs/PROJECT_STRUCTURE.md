@@ -65,6 +65,7 @@ ActionGrid/
 - 关于页的“隐藏桌面图标”仅切换 `LauncherAlias`；`MainActivity` 保留 `INFO` 和 LSPosed 模块设置入口。组件状态由系统持久化，恢复时不保证原图标位置。
 - `UpdateSource` / `UpdateClient` / `UpdateState` 管理 GitHub 与 GitCode 更新来源；关于页显示当前来源并以原生单选对话框切换。GitHub 正式工作流用 `scripts/create-update-manifest.ps1` 从已验证 APK 生成 `latest.json` 并作为 Release 资产上传。
 - `README.md` 记录当前支持范围、7748/8584 的真机验证边界、仅澎湃 3 的页码开关和其他桌面版本的能力降级。当前工作区的任意页翻页、图标/文件夹移动及焦点验证见 `docs/DEVICE_VALIDATION_2026-10-25.md`。
+- 0.4.20 新增 9239 的独立 ELF profile、操作号和原生入口，复用已验证的 current 系统配对、ItemInfo 编码和事务路径；样本及验证边界见 `docs/LAUNCHER_9239_ABI.md`。
 
 ## 签名构建
 

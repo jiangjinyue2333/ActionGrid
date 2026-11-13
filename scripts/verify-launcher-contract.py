@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify offline 7748/8565/8584/8593 launcher contracts and optional 7748 semantics ABI.
+"""Verify offline 7748/8565/8584/8593/9239 launcher contracts and optional 7748 semantics ABI.
 
 Uses only Python's standard library and a caller-selected llvm-nm executable.
 This never loads the shared library, talks to a device, or infers a new runtime profile.
@@ -311,6 +311,20 @@ BASELINES = {
              "key_caller_v2": 0x763e38, "back": 0x729ed4, "back_call": 0x7092cc,
              "redirect": 0x6b5c10, "back_motion": 0x707bc4, "back_motion_size": 0x2100,
              "invoke_gate_load": 0x584},
+    "9239": {"export": 0x9f67c8, "dispatcher": 0x8202c0, "move": 840, "batch": 864,
+             "reload": 0x7d4c68, "move_target": 0x8aec20, "batch_target": 0x8cfbc0,
+             "insert": 836, "insert_target": 0x8a9388, "delete": 827, "delete_target": 0x8a898c,
+             "freeform": 1033, "freeform_target": 0x8ace20, "split": 798, "split_target": 0x8cbe3c,
+             "grid_x": 0x6ed3f4, "grid_y": 0x6ed4a0,
+             "grid_x_load": 0xb9453920, "grid_y_load": 0xb9453d20,
+             "motion": 0xd84c18, "motion_caller": 0x787c54, "motion_caller_v2": 0x788028,
+             "motion_v2_call_offset": 0x28,
+             "motion_cancel_symbol": "<app_launcher::recents::gesture::gesture_input_monitor::GestureInputMonitor>::give_up_gesture_for_accessibility",
+             "motion_cancel_clone_offset": 0xe4,
+             "focus": 0x79c418, "key": 0x9b19a0, "key_caller": 0x78730c,
+             "key_caller_v2": 0x787c48, "back": 0x74bb8c, "back_call": 0x72a388,
+             "redirect": 0x6d5548, "back_motion": 0x728c5c, "back_motion_size": 0x2124,
+             "invoke_gate_load": 0x5ac},
 }
 
 

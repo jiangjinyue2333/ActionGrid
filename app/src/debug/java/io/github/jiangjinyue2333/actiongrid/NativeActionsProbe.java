@@ -366,7 +366,7 @@ public final class NativeActionsProbe extends Instrumentation {
             for (AccessibilityNodeInfo.AccessibilityAction action : node.getActionList()) {
                 if (action.getId() == AccessibilityNodeInfo.AccessibilityAction
                         .ACTION_CONTEXT_CLICK.getId()
-                        && "应用操作".contentEquals(action.getLabel())) {
+                        && "应用操作".contentEquals(String.valueOf(action.getLabel()))) {
                     nativeMenuVisible = true;
                 }
             }

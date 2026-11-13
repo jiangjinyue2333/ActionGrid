@@ -471,9 +471,13 @@ struct CapturedEvent {
 std::vector<CapturedEvent> events;
 // Capture only Android ABI boundaries; the hooks and state machine are production code.
 struct AccessibilityCapture {
-    AccessibilityCapture() {
+    LauncherAbiProfile previousProfile = g_launcher_profile.load();
+    explicit AccessibilityCapture(LauncherAbiProfile profile = g_launcher_profile.load()) {
+        g_launcher_profile.store(profile);
         events.clear();
         g_pending_surface_announcements.clear();
+        g_home_announcement_pending.store(false);
+        g_focus_callback_active.store(false);
         g_event_controller.store(reinterpret_cast<void *>(1));
         g_event_new = +[](int32_t type) -> void * { return new CapturedEvent{type}; };
         g_event_drop = +[](void *event) { delete static_cast<CapturedEvent *>(event); };
@@ -509,6 +513,8 @@ struct AccessibilityCapture {
         g_swallow_cancel_back_up.store(false);
     }
     ~AccessibilityCapture() {
+        g_focus_generation.fetch_add(1);
+        g_launcher_profile.store(previousProfile);
         g_event_controller.store(nullptr);
         g_event_new = nullptr; g_event_drop = nullptr;
         g_event_set_source = nullptr; g_rstring_from_utf16 = nullptr;
@@ -1123,45 +1129,68 @@ void cancelledSwipeKeepsConfirmedPage() {
 int forwardedFocus = 0, forwardedKeys = 0, forwardedBacks = 0;
 struct TestKey { int32_t code, action; int64_t downTime = 1; };
 
-void everyReturnHomeAnnouncesOnce() {
-    AccessibilityCapture capture;
-    returnedNode = testNode(10, -1, {0, 0, 400, 600}, "com.miui.home:id/screen_content", "");
-    forwardedFocus = 0;
-    g_original_launcher_focus = +[](void *, bool focused) {
-        ++forwardedFocus;
-        if (focused) restoreNativeEventController();
-    };
-    auto *window = reinterpret_cast<void *>(1);
-    // Back and Home both restore the launcher's window focus. Its cached tree persists in apps.
-    for (int iteration = 0; iteration < 10; ++iteration) {
-        onLauncherWindowFocus(window, false);
-        observeSurfaceNode(window, 10, returnedNode.data());
-        require(events.size() == static_cast<size_t>(iteration), "background cached tree announced Home");
-        onLauncherWindowFocus(window, true);
-        onCreateNode(window, 10);
-        onLauncherWindowFocus(window, true);
-        onCreateNode(window, 10);
-        require(events.size() == static_cast<size_t>(iteration + 1)
-                        && events.back().text == u"系统桌面",
-                "repeated app-to-Home return did not announce exactly once");
+constexpr std::pair<LauncherAbiProfile, bool> kSurfaceAnnouncementCases[] = {
+    {LauncherAbiProfile::kLegacy7653, true},
+    {LauncherAbiProfile::kLegacy7722, true},
+    {LauncherAbiProfile::kLegacy7748, true},
+    {LauncherAbiProfile::kCurrent8565, true},
+    {LauncherAbiProfile::kCurrent8584, true},
+    {LauncherAbiProfile::kCurrent8593, true},
+    {LauncherAbiProfile::kCurrent9239, false},
+    {LauncherAbiProfile::kUnknown, false},
+};
+
+void everyReturnHomeFollowsSpeechPolicy() {
+    for (const auto &[profile, announce] : kSurfaceAnnouncementCases) {
+        AccessibilityCapture capture(profile);
+        returnedNode = testNode(10, -1, {0, 0, 400, 600}, "com.miui.home:id/screen_content", "");
+        forwardedFocus = 0;
+        g_original_launcher_focus = +[](void *, bool focused) {
+            ++forwardedFocus;
+            if (focused) restoreNativeEventController();
+        };
+        auto *window = reinterpret_cast<void *>(1);
+        // Back and Home both restore the launcher's window focus. Its cached tree persists in apps.
+        for (int iteration = 0; iteration < 10; ++iteration) {
+            onLauncherWindowFocus(window, false);
+            observeSurfaceNode(window, 10, returnedNode.data());
+            require(events.size() == static_cast<size_t>(announce ? iteration : 0),
+                    "background cached tree announced Home");
+            onLauncherWindowFocus(window, true);
+            onCreateNode(window, 10);
+            onLauncherWindowFocus(window, true);
+            onCreateNode(window, 10);
+            require(events.size() == static_cast<size_t>(announce ? iteration + 1 : 0)
+                            && (!announce || events.back().text == u"系统桌面"),
+                    "repeated app-to-Home return ignored the launcher speech policy");
+            require(g_surface_state.load() == static_cast<int32_t>(SurfaceState::kWorkspace)
+                            && g_pending_surface_announcements.empty()
+                            && !g_home_announcement_pending.load(),
+                    "Home return left stale surface or pending speech state");
+        }
+        require(forwardedFocus == 30, "native focus lifecycle was swallowed");
     }
-    require(forwardedFocus == 30, "native focus lifecycle was swallowed");
 }
 
-void quickReturnHomeWithoutNodeQueryAnnounces() {
-    AccessibilityCapture capture;
-    forwardedFocus = 0;
-    g_original_launcher_focus = +[](void *, bool focused) {
-        ++forwardedFocus;
-        if (focused) restoreNativeEventController();
-    };
-    auto *window = reinterpret_cast<void *>(1);
-    onLauncherWindowFocus(window, false);
-    onLauncherWindowFocus(window, true);
-    std::this_thread::sleep_for(std::chrono::milliseconds(350));
-    require(std::count_if(events.begin(), events.end(), [](const auto &event) {
-        return event.type == kTypeAnnouncement && event.text == u"系统桌面";
-    }) == 1, "quick app-to-Home return without a node query missed Home speech");
+void quickReturnHomeWithoutNodeQueryFollowsSpeechPolicy() {
+    for (const auto &[profile, announce] : kSurfaceAnnouncementCases) {
+        AccessibilityCapture capture(profile);
+        forwardedFocus = 0;
+        g_original_launcher_focus = +[](void *, bool focused) {
+            ++forwardedFocus;
+            if (focused) restoreNativeEventController();
+        };
+        auto *window = reinterpret_cast<void *>(1);
+        onLauncherWindowFocus(window, false);
+        onLauncherWindowFocus(window, true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(350));
+        require(std::count_if(events.begin(), events.end(), [](const auto &event) {
+            return event.type == kTypeAnnouncement && event.text == u"系统桌面";
+        }) == (announce ? 1 : 0), "quick Home fallback ignored the launcher speech policy");
+        require(forwardedFocus == 2 && g_pending_surface_announcements.empty()
+                        && !g_home_announcement_pending.load(),
+                "quick Home return changed native focus or left pending speech");
+    }
 }
 
 void backGestureCancelsLiftAndKeepsNativeCleanup() {
@@ -1528,7 +1557,7 @@ void captureDispatch(uint32_t operation, int64_t, const uint8_t *bytes, uint32_t
     throw CapturedDispatch{}; // Stop before the asynchronous database confirmation.
 }
 
-void recent8593UsesVerifiedFrbWire() {
+void checkRecentFrbWire(LauncherAbiProfile profile, uint32_t freeformOp, uint32_t splitOp) {
     struct Cleanup {
         uint32_t capabilities = g_capabilities.load();
         LauncherAbiProfile profile = g_launcher_profile.load();
@@ -1561,7 +1590,7 @@ void recent8593UsesVerifiedFrbWire() {
     g_launcher_launch_sosc = nullptr;
     g_launcher_start_freeform = nullptr;
     g_component_name_new = nullptr;
-    g_launcher_profile.store(LauncherAbiProfile::kCurrent8593);
+    g_launcher_profile.store(profile);
     g_launcher_fingerprint_ready.store(true);
     g_launcher_system_compatible.store(true);
     g_capabilities.store(CAP_FRB_MODEL);
@@ -1573,12 +1602,12 @@ void recent8593UsesVerifiedFrbWire() {
         7, 0, 0, 0, 'M', 'a', 'i', 'n', 0xe7, 0x95, 0x8c,
         4, 3, 2, 1, 0xe7, 3, 0, 0, 1};
     require(performDirectRecentAction(kRecentFreeformAction, target, task)
-                    && operations == std::vector<uint32_t>{1026} && dispatched == freeformWire,
-            "8593 freeform did not submit the verified UTF-8 wire");
+                    && operations == std::vector<uint32_t>{freeformOp} && dispatched == freeformWire,
+            "freeform did not submit the verified UTF-8 wire");
     require(performDirectRecentAction(kRecentSplitAction, target, task)
-                    && operations == std::vector<uint32_t>({1026, 792})
+                    && operations == std::vector<uint32_t>({freeformOp, splitOp})
                     && dispatched == std::vector<uint8_t>({4, 3, 2, 1}),
-            "8593 split did not submit exactly one task id");
+            "split did not submit exactly one task id");
     for (int field = 0; field < 3; ++field) {
         AppTarget invalid = target;
         if (field == 0) invalid.package.clear();
@@ -1609,15 +1638,15 @@ void recent8593UsesVerifiedFrbWire() {
     g_capabilities.store(CAP_FRB_MODEL);
     g_launcher_profile.store(LauncherAbiProfile::kUnknown);
     rejectBoth();
-    g_launcher_profile.store(LauncherAbiProfile::kCurrent8593);
+    g_launcher_profile.store(profile);
     WireWriter emptyString;
     require(emptyString.putString("") && emptyString.bytes == std::vector<uint8_t>({0, 0, 0, 0}),
             "a bare empty string gained an Option tag");
-    require(!dispatchWire(0, {1}) && !dispatchWire(1026, {}) && operations.size() == 2,
+    require(!dispatchWire(0, {1}) && !dispatchWire(freeformOp, {}) && operations.size() == 2,
             "empty wire or zero operation was dispatched");
     g_frb_dispatcher = nullptr;
     rejectBoth();
-    require(!dispatchWire(792, {4, 3, 2, 1}), "missing dispatcher reported submission");
+    require(!dispatchWire(splitOp, {4, 3, 2, 1}), "missing dispatcher reported submission");
 
     static int legacyCalls;
     legacyCalls = 0;
@@ -1639,12 +1668,17 @@ void recent8593UsesVerifiedFrbWire() {
         return true;
     };
     rejectBoth();
-    require(legacyCalls == 0, "8593 fell back to the incompatible ComponentName helper");
+    require(legacyCalls == 0, "FRB profile fell back to the incompatible ComponentName helper");
     g_launcher_profile.store(LauncherAbiProfile::kLegacy7722);
     require(performDirectRecentAction(kRecentFreeformAction, target, task)
                     && performDirectRecentAction(kRecentSplitAction, target, task)
                     && legacyCalls == 2 && operations.size() == 2,
             "the existing legacy recent helpers stopped working");
+}
+
+void recentProfilesUseVerifiedFrbWire() {
+    checkRecentFrbWire(LauncherAbiProfile::kCurrent8593, 1026, 792);
+    checkRecentFrbWire(LauncherAbiProfile::kCurrent9239, 1033, 798);
 }
 
 void emptyMoveRejectsOutOfGridDestination() {
@@ -1854,6 +1888,7 @@ void currentEmptyPlacementCommitsBeforeVerification() {
     checkPlacementAfterReload(false, false, LauncherAbiProfile::kCurrent8565);
     checkPlacementAfterReload(false, false, LauncherAbiProfile::kCurrent8584);
     checkPlacementAfterReload(false, false, LauncherAbiProfile::kCurrent8593);
+    checkPlacementAfterReload(false, false, LauncherAbiProfile::kCurrent9239);
 }
 
 void cancelRemovesVirtualGridAndFocus() {
@@ -2357,6 +2392,63 @@ void announcementFallbackFlushesAfterControllerRecovery() {
     }) == 1, "queued lift announcement was not flushed after controller recovery");
 }
 
+void surfaceAnnouncementsOnlySupplementOlderHome() {
+    auto speechCount = [](const std::u16string &text) {
+        return std::count_if(events.begin(), events.end(), [&](const auto &event) {
+            return event.type == kTypeAnnouncement && event.text == text;
+        });
+    };
+    for (const auto &[profile, announce] : kSurfaceAnnouncementCases) {
+        for (bool delayed : {false, true}) {
+            AccessibilityCapture capture(profile);
+            prepareGrid();
+            g_launcher_window_focused.store(1);
+            if (delayed) g_event_controller.store(nullptr);
+            g_recent_snapshot_initialized = true;
+            g_recent_card_counts = {{"旧任务", 1}};
+            g_pending_recent_removals = {{"旧任务", 1}};
+            auto *provider = reinterpret_cast<void *>(1);
+            setSurfaceState(SurfaceState::kRecents, provider);
+            require(!g_lifted.load() && g_slots.empty()
+                            && !g_recent_snapshot_initialized && g_recent_card_counts.empty()
+                            && g_pending_recent_removals.empty(),
+                    "Recents speech policy skipped lift or snapshot cleanup");
+            require(speechCount(u"进入多任务界面") == (announce && !delayed ? 1 : 0)
+                            && g_pending_surface_announcements.size() == (announce && delayed ? 1U : 0U),
+                    "Recents entry speech was sent or queued for the wrong launcher");
+            g_event_controller.store(reinterpret_cast<void *>(1));
+            flushSurfaceAnnouncements();
+            setSurfaceState(SurfaceState::kRecents, provider);
+            flushSurfaceAnnouncements();
+            require(speechCount(u"进入多任务界面") == (announce ? 1 : 0),
+                    "controller recovery or repeated Recents observation changed entry speech");
+
+            std::vector<ObservedNode> cards{{55, -1, 7, 8, {0, 0, 100, 100},
+                    "", "测试程序,未加锁"}};
+            observeRecentSnapshot(provider, cards);
+            observeRecentSnapshot(provider, {});
+            observeRecentSnapshot(provider, {});
+            if (delayed) g_event_controller.store(nullptr);
+            setSurfaceState(SurfaceState::kWorkspace, provider);
+            require(speechCount(u"系统桌面") == (announce && !delayed ? 1 : 0)
+                            && g_pending_surface_announcements.size() == (announce && delayed ? 1U : 0U)
+                            && g_home_announcement_pending.load() == (announce && delayed)
+                            && !g_recent_snapshot_initialized && g_recent_card_counts.empty(),
+                    "Home entry speech or snapshot cleanup ignored the launcher policy");
+            g_event_controller.store(reinterpret_cast<void *>(1));
+            flushSurfaceAnnouncements();
+            setSurfaceState(SurfaceState::kWorkspace, provider);
+            require(speechCount(u"测试程序已清除") == 1
+                            && speechCount(u"系统桌面") == (announce ? 1 : 0)
+                            && !g_home_announcement_pending.load(),
+                    "Home speech recovery or task removal feedback changed");
+            setSurfaceState(SurfaceState::kRecents, provider);
+            require(speechCount(u"进入多任务界面") == (announce ? 2 : 0),
+                    "a later Recents entry ignored the launcher speech policy");
+        }
+    }
+}
+
 void realFocusReplacesVirtualDoubleTapTarget() {
     AccessibilityCapture capture;
     prepareGrid();
@@ -2506,19 +2598,26 @@ void wrapperBoundsDoNotMoveTheirIconsAfterEmptyRows() {
 }
 
 void homeAnnouncementWaitsForNativeFocusCallback() {
-    AccessibilityCapture capture;
-    returnedNode = testNode(10, -1, {0, 0, 400, 600}, "com.miui.home:id/screen_content", "");
-    onLauncherWindowFocus(reinterpret_cast<void *>(1), false);
-    g_original_launcher_focus = +[](void *, bool focused) {
-        if (!focused) return;
-        restoreNativeEventController();
+    for (const auto &[profile, announce] : kSurfaceAnnouncementCases) {
+        AccessibilityCapture capture(profile);
+        returnedNode = testNode(10, -1, {0, 0, 400, 600}, "com.miui.home:id/screen_content", "");
+        onLauncherWindowFocus(reinterpret_cast<void *>(1), false);
+        g_original_launcher_focus = +[](void *, bool focused) {
+            if (!focused) return;
+            restoreNativeEventController();
+            onCreateNode(reinterpret_cast<void *>(1), 10);
+            require(events.empty(), "Home announcement raced ahead of native focus completion");
+        };
+        onLauncherWindowFocus(reinterpret_cast<void *>(1), true);
+        require(g_home_announcement_pending.load() == announce,
+                "native focus callback queued Home speech for the wrong launcher");
         onCreateNode(reinterpret_cast<void *>(1), 10);
-        require(events.empty(), "Home announcement raced ahead of native focus completion");
-    };
-    onLauncherWindowFocus(reinterpret_cast<void *>(1), true);
-    onCreateNode(reinterpret_cast<void *>(1), 10);
-    require(events.size() == 1 && events.front().text == u"系统桌面",
-            "confirmed return failed to announce Home once");
+        require(events.size() == (announce ? 1U : 0U)
+                        && (!announce || events.front().text == u"系统桌面")
+                        && g_pending_surface_announcements.empty()
+                        && !g_home_announcement_pending.load(),
+                "confirmed Home return ignored the launcher speech policy");
+    }
 }
 
 void openingAppSeparatesRepeatedHomeAnnouncements() {
@@ -2574,7 +2673,7 @@ int main() {
         {"folder reordering preserves unrelated member order", folderReorderPreservesUnmovedMembers},
         {"sparse ItemInfo preserves the verified 75-byte wire layout", sparseItemInfoKeepsTheVerifiedWireLayout},
         {"folder ItemInfo encodes UTF-8 title/label and all 35 fields", folderItemInfoEncodesUtf8TitleAndLabel},
-        {"8593 recent actions use verified FRB bytes and reject unavailable capabilities", recent8593UsesVerifiedFrbWire},
+        {"8593/9239 recent actions use verified FRB bytes and reject unavailable capabilities", recentProfilesUseVerifiedFrbWire},
         {"folder identity uses visible members to disambiguate", folderIdentityUsesVisibleMembersToDisambiguate},
         {"folder identity ignores icons outside the open grid", folderIdentityIgnoresIconsOutsideTheOpenGrid},
         {"folder refresh stops touch input after cancellation", folderRefreshInputStopsAfterCancellation},
@@ -2624,7 +2723,7 @@ int main() {
         {"move retains nodes observed during native dispatch", placementKeepsNodesObservedDuringDispatch},
         {"current empty placement commits before verifying", currentEmptyPlacementCommitsBeforeVerification},
         {"cancelled swipe keeps confirmed page", cancelledSwipeKeepsConfirmedPage},
-        {"ten returns to Home announce ten times", everyReturnHomeAnnouncesOnce},
+        {"repeated Home returns follow the launcher speech policy", everyReturnHomeFollowsSpeechPolicy},
         {"system Back gesture cancels lifted grid", backGestureCancelsLiftAndKeepsNativeCleanup},
         {"Back key cancels only the lifted session", backKeyCancelsOnlyTheLiftedSession},
         {"folder Back closes then cancels in two steps", folderBackKeepsLiftUntilTheSecondBack},
@@ -2638,8 +2737,9 @@ int main() {
         {"single and multiple lift use launcher speech", liftingIconUsesLauncherFeedback},
         {"lifting enables the native edge Back recognizer", liftingIconKeepsNativeEdgeBackAvailable},
         {"native edge invoke gate is temporary and ABI guarded", edgeMotionTemporarilyEnablesOnlyLiftCancellation},
-        {"quick Home return without node query announces once", quickReturnHomeWithoutNodeQueryAnnounces},
+        {"quick Home return without node query follows speech policy", quickReturnHomeWithoutNodeQueryFollowsSpeechPolicy},
         {"announcement fallback survives controller replacement", announcementFallbackFlushesAfterControllerRecovery},
+        {"surface transition speech only supplements older Home", surfaceAnnouncementsOnlySupplementOlderHome},
         {"real focus clears old empty-cell target", realFocusReplacesVirtualDoubleTapTarget},
         {"empty cell IDs survive occupancy changes", gridRefreshKeepsCellIdentityAndFocus},
         {"same-page refresh preserves empty-cell focus", samePageRefreshPreservesDoubleTapTarget},
